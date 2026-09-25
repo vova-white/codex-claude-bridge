@@ -522,6 +522,167 @@ describe("nested writers", () => {
     expect(git(project, "branch", "--list", writers[0].workspace.branch)).not.toBe("");
   }, 30_000);
 
+  it("are cleaned up with their task once the task branch holds their assembled work", async () => {
+    const { project, client, taskId, status, wait, saved } = await setUp({
+      turns: [
+        { match: "Alpha writer", steps: retitle("Alpha") },
+        {
+          match: "Coordinate",
+          steps: [
+            startWriter("alpha", "Alpha writer: retitle the README."),
+            waitWriters("waited"),
+            merge("alpha"),
+            finished("Merged the alpha writer."),
+          ],
+        },
+      ],
+    });
+    expect(await wait()).toMatchObject({ status: "completed" });
+    const { path, branch } = saved("alpha").data.workspace;
+    const writerId = saved("alpha").data.writerId;
+    const { workspace } = await status();
+    // The fast-forward merge leaves the task branch and the writer's branch at one commit.
+    expect(git(project, "rev-parse", workspace.branch)).toBe(git(project, "rev-parse", branch));
+
+    // With scope all both branches go, so neither keeps the other's commits.
+    const all = (await client.call("cleanup_task", { project, taskId, dryRun: true })).data;
+    expect(all).toMatchObject({
+      outcome: "refused",
+      branch: { action: "keep", unintegratedCommits: 1 },
+      nestedWriters: [
+        {
+          writerId,
+          worktree: { path, action: "keep", uncommittedChanges: false },
+          branch: { name: branch, action: "keep", unintegratedCommits: 1 },
+        },
+      ],
+      refusals: [{ code: "unintegrated_commits" }, { code: "unintegrated_commits" }],
+    });
+
+    const plan = { project, taskId, scope: "worktree" };
+    expect((await client.call("cleanup_task", { ...plan, dryRun: true })).data).toMatchObject({
+      outcome: "planned",
+      worktree: { action: "remove" },
+      branch: { action: "keep" },
+      nestedWriters: [
+        { worktree: { action: "remove" }, branch: { action: "remove", unintegratedCommits: 0 } },
+      ],
+    });
+    expect(existsSync(path)).toBe(true);
+
+    const cleaned = (await client.call("cleanup_task", plan)).data;
+    expect(cleaned).toMatchObject({
+      outcome: "cleaned",
+      worktree: { action: "removed" },
+      branch: { action: "keep" },
+      nestedWriters: [{ worktree: { action: "removed" }, branch: { action: "removed" } }],
+    });
+    expect(existsSync(path)).toBe(false);
+    expect(git(project, "branch", "--list", branch)).toBe("");
+    expect(git(project, "log", "--format=%s", "-1", workspace.branch)).toBe("docs: alpha title");
+    const after = await status();
+    expect(after.workspace.state).toBe("branch_kept");
+    expect(after.executions[0].nestedWriters[0].workspace.state).toBe("removed");
+  });
+
+  it("refuse cleanup while a nested writer's branch holds work the executor did not assemble", async () => {
+    const { project, client, taskId, status, wait, saved } = await setUp({
+      turns: [
+        { match: "Alpha writer", steps: retitle("Alpha") },
+        {
+          match: "Coordinate",
+          steps: [
+            startWriter("alpha", "Alpha writer: retitle the README."),
+            waitWriters("waited"),
+            finished("Left the alpha writer's branch unmerged."),
+          ],
+        },
+      ],
+    });
+    expect(await wait()).toMatchObject({ status: "completed" });
+    const { path, branch } = saved("alpha").data.workspace;
+    const { workspace } = await status();
+
+    const refused = (await client.call("cleanup_task", { project, taskId, scope: "worktree" }))
+      .data;
+    expect(refused).toMatchObject({
+      outcome: "refused",
+      worktree: { action: "keep" },
+      nestedWriters: [
+        { worktree: { action: "keep" }, branch: { action: "keep", unintegratedCommits: 1 } },
+      ],
+      refusals: [{ code: "unintegrated_commits" }],
+    });
+    expect(refused.refusals[0].message).toContain(saved("alpha").data.writerId);
+    expect(existsSync(path)).toBe(true);
+    expect(existsSync(workspace.path)).toBe(true);
+    expect(git(project, "branch", "--list", branch)).not.toBe("");
+
+    const discarded = await client.call("cleanup_task", {
+      project,
+      taskId,
+      discardUnintegrated: true,
+    });
+    expect(discarded.data).toMatchObject({
+      outcome: "cleaned",
+      nestedWriters: [{ worktree: { action: "removed" }, branch: { action: "removed" } }],
+    });
+    expect(git(project, "branch", "--list", branch)).toBe("");
+    expect((await status()).executions[0].nestedWriters[0].workspace.state).toBe("removed");
+  });
+
+  it("refuse cleanup while a nested writer runs, and keep a cancelled writer's changes until the caller discards them", async () => {
+    const { fixture, project, client, taskId, status, saved } = await setUp({
+      turns: [
+        {
+          match: "Alpha writer",
+          steps: [
+            { writeFile: { path: "partial.txt", content: "p\n" } },
+            { signal: "alpha-editing" },
+            { waitFor: "never" },
+          ],
+        },
+        {
+          match: "Coordinate",
+          steps: [startWriter("alpha", "Alpha writer: retitle the README."), waitWriters("w")],
+        },
+      ],
+    });
+    await waitFor(() => fixture.signalled("alpha-editing") || undefined);
+    const { path } = saved("alpha").data.workspace;
+    const cleanup = async (options: Record<string, unknown> = {}) =>
+      (await client.call("cleanup_task", { project, taskId, ...options })).data;
+
+    expect(await cleanup({ discardUnintegrated: true })).toMatchObject({
+      outcome: "refused",
+      nestedWriters: [{ worktree: { action: "keep" } }],
+      refusals: [{ code: "active_execution" }],
+    });
+    expect(existsSync(join(path, "partial.txt"))).toBe(true);
+
+    await client.call("cancel_task", { project, taskId });
+    const dirty = await cleanup();
+    expect(dirty).toMatchObject({
+      outcome: "refused",
+      nestedWriters: [
+        { worktree: { action: "keep", uncommittedChanges: true }, branch: { action: "keep" } },
+      ],
+      refusals: [{ code: "uncommitted_changes" }],
+    });
+    expect(dirty.refusals[0].message).toContain(path);
+    expect(existsSync(join(path, "partial.txt"))).toBe(true);
+
+    expect(await cleanup({ discardUnintegrated: true })).toMatchObject({
+      outcome: "cleaned",
+      nestedWriters: [{ worktree: { action: "removed" }, branch: { action: "removed" } }],
+    });
+    expect(existsSync(path)).toBe(false);
+    expect((await status()).executions[0].nestedWriters[0]).toMatchObject({
+      status: "cancelled",
+      workspace: { state: "removed" },
+    });
+  }, 30_000);
+
   it("report nested writers of an interrupted execution as interrupted", async () => {
     const { fixture, project, taskId } = await setUp({
       turns: [

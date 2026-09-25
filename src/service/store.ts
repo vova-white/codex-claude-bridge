@@ -104,6 +104,7 @@ const migrations: string[] = [
   );
   CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at);
   ALTER TABLE requests ADD COLUMN writer_id TEXT`,
+  `ALTER TABLE nested_writers ADD COLUMN workspace_state TEXT`,
 ];
 
 export class StoreLockedError extends Error {}
