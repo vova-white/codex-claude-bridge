@@ -18,6 +18,7 @@
     "test:unit": "vp test run tests/unit",
     "test:integration": "vp test run tests/integration",
     "test:e2e": "node scripts/e2e.ts",
+    "smoke": "node scripts/smoke.ts",
     "check": "node scripts/quality.ts",
     "hooks:install": "vp config --no-agent",
     "hooks:check": "node scripts/verify-hooks.ts",
