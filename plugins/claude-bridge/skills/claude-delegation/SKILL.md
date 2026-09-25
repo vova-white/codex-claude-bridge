@@ -9,7 +9,7 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout and read its progress. Claude cannot edit files, publish changes, take follow-ups, receive answers to questions mid-task, be cancelled, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude cannot edit files, publish changes, receive answers to questions mid-task, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
@@ -29,6 +29,16 @@ Delegate a focused investigation or review that Claude can complete from the rep
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, call `task_result` again with `part` and `offset` from `truncated.next` to read the rest, repeating until no `truncated` remains. Read further only if you need the omitted detail.
 
+## Follow-ups and cancellation
+
+Use `send_followup` to continue the same Claude session: ask a clarifying question about the result, or request an adjustment. Each follow-up is a new execution with its own `executionId` and result; the original result never changes (`task_result` without `executionId` still returns it). Choose a new `requestKey` for each follow-up and reuse it only to retry the same message.
+
+If an execution of the task is still active, the follow-up is queued behind it (`delivery: queued`, `queuedBehind`) and starts when that execution ends. Follow-ups never interrupt or steer a running turn. Wait for the follow-up's own `executionId`.
+
+If the follow-up fails with `reason: session_unavailable`, Claude Code can no longer resume the session (or the task never reached Claude). The message was not sent to any other conversation. Start a new task whose brief includes what the follow-up needs.
+
+`cancel_task` stops obsolete work: queued follow-ups are cancelled at once, and the running execution is stopped by ending Claude Code. `cancellation: confirmed` means Claude Code has exited; `requested` means termination is not confirmed yet, so check again with `task_status`. An execution that finished before the cancellation took effect keeps its result. Repeating the call is harmless. Cancellation stops Claude; it does not undo changes Claude already made. You can send a new follow-up to the session after cancelling.
+
 ## Reading progress
 
 Read progress only when it helps you decide something, such as whether a long task is on track. `read_output` returns the execution's events after a cursor: status changes, Claude's messages, the tools it called with their inputs, and the final summary. Keep reads small: start with the default `limit` and `maxChars`, pass the returned `nextCursor` as `after` to continue (cursors stay valid after reconnecting), and stop when `hasMore` is false. An event cut to fit `maxChars` is marked `truncated`; read just that event in full with `after` set to its `seq` minus 1, `limit: 1`, and a larger `maxChars`. `lastEventSeq` from `wait_task` tells you whether anything new arrived. Only the newest events of long executions are kept (`retention` says how many were dropped); results are never affected.
@@ -39,7 +49,8 @@ Claude runs with the edit tools disabled and without nested agents, but shell co
 
 - `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own.
 - `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
-- `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
+- `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), `session_unavailable` (a follow-up whose session cannot be resumed), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
+- `cancelled`: stopped by `cancel_task`; `detail.processExited` confirms Claude Code exited.
 - `interrupted`: the bridge service stopped while the task ran. The result may be incomplete; decide whether to start a new task with a new request key.
 
 Review the result in proportion to its risk: check the evidence behind claims you will act on, rather than repeating the whole investigation.

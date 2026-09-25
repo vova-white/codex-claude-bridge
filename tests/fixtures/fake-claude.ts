@@ -17,10 +17,14 @@ export type Step =
   | { rateLimit: { status: "allowed" | "allowed_warning" | "rejected"; resetsAt?: number } }
   /** Waits until the named file exists, relative to the scenario file. */
   | { waitFor: string }
+  /** Creates the named file next to the scenario file, so a test can wait for this point. */
+  | { signal: string }
   /** Writes a file relative to the working directory, as a shell command could. */
   | { writeFile: { path: string; content: string } }
   /** Runs a command in the working directory, as the Bash tool could. */
   | { exec: string[] }
+  /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
+  | { ignoreTermination: true }
   | {
       result: {
         text?: string;
@@ -48,13 +52,20 @@ export interface Scenario {
   turns?: Turn[];
   /** Delays the answer to the SDK's initialize request until this file exists. */
   initializeWaitFor?: string;
+  /** Makes `--resume` fail the way Claude Code does for a session it cannot find. */
+  lostSessions?: boolean;
 }
 
 const scenarioPath = process.env.FAKE_CLAUDE_SCENARIO;
 const scenario: Scenario = scenarioPath ? JSON.parse(readFileSync(scenarioPath, "utf8")) : {};
 const scenarioDir = scenarioPath ? dirname(scenarioPath) : process.cwd();
 const args = process.argv.slice(2);
-const sessionId = randomUUID();
+const resumeIndex = args.indexOf("--resume");
+const resumed =
+  resumeIndex >= 0
+    ? args[resumeIndex + 1]
+    : args.find((arg) => arg.startsWith("--resume="))?.slice("--resume=".length);
+const sessionId = resumed ?? randomUUID();
 
 if (args.includes("--version")) {
   console.log(`${scenario.version ?? "2.1.282"} (Claude Code)`);
@@ -148,6 +159,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 let initialized = false;
+let ignoreTermination = false;
 let queue = Promise.resolve();
 
 async function answer(prompt: string): Promise<void> {
@@ -188,10 +200,17 @@ async function answer(prompt: string): Promise<void> {
         uuid: randomUUID(),
         session_id: sessionId,
       });
+    } else if ("signal" in step) {
+      writeFileSync(resolve(scenarioDir, step.signal), "");
     } else if ("waitFor" in step) {
       await waitForFile(resolve(scenarioDir, step.waitFor));
     } else if ("writeFile" in step) {
       writeFileSync(resolve(process.cwd(), step.writeFile.path), step.writeFile.content);
+    } else if ("ignoreTermination" in step) {
+      ignoreTermination = true;
+      process.on("SIGTERM", () => {});
+      // Stay alive after stdin closes, as a hung process would.
+      setInterval(() => {}, 60_000);
     } else if ("exec" in step) {
       const [command = "true", ...commandArgs] = step.exec;
       execFileSync(command, commandArgs, { cwd: process.cwd() });
@@ -238,6 +257,27 @@ lines.on("line", (line) => {
   const { request_id: requestId, request } = message;
   switch (request.subtype) {
     case "initialize":
+      if (resumed && scenario.lostSessions) {
+        // Claude Code answers an unknown --resume with an error result and exits.
+        send({
+          type: "result",
+          subtype: "error_during_execution",
+          is_error: true,
+          errors: [`No conversation found with session ID: ${resumed}`],
+          duration_ms: 0,
+          duration_api_ms: 0,
+          num_turns: 0,
+          stop_reason: null,
+          total_cost_usd: 0,
+          usage: { input_tokens: 0, output_tokens: 0 },
+          modelUsage: {},
+          permission_denials: [],
+          uuid: randomUUID(),
+          session_id: resumed,
+        });
+        process.stderr.write(`No conversation found with session ID: ${resumed}\n`);
+        process.exit(1);
+      }
       void (
         scenario.initializeWaitFor
           ? waitForFile(resolve(scenarioDir, scenario.initializeWaitFor))
@@ -285,4 +325,6 @@ lines.on("line", (line) => {
   }
 });
 // Like Claude Code, stop when the SDK closes stdin, even in the middle of a turn.
-lines.on("close", () => process.exit(0));
+lines.on("close", () => {
+  if (!ignoreTermination) process.exit(0);
+});

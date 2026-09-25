@@ -67,6 +67,18 @@ export const waitSchema = z.object({
     ),
 });
 
+/** Arguments of send_followup. */
+export const followUpSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  requestKey: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Caller-chosen key for this follow-up; reuse it to retry safely."),
+  message: z.string().min(1).describe("The follow-up instruction or question for Claude."),
+});
+
 /** Arguments of read_output. */
 export const outputSchema = z.object({
   project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
@@ -148,12 +160,18 @@ interface ExecutionRow {
   session_id: string | null;
   result: string | null;
   events_pruned: number;
+  kind: string;
+  input: string | null;
+  request_key: string | null;
+  request_hash: string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
 }
 
-const terminalStatuses = ["completed", "failed", "interrupted"];
+/** How long a cancel call waits for Claude Code to exit before reporting the request as pending. */
+const cancelConfirmationMs = 20_000;
+const terminalStatuses = ["completed", "failed", "cancelled", "interrupted"];
 /** Reasons a running execution cannot progress on its own; entering one ends a wait. */
 const blockedReasons = new Set(["waiting_for_capacity"]);
 
@@ -199,6 +217,13 @@ export class TaskService {
   private readonly log: (message: string) => void;
   /** Emits an execution ID whenever that execution's state changes. */
   private readonly changes = new EventEmitter();
+  /** Executions this service is running, with the means to stop them. */
+  private readonly running = new Map<
+    string,
+    { controller: AbortController; done: Promise<void> }
+  >();
+  /** Tasks whose next queued execution is about to start. */
+  private readonly launching = new Set<string>();
 
   constructor(
     db: DatabaseSync,
@@ -297,17 +322,7 @@ export class TaskService {
     }
     this.record(executionId, "status", "Accepted.");
     // Accepted intent is durable before any Claude Code process starts.
-    setImmediate(() => {
-      this.execute(executionId, project, request).catch((error: unknown) => {
-        this.log(`execution ${executionId} failed unexpectedly: ${errorOrigin(error)}`);
-        this.update(executionId, {
-          status: "failed",
-          reason: "provider_error",
-          error: JSON.stringify({ message: (error as Error).message }),
-          ended_at: now(),
-        });
-      });
-    });
+    this.schedule(taskId);
     return { taskId, executionId, status: "queued", created: true };
   }
 
@@ -414,6 +429,116 @@ export class TaskService {
         ...rest,
       },
       ...truncation,
+    };
+  }
+
+  /**
+   * Adds a follow-up to the task's Claude session as a new execution. It runs
+   * after any active execution of the task; a retry with the same request key
+   * returns the same execution.
+   */
+  async followUp(caller: string, params: unknown) {
+    const { project, taskId, requestKey, message } = parse(followUpSchema, params);
+    const task = await this.task(caller, project, taskId);
+    const hash = createHash("sha256").update(message).digest("hex");
+    const existing = this.db
+      .prepare("SELECT * FROM executions WHERE task_id = ? AND request_key = ?")
+      .get(task.id, requestKey) as ExecutionRow | undefined;
+    if (existing) {
+      if (existing.request_hash !== hash) {
+        throw new ServiceError(
+          "request_key_conflict",
+          `Request key "${requestKey}" already sent a different follow-up to task ${task.id} (execution ${existing.id}). Use a new request key for a different message.`,
+        );
+      }
+      return {
+        taskId: task.id,
+        executionId: existing.id,
+        ...executionState(existing),
+        created: false,
+      };
+    }
+    const active = this.db
+      .prepare(
+        "SELECT id FROM executions WHERE task_id = ? AND status IN ('queued', 'running') ORDER BY ordinal DESC LIMIT 1",
+      )
+      .get(task.id) as { id: string } | undefined;
+    const executionId = `exec_${randomUUID()}`;
+    this.db
+      .prepare(
+        `INSERT INTO executions (id, task_id, ordinal, status, created_at, kind, input, request_key, request_hash)
+         VALUES (?, ?, (SELECT MAX(ordinal) + 1 FROM executions WHERE task_id = ?), 'queued', ?, 'follow-up', ?, ?, ?)`,
+      )
+      .run(executionId, task.id, task.id, now(), message, requestKey, hash);
+    this.record(
+      executionId,
+      "status",
+      active ? `Queued behind execution ${active.id}.` : "Accepted.",
+    );
+    this.schedule(task.id);
+    return {
+      taskId: task.id,
+      executionId,
+      status: "queued",
+      terminal: false,
+      created: true,
+      // Follow-ups never steer a running turn: they wait for it and then continue the session.
+      delivery: active ? "queued" : "starting",
+      ...(active ? { queuedBehind: active.id } : {}),
+    };
+  }
+
+  /**
+   * Cancels the task's unfinished executions: queued ones at once, running ones
+   * by stopping Claude Code. Cancellation is confirmed only once the process has
+   * exited; repeating it is harmless.
+   */
+  async cancel(caller: string, params: unknown) {
+    const { project, taskId } = parse(taskLookup, params);
+    const task = await this.task(caller, project, taskId);
+    const active = this.db
+      .prepare(
+        "SELECT * FROM executions WHERE task_id = ? AND status IN ('queued', 'running') ORDER BY ordinal",
+      )
+      .all(task.id) as unknown as ExecutionRow[];
+    const requestedAt = now();
+    const stopping: Promise<void>[] = [];
+    for (const execution of active) {
+      if (execution.status === "queued") {
+        const cancelled = this.update(
+          execution.id,
+          { status: "cancelled", reason: "cancelled", ended_at: requestedAt },
+          "queued",
+        );
+        if (cancelled) this.record(execution.id, "status", "Cancelled before it started.");
+        continue;
+      }
+      const run = this.running.get(execution.id);
+      if (run) {
+        run.controller.abort();
+        stopping.push(run.done);
+      }
+    }
+    await Promise.race([
+      Promise.all(stopping),
+      new Promise((resolve) => setTimeout(resolve, cancelConfirmationMs)),
+    ]);
+    const executions = active.map((execution) => this.executionById(task.id, execution.id));
+    // Every terminal state is written after Claude Code's process exited, or
+    // records processExited: false when it could not be confirmed.
+    const confirmed = executions.every(
+      (execution) =>
+        terminalStatuses.includes(execution.status) &&
+        (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
+          false,
+    );
+    return {
+      taskId: task.id,
+      cancellation: active.length === 0 ? "none_active" : confirmed ? "confirmed" : "requested",
+      executions: executions.map((execution) => ({
+        executionId: execution.id,
+        ...executionState(execution),
+      })),
     };
   }
 
@@ -606,9 +731,57 @@ export class TaskService {
     });
   }
 
-  private async execute(executionId: string, root: string, request: StartRequest): Promise<void> {
+  /** Starts the task's next queued execution unless one of its executions is running. */
+  private schedule(taskId: string): void {
+    if (this.launching.has(taskId)) return;
+    const running = this.db
+      .prepare("SELECT 1 FROM executions WHERE task_id = ? AND status = 'running'")
+      .get(taskId);
+    if (running) return;
+    const next = this.db
+      .prepare(
+        "SELECT id FROM executions WHERE task_id = ? AND status = 'queued' ORDER BY ordinal LIMIT 1",
+      )
+      .get(taskId) as { id: string } | undefined;
+    if (!next) return;
+    this.launching.add(taskId);
+    setImmediate(() => {
+      this.launching.delete(taskId);
+      this.launch(taskId, next.id);
+    });
+  }
+
+  private launch(taskId: string, executionId: string): void {
+    const controller = new AbortController();
+    const done = this.execute(executionId, controller.signal)
+      .catch((error: unknown) => {
+        this.log(`execution ${executionId} failed unexpectedly: ${errorOrigin(error)}`);
+        this.update(executionId, {
+          status: "failed",
+          reason: "provider_error",
+          error: JSON.stringify({ message: "The bridge could not run this execution." }),
+          ended_at: now(),
+        });
+      })
+      .finally(() => {
+        this.running.delete(executionId);
+        this.schedule(taskId);
+      });
+    this.running.set(executionId, { controller, done });
+  }
+
+  private async execute(executionId: string, signal: AbortSignal): Promise<void> {
     if (!this.update(executionId, { status: "running", started_at: now() }, "queued")) return;
     this.record(executionId, "status", "Running.");
+    const execution = this.db
+      .prepare("SELECT * FROM executions WHERE id = ?")
+      .get(executionId) as unknown as ExecutionRow;
+    const task = this.db
+      .prepare("SELECT * FROM tasks WHERE id = ?")
+      .get(execution.task_id) as unknown as TaskRow;
+    const root = task.project;
+    const request = JSON.parse(task.request) as StartRequest;
+    const followUp = execution.kind === "follow-up";
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
@@ -620,6 +793,17 @@ export class TaskService {
         reason: "provider_error",
         message: "Claude Code was not found.",
         action: `Install Claude Code, or set "claudeExecutable" in ${this.paths.config}.`,
+        processExited: true,
+      };
+    } else if (followUp && !task.session_id) {
+      // Never answer a follow-up in a new, unrelated conversation.
+      outcome = {
+        status: "failed",
+        reason: "session_unavailable",
+        message: "The task has no Claude session to continue; the follow-up was not sent.",
+        action:
+          "Start a new task with the context the follow-up needs; the earlier results stay available.",
+        processExited: true,
       };
     } else {
       before = await checkoutState(root);
@@ -629,7 +813,9 @@ export class TaskService {
           env: claudeEnvironment(config),
           extraArgs: mcpConfigArgs(this.paths, config),
           cwd: root,
-          prompt: prompt(request),
+          prompt: followUp ? `<follow-up>\n${execution.input}\n</follow-up>` : prompt(request),
+          ...(followUp && task.session_id ? { resume: task.session_id } : {}),
+          signal,
           guidance: readOnlyGuidance(root),
           disallowedTools: readOnlyDisallowedTools,
           ...(request.model ? { model: request.model } : {}),
@@ -685,11 +871,38 @@ export class TaskService {
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
         : [];
+    if (outcome.status === "cancelled") {
+      const cancelled = this.update(executionId, {
+        status: "cancelled",
+        reason: "cancelled",
+        detail: JSON.stringify({
+          processExited: outcome.processExited,
+          ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+        }),
+        ended_at: endedAt,
+      });
+      if (cancelled) {
+        this.record(
+          executionId,
+          "status",
+          outcome.processExited
+            ? "Cancelled; Claude Code has exited."
+            : "Cancelled; Claude Code did not exit within the grace period.",
+        );
+      }
+      return;
+    }
     if (outcome.status === "failed") {
       const failed = this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
-        detail: outcome.detail ? JSON.stringify(outcome.detail) : null,
+        detail:
+          outcome.detail || !outcome.processExited
+            ? JSON.stringify({
+                ...outcome.detail,
+                ...(outcome.processExited ? {} : { processExited: false }),
+              })
+            : null,
         error: JSON.stringify({
           message: [outcome.message, ...violation].join(" "),
           ...(outcome.action ? { action: outcome.action } : {}),
@@ -716,7 +929,7 @@ export class TaskService {
     const completed = this.update(executionId, {
       status: "completed",
       reason: null,
-      detail: null,
+      detail: outcome.processExited ? null : JSON.stringify({ processExited: false }),
       result: JSON.stringify(result),
       ended_at: endedAt,
     });

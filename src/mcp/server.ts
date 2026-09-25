@@ -4,7 +4,13 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { ServiceConnection } from "../ipc.ts";
 import { connectService } from "../service/launcher.ts";
-import { outputSchema, resultSchema, startSchema, waitSchema } from "../service/tasks.ts";
+import {
+  followUpSchema,
+  outputSchema,
+  resultSchema,
+  startSchema,
+  waitSchema,
+} from "../service/tasks.ts";
 import type { StatePaths } from "../state.ts";
 import metadata from "../../package.json" with { type: "json" };
 
@@ -120,6 +126,32 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     (args) => call("read_output", args),
+  );
+
+  server.registerTool(
+    "send_followup",
+    {
+      title: "Send a follow-up to a delegated task",
+      description:
+        "Continue the task's Claude session with a follow-up message, as a new execution with its own identifier and result; the original result is never replaced. If an execution of the task is active, the follow-up is queued behind it (delivery: queued) and starts when it ends; follow-ups never steer a running turn. Retrying with the same requestKey returns the same execution; a different message with that key fails. If the session cannot be resumed, the execution fails with reason session_unavailable instead of starting an unrelated conversation.",
+      inputSchema: followUpSchema.shape,
+      annotations: { readOnlyHint: false, openWorldHint: true },
+    },
+    (args) => call("send_followup", args),
+  );
+  server.registerTool(
+    "cancel_task",
+    {
+      title: "Cancel a delegated task",
+      description:
+        "Cancel the task's unfinished executions: queued follow-ups at once, the running execution by stopping Claude Code. Returns cancellation: confirmed once Claude Code has exited, requested if termination could not be confirmed yet, or none_active when nothing was running; each execution's final status is listed (an execution that finished first keeps its result). Safe to repeat.",
+      inputSchema: {
+        project: z.string().describe("Absolute path of the Git checkout the task belongs to."),
+        taskId: z.string().describe("Task identifier returned by start_task."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    },
+    (args) => call("cancel_task", args),
   );
 
   // Codex closing stdin ends this entry point; the service and its work continue.
