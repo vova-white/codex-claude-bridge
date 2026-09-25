@@ -18,7 +18,7 @@ A bounded assignment from the parent agent to a child agent, with an expected re
 One run of Claude Code for a delegated task, with its own identity, status, and result. The first execution carries the original assignment.
 
 **Execution slot**:
-One of the limited number of executions the bridge service runs at once. An execution holds its slot from start to end, whatever it waits for meanwhile (an answer, subscription capacity, nested agents); nested agents run inside it and take no slot of their own.
+One of the limited number of executions the bridge service runs at once. An execution holds its slot from start to end, whatever it waits for meanwhile (an answer, subscription capacity, nested agents, nested writers); nested agents and nested writers run as part of it and take no slot of their own.
 
 **Request key**:
 A caller-chosen key that identifies one request so a retry returns what the first attempt created: a start request within a project and logical caller returns the existing task, and a follow-up within a task returns the existing execution.
@@ -27,7 +27,7 @@ A caller-chosen key that identifies one request so a retry returns what the firs
 The identity that owns delegated tasks across MCP connections, such as one Codex installation. A reconnecting parent agent finds the tasks it started as the same logical caller.
 
 **Task profile**:
-The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except nested agents.
+The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except Claude Code's own nested agents, and may start nested writers.
 
 **Task worktree**:
 The Git worktree and task branch a writing agent works in, created from a committed baseline. It isolates Git changes from other agents; it is not a sandbox. It stays after the task ends until the parent agent cleans it up.
@@ -40,6 +40,9 @@ A child agent assigned to change project files as part of its delegated task.
 
 **Nested agent**:
 An agent engaged by a child agent to carry out part of its delegated task. The child agent remains accountable for incorporating that agent's work into its task result.
+
+**Nested writer**:
+A nested agent that changes files for a writing agent, run by the bridge service as a separate Claude Code execution in its own worktree and branch, starting from the writing agent's committed state. The writing agent assembles its branch into the task result.
 
 **Pending request**:
 A question or a request for permission that a child agent is waiting on the parent agent to answer during an execution. It can be answered only while that execution runs; afterwards it is expired.
