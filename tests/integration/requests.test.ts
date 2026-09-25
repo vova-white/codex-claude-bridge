@@ -289,6 +289,39 @@ describe("permission requests", () => {
     },
   );
 
+  it("redact configured secrets used as input keys without merging entries", async () => {
+    const secrets = { ALPHA: "token-alpha-123", BETA: "token-beta-456" };
+    const input = { tokens: { "token-alpha-123": "revoke", "token-beta-456": "keep" } };
+    const shown = { tokens: { "[REDACTED]": "revoke", "[REDACTED] (key 2)": "keep" } };
+    const { client, project, taskId } = await startTask(
+      [
+        { toolUse: { name: "mcp__tracker__list_tokens", input } },
+        { canUseTool: { ...trackerCall.canUseTool, input } },
+        finished("Done."),
+      ],
+      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: secrets } } } },
+    );
+
+    const request = await pendingRequest(client, project, taskId);
+    expect(request.action.input).toEqual(shown);
+    const answered = await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId: request.requestId,
+      response: { decision: "allow" },
+    });
+    expect(answered.data.action.input).toEqual(shown);
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(await events(client, project, taskId)).toContain(
+      `mcp__tracker__list_tokens ${JSON.stringify(shown)}`,
+    );
+    const status = await client.call("task_status", { project, taskId });
+    const output = await client.call("read_output", { project, taskId, limit: 200 });
+    for (const text of [answered.text, status.text, output.text]) {
+      expect(text).not.toMatch(/token-(alpha|beta)/);
+    }
+  });
+
   it("let an autoApprove server and built-in tools run without a request", async () => {
     const { fixture, client, project, taskId } = await startTask(
       [
