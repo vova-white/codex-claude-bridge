@@ -67,7 +67,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Delegate a task to Claude",
       description:
-        "Start a delegated task. mode read-only (default): Claude Code inspects the project's shared checkout. mode write: Claude changes files and commits in a new Git worktree on its own task branch from a committed baseline (refused with dirty_parent when the checkout has uncommitted changes and no baseline is given). Both return a structured result (summary, evidence, failures, remaining work; writing tasks add checks and the workspace). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here. In read-only tasks Claude may engage nested read-only agents for independent subtasks and incorporates their work into its result.",
+        "Start a delegated task. mode read-only (default): Claude Code inspects the project's shared checkout. mode write: Claude changes files and commits in a new Git worktree on its own task branch from a committed baseline (refused with dirty_parent when the checkout has uncommitted changes and no baseline is given). Both return a structured result (summary, evidence, failures, remaining work; writing tasks add checks and the workspace). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here. The service runs at most its configured number of executions at once; a task beyond that stays queued with reason waiting_for_slot and starts, in order, when a slot frees. In read-only tasks Claude may engage nested read-only agents for independent subtasks and incorporates their work into its result.",
       inputSchema: startSchema.shape,
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
@@ -77,7 +77,8 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     "list_tasks",
     {
       title: "List delegated tasks",
-      description: "List this caller's delegated tasks in a project with their current status.",
+      description:
+        "List this caller's delegated tasks in a project with their current status, and the service's execution slots across all tasks (slots): limit (most executions running at once; null while config.json is invalid), running, and queued (executions waiting for a free slot).",
       inputSchema: { project },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -88,7 +89,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Check a delegated task",
       description:
-        "Current status of a task, its executions, and its requests: queued, running (reason waiting_for_capacity while Claude waits for subscription capacity, waiting_for_children while nested agents Claude started still run after its turn, or needs_input while Claude waits for an answer to detail.requestId), completed, failed (reason authentication, subscription_limit, invalid_request, or provider_error, with an error message and action), or interrupted (the service stopped while it ran). Each execution lists the nested agents Claude Code reported (nested), with their status, summary, and how their end is known (termination). requests lists Claude's questions and permission requests with their state (pending, answered, expired), whether they can still be answered (live), and, for live ones, the responseShape respond_to_request expects.",
+        "Current status of a task, its executions, and its requests: queued (reason waiting_for_slot while the service runs its limit of executions, with detail.position in line and detail.limit), running (reason waiting_for_capacity while Claude waits for subscription capacity, waiting_for_children while nested agents Claude started still run after its turn, or needs_input while Claude waits for an answer to detail.requestId), completed, failed (reason authentication, subscription_limit, invalid_request, or provider_error, with an error message and action), or interrupted (the service stopped while it ran). Each execution lists the nested agents Claude Code reported (nested), with their status, summary, and how their end is known (termination). requests lists Claude's questions and permission requests with their state (pending, answered, expired), whether they can still be answered (live), and, for live ones, the responseShape respond_to_request expects.",
       inputSchema: { project, taskId },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -111,7 +112,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Wait for a delegated task",
       description:
-        "Wait up to timeoutSeconds for one execution to finish or become blocked (waiting for subscription capacity, or needs_input when Claude asks something, which ends a wait at once); waiting for nested agents is still progress, so the wait continues. The execution is the one given, or the task's latest at call time, and the response names it. Returns at once for finished executions. A timeout returns the current state with timedOut: true and never stops the task. lastEventSeq tells whether new output exists for read_output.",
+        "Wait up to timeoutSeconds for one execution to finish or become blocked (waiting for subscription capacity, or needs_input when Claude asks something, which ends a wait at once); waiting for nested agents or for a free slot is still progress, so the wait continues. The execution is the one given, or the task's latest at call time, and the response names it. Returns at once for finished executions. A timeout returns the current state with timedOut: true and never stops the task. lastEventSeq tells whether new output exists for read_output.",
       inputSchema: waitSchema.shape,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -134,7 +135,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Send a follow-up to a delegated task",
       description:
-        "Continue the task's Claude session with a follow-up message, as a new execution with its own identifier and result; the original result is never replaced. If an execution of the task is active, the follow-up is queued behind it (delivery: queued) and starts when it ends; follow-ups never steer a running turn. Retrying with the same requestKey returns the same execution; a different message with that key fails. If the session cannot be resumed, the execution fails with reason session_unavailable instead of starting an unrelated conversation.",
+        "Continue the task's Claude session with a follow-up message, as a new execution with its own identifier and result; the original result is never replaced. If an execution of the task is active, the follow-up is queued behind it (delivery: queued) and starts when it ends; if the service runs its limit of executions, it waits for a slot (delivery: queued, reason waiting_for_slot). Follow-ups never steer a running turn. Retrying with the same requestKey returns the same execution; a different message with that key fails. If the session cannot be resumed, the execution fails with reason session_unavailable instead of starting an unrelated conversation.",
       inputSchema: followUpSchema.shape,
       annotations: { readOnlyHint: false, openWorldHint: true },
     },

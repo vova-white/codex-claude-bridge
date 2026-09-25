@@ -3,7 +3,10 @@ import { configSecrets, type BridgeConfig } from "../../src/config.ts";
 import { errorOrigin, redact, redactContent } from "../../src/redact.ts";
 
 function redactFor(url: string, message: string): string {
-  const config: BridgeConfig = { mcpServers: { tracker: { type: "http", url } } };
+  const config: BridgeConfig = {
+    mcpServers: { tracker: { type: "http", url } },
+    maxConcurrentExecutions: 2,
+  };
   return redact(message, configSecrets(config));
 }
 
@@ -46,6 +49,7 @@ describe("task result redaction", () => {
     mcpServers: {
       tracker: { type: "http", url: "https://tracker.invalid/mcp?token=a%2fb%20c-key" },
     },
+    maxConcurrentExecutions: 2,
   });
 
   it("masks configured query credentials in any encoding and keeps the rest of the link", () => {

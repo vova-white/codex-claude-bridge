@@ -340,7 +340,8 @@ Finish with the structured result: summary (what you changed and why), evidence 
 /**
  * Owns delegated tasks: their durable identity, their executions, and the
  * Claude Code processes running them. Tasks belong to a project and a logical
- * caller; nothing is visible outside that scope.
+ * caller; nothing is visible outside that scope except the service-wide counts
+ * and queue positions of execution slots, which carry no task content.
  */
 export class TaskService {
   private readonly db: DatabaseSync;
@@ -356,6 +357,8 @@ export class TaskService {
   >();
   /** Tasks whose next queued execution is about to start. */
   private readonly launching = new Set<string>();
+  /** Executions waiting for a free slot, in the order they started waiting. */
+  private slotQueue: string[] = [];
   /** Requests Claude is waiting on in this process, with the means to answer them. */
   /** What each execution running in this process waits for; its reason is derived from it. */
   private readonly waits = new Map<string, Waits>();
@@ -434,7 +437,7 @@ export class TaskService {
       return {
         taskId: task.id,
         executionId: execution.id,
-        status: execution.status,
+        ...executionState(execution),
         created: false,
       };
     };
@@ -521,17 +524,24 @@ export class TaskService {
     }
     this.record(executionId, "status", "Accepted.");
     // Accepted intent is durable before any Claude Code process starts.
-    this.schedule(taskId);
-    return { taskId, executionId, status: "queued", created: true };
+    this.schedule();
+    return {
+      taskId,
+      executionId,
+      ...executionState(this.executionById(taskId, executionId)),
+      created: true,
+    };
   }
 
   async list(caller: string, params: unknown) {
     const { project } = parse(projectLookup, params);
     const root = await this.projectRoot(project);
+    this.schedule();
     const tasks = this.db
       .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? ORDER BY created_at, id")
       .all(root, caller) as unknown as TaskRow[];
     return {
+      slots: this.slots(),
       tasks: tasks.map((task) => {
         const latest = this.latestExecution(task.id);
         const intent = JSON.parse(task.request) as { assignment: string };
@@ -553,6 +563,7 @@ export class TaskService {
   async status(caller: string, params: unknown) {
     const { project, taskId } = parse(taskLookup, params);
     const task = await this.task(caller, project, taskId);
+    this.schedule();
     const executions = this.db
       .prepare("SELECT * FROM executions WHERE task_id = ? ORDER BY ordinal")
       .all(task.id) as unknown as ExecutionRow[];
@@ -745,15 +756,15 @@ export class TaskService {
       "status",
       active ? `Queued behind execution ${active.id}.` : "Accepted.",
     );
-    this.schedule(task.id);
+    this.schedule();
+    const current = this.executionById(task.id, executionId);
     return {
       taskId: task.id,
       executionId,
-      status: "queued",
-      terminal: false,
+      ...executionState(current),
       created: true,
       // Follow-ups never steer a running turn: they wait for it and then continue the session.
-      delivery: active ? "queued" : "starting",
+      delivery: active || current.reason === "waiting_for_slot" ? "queued" : "starting",
       ...(active ? { queuedBehind: active.id } : {}),
     };
   }
@@ -777,7 +788,7 @@ export class TaskService {
       if (execution.status === "queued") {
         const cancelled = this.update(
           execution.id,
-          { status: "cancelled", reason: "cancelled", ended_at: requestedAt },
+          { status: "cancelled", reason: "cancelled", detail: null, ended_at: requestedAt },
           "queued",
         );
         if (cancelled) this.record(execution.id, "status", "Cancelled before it started.");
@@ -789,6 +800,7 @@ export class TaskService {
         stopping.push(run.done);
       }
     }
+    this.schedule();
     await Promise.race([
       Promise.all(stopping),
       new Promise((resolve) => setTimeout(resolve, cancelConfirmationMs)),
@@ -830,6 +842,7 @@ export class TaskService {
   async wait(caller: string, params: unknown) {
     const { project, taskId, executionId, timeoutSeconds } = parse(waitSchema, params);
     const task = await this.task(caller, project, taskId);
+    this.schedule();
     const pinned = executionId
       ? this.executionById(task.id, executionId)
       : this.latestExecution(task.id);
@@ -1237,27 +1250,83 @@ export class TaskService {
     return true;
   }
 
-  /** Starts the task's next queued execution unless one of its executions is running. */
-  private schedule(taskId: string): void {
-    if (this.launching.has(taskId)) return;
-    const running = this.db
-      .prepare("SELECT 1 FROM executions WHERE task_id = ? AND status = 'running'")
-      .get(taskId);
-    if (running) return;
-    const next = this.db
-      .prepare(
-        "SELECT id FROM executions WHERE task_id = ? AND status = 'queued' ORDER BY ordinal LIMIT 1",
-      )
-      .get(taskId) as { id: string } | undefined;
-    if (!next) return;
-    this.launching.add(taskId);
-    setImmediate(() => {
-      this.launching.delete(taskId);
-      this.launch(taskId, next.id);
-    });
+  /** The configured limit of running executions, or undefined while config.json is invalid. */
+  private limit(): number | undefined {
+    try {
+      return this.config().maxConcurrentExecutions;
+    } catch {
+      return undefined;
+    }
   }
 
-  private launch(taskId: string, executionId: string): void {
+  /**
+   * Service-wide execution slots, as list_tasks reports them. The limit is null
+   * while config.json is invalid; executions then fail as they start.
+   */
+  private slots() {
+    const { running } = this.db
+      .prepare("SELECT COUNT(*) AS running FROM executions WHERE status = 'running'")
+      .get() as { running: number };
+    return { limit: this.limit() ?? null, running, queued: this.slotQueue.length };
+  }
+
+  /**
+   * Starts queued executions while fewer than the configured limit run,
+   * service-wide, and tells the rest their place in line (see "Execution slot"
+   * in CONTEXT.md). A task runs one execution at a time, in order: its next
+   * execution joins the line only once the previous one has ended, behind those
+   * already waiting, so a position never moves back. Runs whenever work is
+   * queued, cancelled, or ends, and when a caller reads task state, which also
+   * applies an edited limit.
+   */
+  private schedule(): void {
+    const limit = this.limit() ?? Number.POSITIVE_INFINITY;
+    const ready = (
+      this.db
+        .prepare(
+          `SELECT id, task_id, reason, detail FROM executions AS next
+           WHERE status = 'queued'
+             AND ordinal = (SELECT MIN(ordinal) FROM executions
+                            WHERE task_id = next.task_id AND status = 'queued')
+             AND NOT EXISTS (SELECT 1 FROM executions
+                             WHERE task_id = next.task_id AND status = 'running')
+           ORDER BY created_at, rowid`,
+        )
+        .all() as unknown as Pick<ExecutionRow, "id" | "task_id" | "reason" | "detail">[]
+    ).filter((execution) => !this.launching.has(execution.task_id));
+    const rank = (id: string) => {
+      const index = this.slotQueue.indexOf(id);
+      return index < 0 ? this.slotQueue.length : index;
+    };
+    ready.sort((a, b) => rank(a.id) - rank(b.id));
+    let active = this.running.size + this.launching.size;
+    this.slotQueue = [];
+    for (const execution of ready) {
+      if (active < limit) {
+        active++;
+        this.launching.add(execution.task_id);
+        setImmediate(() => {
+          this.launching.delete(execution.task_id);
+          this.launch(execution.id);
+        });
+        continue;
+      }
+      const position = this.slotQueue.push(execution.id);
+      const shown = JSON.parse(execution.detail ?? "{}") as { position?: number; limit?: number };
+      const waiting = execution.reason === "waiting_for_slot";
+      if (waiting && shown.position === position && shown.limit === limit) continue;
+      const detail = JSON.stringify({ position, limit });
+      if (this.update(execution.id, { reason: "waiting_for_slot", detail }, "queued") && !waiting) {
+        this.record(
+          execution.id,
+          "status",
+          `Waiting for a free slot: position ${position}, at most ${limit} executions run at once.`,
+        );
+      }
+    }
+  }
+
+  private launch(executionId: string): void {
     const controller = new AbortController();
     const done = this.execute(executionId, controller.signal)
       .catch((error: unknown) => {
@@ -1277,13 +1346,21 @@ export class TaskService {
       .finally(() => {
         this.running.delete(executionId);
         this.waits.delete(executionId);
-        this.schedule(taskId);
+        this.schedule();
       });
     this.running.set(executionId, { controller, done });
   }
 
   private async execute(executionId: string, signal: AbortSignal): Promise<void> {
-    if (!this.update(executionId, { status: "running", started_at: now() }, "queued")) return;
+    if (
+      !this.update(
+        executionId,
+        { status: "running", reason: null, detail: null, started_at: now() },
+        "queued",
+      )
+    ) {
+      return;
+    }
     this.waits.set(executionId, { requests: new Set(), runningNested: 0 });
     this.record(executionId, "status", "Running.");
     const execution = this.db
