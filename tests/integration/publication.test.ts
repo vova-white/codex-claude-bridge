@@ -230,7 +230,7 @@ describe("task publication", () => {
     });
     const { taskId, status } = await run(client, writeTask(project));
     expect(status).toMatchObject({ status: "failed", reason: "provider_error" });
-    expect(status.error.publication).toMatchObject({
+    expect(status.detail.publication).toMatchObject({
       pushed: true,
       pullRequest: { number: 1, url: pullRequestUrl, state: "OPEN" },
     });
