@@ -9,7 +9,7 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, without nested agents, and may publish them as a pull request). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, and cancel work. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, without nested agents, and may publish them as a pull request). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, cancel work, and clean up a writing task's worktree and branch. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
@@ -46,6 +46,21 @@ After each execution that is not cancelled, the bridge reads the branch and its 
 Trust `publication` over Claude's summary for what reached the remote. An execution that failed or was interrupted may still have pushed or opened a pull request: check `publication` before asking for publication again. A follow-up re-checks the remote before it starts and tells Claude about the existing pull request, so Claude updates it rather than opening another.
 
 Review the pull request in proportion to its risk: read its diff (`gh pr diff <url>`, or the worktree against `workspace.baseline`), look at its checks (`gh pr checks <url>`) and Claude's `checks`, and verify what matters rather than repeating Claude's work. Then coordinate integration: request changes through a follow-up, or tell the user the pull request is ready to merge. Merge only when the user asks.
+
+## Cleaning up a writing task
+
+Worktrees and task branches stay until you call `cleanup_task`; finishing, failing, or cancelling a task never removes them. Clean up once you have integrated or abandoned the changes and need no more follow-ups: a follow-up to a cleaned-up task fails with `workspace_removed`, and one sent while `cleanup_task` runs waits for it to finish.
+
+Call `cleanup_task` with `project`, `taskId`, and `scope`: `all` (default) removes the worktree and deletes the task branch; `worktree` removes only the worktree and keeps the branch, for example while its pull request or merge is pending. Pass `dryRun: true` first when unsure: it reports the plan without acting. The response lists `worktree` (`path`, `uncommittedChanges`) and `branch` (`name`, `unintegratedCommits`: commits no other branch, tag, remote-tracking ref, or your checkout's HEAD contains), each with an `action`: `remove` (planned), `removed`, `keep`, `already_removed`, or `failed`.
+
+`outcome` is one of:
+
+- `refused`: nothing was removed. `refusals` gives each reason: `active_execution` (wait for or cancel the task first), `uncommitted_changes` in the worktree, or `unintegrated_commits`: commits no other branch, tag, remote-tracking ref, or your checkout's HEAD contains, either at the worktree's HEAD (for example a detached HEAD, reported as `worktree.unintegratedCommits`) or, with scope `all`, on the task branch. Another task branch at the same commits counts only while it exists: cleanups of one repository, from any of its checkouts, run one at a time, so the last branch holding them is refused. Integrate the work (merge or push the branch, commit the changes), use scope `worktree` to keep the branch, or, only when the user has decided the work is not wanted, repeat with `discardUnintegrated: true` to delete it. Never pass that on your own judgment.
+- `planned`: a dry run found nothing blocking.
+- `cleaned`: every planned resource is gone.
+- `partial`: some removals failed; `failures` names each resource and how Git failed. Call `cleanup_task` again later; resources already gone are reported as `already_removed`.
+
+Only the task's own worktree and branch are removed: never your checkout, other worktrees, remotes, or the task's results and session. `task_result` keeps returning the results after cleanup, and `task_status` shows `workspace.state` as `removed` or `branch_kept` (the branch remains; start a new writing task with it as `baseline` to continue from it). Repeating `cleanup_task` is safe. Read-only tasks own nothing to clean up (`no_workspace`).
 
 ## Parallel tasks and execution slots
 
