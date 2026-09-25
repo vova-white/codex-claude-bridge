@@ -60,8 +60,9 @@ export function loadConfig(path: string): BridgeConfig {
 }
 
 /**
- * Values that must never appear in results or diagnostics: everything an MCP
- * server entry may carry credentials in except its command.
+ * Credentials an MCP server entry may carry, everything except its command.
+ * The bridge never echoes them and masks them in the diagnostics and Git
+ * command lines it composes; Claude's own content passes through unchanged.
  */
 export function configSecrets(config: BridgeConfig): string[] {
   return Object.values(config.mcpServers).flatMap((server) => [

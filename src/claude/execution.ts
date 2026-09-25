@@ -280,7 +280,7 @@ function permissionResult(
     return { behavior: "deny", message: "No one answered this request before the task ended." };
   }
   if ("answers" in response) {
-    // Claude Code looks answers up by its original question text, which the parent may only see redacted.
+    // Claude Code looks answers up by its original question text; the parent answered by position, since duplicate texts are told apart.
     const questions = Array.isArray(input.questions) ? (input.questions as unknown[]) : [];
     const answers = Object.fromEntries(
       questions.map((item, index) => [

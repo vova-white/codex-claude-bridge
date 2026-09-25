@@ -31,7 +31,7 @@ The most common defect is a change that works on the path you tested and is miss
 - `src/mcp/`: the stateless stdio MCP entry point that Codex launches.
 - `src/service/`: the background service, its launcher, task lifecycle, and SQLite store.
 - `src/claude/`: readiness checks, version compatibility, and the Agent SDK execution adapter.
-- `src/ipc.ts`, `src/state.ts`, `src/config.ts`, `src/redact.ts`, `src/workspace.ts`, `src/publication.ts`: the socket protocol, state directory, `config.json`, credential redaction, Git workspace, and a task branch's remote state (pushed revision and pull request) shared by both sides.
+- `src/ipc.ts`, `src/state.ts`, `src/config.ts`, `src/redact.ts`, `src/workspace.ts`, `src/publication.ts`: the socket protocol, state directory, `config.json`, pattern redaction for the bridge's own diagnostics, Git workspace, and a task branch's remote state (pushed revision and pull request) shared by both sides.
 - `plugins/claude-bridge/`: the Codex plugin manifest, `.mcp.json`, and the delegation skill. Its `dist/` is a build output.
 - `tests/`: unit, integration (real MCP entry point and service with `fixtures/fake-claude.ts`), and Playwright E2E. README describes the boundaries.
 
@@ -40,7 +40,7 @@ The most common defect is a change that works on the path you tested and is miss
 - Complexity belongs at the Claude Code adapter boundary. The task lifecycle in the service and the MCP layer stay plain.
 - Inferred types over annotations. `any` is the enemy.
 - Comments describe how a thing is used and move with the code. They describe functions rather than annotate lines.
-- Secrets stay out of logs, results, and command lines. Redaction is a contract, not a nicety.
+- Claude's own content (assistant text, tool inputs, requests, nested summaries, commits, file names, results) passes through unchanged; diagnostics the bridge composes (readiness problems, execution `error`, `service.log`) use only known fields and never copy external text, secrets stay out of argv, and MCP responses never echo configured credentials. Masking Claude's content protects nothing on this single-user machine, where every agent can already read the same files.
 
 ## Pull requests
 
