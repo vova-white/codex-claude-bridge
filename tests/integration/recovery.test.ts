@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -341,6 +341,53 @@ describe("recovery after a service crash", () => {
     ).data.events.map((event: { text: string }) => event.text);
     expect(events).toContain(
       `Could not read the worktree at ${workspace.path} after the restart; inspect it with git directly.`,
+    );
+  });
+
+  it("reports the worktree of a writing execution rolled back to its acceptance as missing when Git has none", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { writeFile: { path: "README.md", content: "# Changed\n" } },
+              commit,
+              { signal: "committed" },
+              { waitFor: "never" },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId, executionId } = await start(client, { project, mode: "write" });
+    await waitFor(() => fixture.signalled("committed") || undefined);
+    const { workspace } = await status(client, project, taskId);
+    await fixture.killService();
+
+    // The worktree is gone but its branch remains, and an OS crash lost the record of either.
+    execFileSync("git", ["worktree", "remove", "--force", workspace.path], { cwd: project });
+    const db = new DatabaseSync(join(fixture.stateDir, "state.db"));
+    db.prepare(
+      "UPDATE executions SET status = 'queued', reason = NULL, detail = NULL, started_at = NULL, process = NULL WHERE id = ?",
+    ).run(executionId);
+    db.prepare("UPDATE workspaces SET state = 'pending' WHERE task_id = ?").run(taskId);
+    db.prepare("UPDATE service_state SET value = 'an-earlier-boot' WHERE key = 'boot_id'").run();
+    db.close();
+    const reconnected = await fixture.connect();
+
+    const recovered = await waitFor(async () => {
+      const state = await status(reconnected, project, taskId);
+      return state.executions[0].detail.recovery.reconciled ? state.executions[0] : undefined;
+    });
+    expect(recovered.detail.recovery).toMatchObject({ reconciled: true, worktree: "missing" });
+    expect(recovered.detail.workspace).toBeUndefined();
+    const events = (
+      await reconnected.call("read_output", { project, taskId, limit: 200 })
+    ).data.events.map((event: { text: string }) => event.text);
+    expect(events).toContain(
+      `Git lists no worktree at ${workspace.path} after the restart, so no changes were recorded; its branch ${workspace.branch} remains: inspect it with git log.`,
     );
   });
 

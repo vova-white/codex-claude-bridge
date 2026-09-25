@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
 import type { FakeGitHub } from "../fixtures/fake-gh.ts";
@@ -562,6 +563,52 @@ describe("task publication", () => {
       dryRun: true,
     });
     expect(cleanup.data.outcome).toBe("planned");
+    expect(creates(ghCalls())).toHaveLength(1);
+    expect(fixture.launches()).toHaveLength(1);
+  });
+
+  it("reconcile a published worktree whose creation a machine restart rolled back", async () => {
+    const { fixture, project, client, ghCalls } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            { signal: "published" },
+            { waitFor: "never" },
+          ],
+        },
+      ],
+    });
+    const { taskId, executionId } = (await client.call("start_task", writeTask(project))).data;
+    await waitFor(() => fixture.signalled("published") || undefined, 15_000);
+    await fixture.killService();
+
+    // An OS crash lost every commit since acceptance, including the one recording the worktree.
+    const db = new DatabaseSync(join(fixture.stateDir, "state.db"));
+    db.prepare(
+      "UPDATE executions SET status = 'queued', reason = NULL, detail = NULL, started_at = NULL, process = NULL WHERE id = ?",
+    ).run(executionId);
+    db.prepare("UPDATE workspaces SET state = 'pending' WHERE task_id = ?").run(taskId);
+    db.prepare("UPDATE service_state SET value = 'an-earlier-boot' WHERE key = 'boot_id'").run();
+    db.close();
+
+    const reconnected = await fixture.connect();
+    const recovered = await waitFor(async () => {
+      const status = (await reconnected.call("task_status", { project, taskId })).data;
+      return status.executions[0].detail.recovery.reconciled ? status : undefined;
+    }, 15_000);
+    expect(recovered.workspace.state).toBe("ready");
+    expect(recovered.executions[0]).toMatchObject({
+      status: "interrupted",
+      reason: "service_restarted",
+      detail: {
+        recovery: { process: "unknown", reconciled: true },
+        workspace: { state: "ready", commitCount: 1, changedFileCount: 1 },
+        publication: { pushed: true, pullRequest: { number: 1, state: "OPEN" } },
+      },
+    });
     expect(creates(ghCalls())).toHaveLength(1);
     expect(fixture.launches()).toHaveLength(1);
   });
