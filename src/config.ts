@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { nestedWriterServerName } from "./claude/nested-writers.ts";
 import { safeDecode } from "./redact.ts";
 
 const mcpServer = z.looseObject({
@@ -46,6 +47,11 @@ export function loadConfig(path: string): BridgeConfig {
     throw new ConfigError(`${path} is invalid: ${z.prettifyError(parsed.error)}`);
   }
   for (const [name, server] of Object.entries(parsed.data.mcpServers)) {
+    if (name === nestedWriterServerName) {
+      throw new ConfigError(
+        `${path}: the MCP server name "${name}" is reserved for the bridge's own tools; rename that server.`,
+      );
+    }
     if (!server.command && !server.url) {
       throw new ConfigError(`${path}: MCP server "${name}" needs a command or a url.`);
     }
