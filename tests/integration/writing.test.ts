@@ -106,12 +106,17 @@ describe("writing tasks", () => {
     expect(result.text).not.toContain("COMMITSECRET");
   });
 
-  it("bound checks by maxChars and serve them in full through the result cursor", async () => {
+  it("bound checks and Git metadata by maxChars and serve them in full through the result cursor", async () => {
     const details = `${"d".repeat(20_000)}-END`;
+    const command = "node <<'JS'\nconsole.log('multi-line')\nJS";
+    const subject = `docs: ${"s".repeat(3_000)}`;
     const { project, client } = await setUp({
       turns: [
         {
           steps: [
+            { writeFile: { path: "notes.txt", content: "n\n" } },
+            { exec: ["git", "add", "notes.txt"] },
+            commit(subject),
             {
               result: {
                 structured: {
@@ -119,7 +124,10 @@ describe("writing tasks", () => {
                   evidence: [],
                   failures: [],
                   remainingWork: [],
-                  checks: [{ command: "npm test", outcome: "failed", details }],
+                  checks: [
+                    { command, outcome: "passed" },
+                    { command: "npm test", outcome: "failed", details },
+                  ],
                 },
               },
             },
@@ -129,21 +137,48 @@ describe("writing tasks", () => {
     });
     const { taskId } = await run(client, writeTask(project));
 
-    const first = (await client.call("task_result", { project, taskId, maxChars: 200 })).data;
-    expect(first.result.checks).toEqual([
-      { command: "npm test", outcome: "failed", details: expect.any(String), complete: false },
+    const first = await client.call("task_result", { project, taskId, maxChars: 200 });
+    expect(first.text.length).toBeLessThan(2_000);
+    expect(first.data.result.checks[0]).toEqual({ command, outcome: "passed" });
+    expect(first.data.result.checks[1]).toMatchObject({ command: "npm test", complete: false });
+
+    const parts = new Map<string, string>();
+    const collect = (items: { field: string; index?: number; key?: string; text: string }[]) => {
+      for (const item of items) {
+        const id = `${item.field}:${item.index ?? ""}:${item.key ?? ""}`;
+        parts.set(id, (parts.get(id) ?? "") + item.text);
+      }
+    };
+    let next = first.data.truncated.next;
+    collect([
+      {
+        field: "checks",
+        index: 1,
+        key: "details",
+        text: first.data.result.checks[1].details ?? "",
+      },
     ]);
-    expect(first.result.checks[0].details.length).toBeLessThan(200);
-    let text = `npm test\n${first.result.checks[0].details}`;
-    let next = first.truncated.next;
     while (next) {
       const page = (
         await client.call("task_result", { project, taskId, maxChars: 16_000, ...next })
       ).data;
-      text += page.parts.map((part: { text: string }) => part.text).join("");
+      collect(page.parts);
       next = page.truncated?.next;
     }
-    expect(text).toBe(`npm test\n${details}`);
+    expect(parts.get("checks:1:details")).toBe(details);
+    expect(parts.get("commits:0:")).toBe(subject.slice(0, 1_000));
+    expect(parts.get("changedFiles:0:")).toBe("notes.txt");
+  });
+
+  it("refuse writing options on read-only tasks", async () => {
+    const { project, client } = await setUp({ turns: [{ steps: [finished("Done.")] }] });
+    const refused = await client.call("start_task", {
+      ...writeTask(project),
+      mode: "read-only",
+      branchType: "bugfix",
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("apply only to writing tasks");
   });
 
   it("return one task for concurrent identical submissions", async () => {

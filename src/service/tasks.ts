@@ -64,8 +64,8 @@ export const startSchema = z.object({
     ),
   branchType: z
     .enum(branchTypes)
-    .default("feature")
-    .describe("Write mode: GitFlow prefix of the task branch."),
+    .optional()
+    .describe("Write mode: GitFlow prefix of the task branch (default feature)."),
 });
 export type StartRequest = z.infer<typeof startSchema>;
 
@@ -166,8 +166,9 @@ const projectLookup = z.object({ project: z.string().min(1) });
 
 /** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
 const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit", "Agent"];
-/** Most commits and changed files a result lists. */
+/** Most commits and changed files a result lists, and the longest commit subject kept. */
 const maxListedChanges = 500;
+const maxSubjectChars = 1_000;
 /** Writing tasks get every tool except subagents, which could not be held to the worktree. */
 const writingDisallowedTools = ["Agent"];
 
@@ -368,10 +369,11 @@ export class TaskService {
         );
       }
       workspace = { baseline, parentDirty };
-    } else if (request.baseline) {
+    } else if (request.baseline || request.branchType) {
+      // Absent options also keep the request identity of read-only tasks as it was.
       throw new ServiceError(
         "invalid_arguments",
-        "baseline applies only to writing tasks; read-only tasks inspect the shared checkout as it is.",
+        "baseline and branchType apply only to writing tasks; read-only tasks inspect the shared checkout as it is.",
       );
     }
 
@@ -417,7 +419,7 @@ export class TaskService {
           .run(
             taskId,
             join(this.paths.worktrees, taskId),
-            taskBranch(request.branchType, request.assignment, taskId),
+            taskBranch(request.branchType ?? "feature", request.assignment, taskId),
             workspace.baseline,
             workspace.parentDirty ? 1 : 0,
             createdAt,
@@ -501,13 +503,7 @@ export class TaskService {
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
     if (!execution.result) return { ...state, result: null };
-    const stored = JSON.parse(execution.result) as Record<string, unknown> & {
-      summary: string;
-      evidence: string[];
-      failures: string[];
-      remainingWork: string[];
-      checks?: Check[];
-    };
+    const stored = JSON.parse(execution.result) as Record<string, unknown> & StoredResult;
     const parts = resultParts(stored);
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
     const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
@@ -525,22 +521,39 @@ export class TaskService {
     }
     const rest = Object.fromEntries(
       Object.entries(stored).filter(
-        ([key]) => !["summary", "evidence", "failures", "remainingWork", "checks"].includes(key),
+        ([key]) =>
+          !["summary", "evidence", "failures", "remainingWork", "checks", "workspace"].includes(
+            key,
+          ),
       ),
     );
-    const shown = (field: string) =>
-      page.parts.filter((item) => item.field === field).map((item) => item.text);
+    const shown = (field: string) => page.parts.filter((item) => item.field === field);
+    const texts = (field: string) => shown(field).map((item) => item.text);
     return {
       ...state,
       result: {
-        summary: shown("summary")[0] ?? "",
-        evidence: shown("evidence"),
-        failures: shown("failures"),
-        remainingWork: shown("remainingWork"),
-        ...(stored.checks
-          ? { checks: page.parts.filter((item) => item.field === "checks").map(shownCheck) }
-          : {}),
+        summary: texts("summary")[0] ?? "",
+        evidence: texts("evidence"),
+        failures: texts("failures"),
+        remainingWork: texts("remainingWork"),
+        ...(stored.checks ? { checks: shownChecks(page.parts, stored.checks) } : {}),
         ...rest,
+        ...(stored.workspace
+          ? {
+              workspace: {
+                ...stored.workspace,
+                ...(stored.workspace.commits
+                  ? {
+                      commits: shown("commits").map((item) => ({
+                        sha: item.sha,
+                        subject: item.text,
+                      })),
+                    }
+                  : {}),
+                ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
+              },
+            }
+          : {}),
       },
       ...truncation,
     };
@@ -1030,9 +1043,10 @@ export class TaskService {
         ? await worktreeChanges(workspace.path, workspace.baseline)
             .then(({ commits, changedFiles }) => ({
               // Long lists are cut; the worktree itself holds every change.
-              commits: commits
-                .slice(0, maxListedChanges)
-                .map(({ sha, subject }) => ({ sha, subject: redactContent(subject, secrets) })),
+              commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
+                sha,
+                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+              })),
               changedFiles: changedFiles
                 .slice(0, maxListedChanges)
                 .map((file) => redactContent(file, secrets)),
@@ -1129,34 +1143,31 @@ interface ResultPart {
   part: number;
   field: string;
   index?: number;
-  /** The outcome of a check part. */
+  /** Which string of a structured item the part holds, such as a check's `command`. */
+  key?: string;
+  /** Short values that belong with the part: a check's outcome, a commit's SHA. */
   outcome?: string;
+  sha?: string;
   text: string;
 }
 
 type Check = z.infer<typeof writingResult>["checks"][number];
 
-/** A check as shown in a bounded result, from its part's (possibly cut) text. */
-function shownCheck(part: ResultPart & { complete?: false }) {
-  const newline = part.text.indexOf("\n");
-  const command = newline < 0 ? part.text : part.text.slice(0, newline);
-  const details = newline < 0 ? undefined : part.text.slice(newline + 1);
-  return {
-    command,
-    outcome: part.outcome,
-    ...(details === undefined ? {} : { details }),
-    ...(part.complete === false ? { complete: false } : {}),
-  };
-}
-
-/** The text of a result as an ordered list of parts: the summary, then each list item. */
-function resultParts(result: {
+interface StoredResult {
   summary: string;
   evidence: string[];
   failures: string[];
   remainingWork: string[];
   checks?: Check[];
-}): ResultPart[] {
+  workspace?: { commits?: { sha: string; subject: string }[]; changedFiles?: string[] };
+}
+
+/**
+ * The text of a result as an ordered list of parts: the summary, each list
+ * item, each check's command and details, and each commit subject and changed
+ * file of a writing task's workspace.
+ */
+function resultParts(result: StoredResult): ResultPart[] {
   const fields = [
     ["evidence", result.evidence],
     ["failures", result.failures],
@@ -1165,20 +1176,54 @@ function resultParts(result: {
   const parts: Omit<ResultPart, "part">[] = [
     { field: "summary", text: result.summary },
     ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
-    // A check's text is its command, then its details on the next line.
-    ...(result.checks ?? []).map((check, index) => ({
-      field: "checks",
+    ...(result.checks ?? []).flatMap((check, index) => [
+      { field: "checks", index, key: "command", outcome: check.outcome, text: check.command },
+      ...(check.details === undefined
+        ? []
+        : [{ field: "checks", index, key: "details", text: check.details }]),
+    ]),
+    ...(result.workspace?.commits ?? []).map(({ sha, subject }, index) => ({
+      field: "commits",
       index,
-      outcome: check.outcome,
-      text: check.details ? `${check.command}\n${check.details}` : check.command,
+      sha,
+      text: subject,
+    })),
+    ...(result.workspace?.changedFiles ?? []).map((text, index) => ({
+      field: "changedFiles",
+      index,
+      text,
     })),
   ];
   return parts.map((item, part) => ({ part, ...item }));
 }
 
+type ShownPart = ResultPart & { offset?: number; complete?: false };
+
+/** Checks as shown in a bounded result; a check whose text was cut says complete: false. */
+function shownChecks(page: ShownPart[], stored: Check[]) {
+  const shown = new Map<number, { command: string; details?: string; complete?: false }>();
+  for (const part of page.filter((item) => item.field === "checks")) {
+    const check = shown.get(part.index!) ?? { command: "" };
+    if (part.key === "command") check.command = part.text;
+    else check.details = part.text;
+    if (part.complete === false) check.complete = false;
+    shown.set(part.index!, check);
+  }
+  return [...shown].map(([index, check]) => {
+    const original = stored[index]!;
+    const missingDetails = original.details !== undefined && check.details === undefined;
+    return {
+      command: check.command,
+      outcome: original.outcome,
+      ...(check.details === undefined ? {} : { details: check.details }),
+      ...(check.complete === false || missingDetails ? { complete: false } : {}),
+    };
+  });
+}
+
 /** Reads parts from a position, returning at most `budget` characters and where to continue. */
 function readParts(parts: ResultPart[], start: number, offset: number, budget: number) {
-  const page: (ResultPart & { offset?: number; complete?: false })[] = [];
+  const page: ShownPart[] = [];
   let remaining = budget;
   for (let part = start; part < parts.length; part++) {
     const from = part === start ? offset : 0;

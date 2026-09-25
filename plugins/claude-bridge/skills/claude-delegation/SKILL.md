@@ -1,6 +1,6 @@
 ---
 name: claude-delegation
-description: Delegate read-only research and review assignments to Claude Code through the claude_bridge MCP tools, check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
+description: Delegate research, review, and code-change assignments to Claude Code through the claude_bridge MCP tools (read-only on the shared checkout, or writing in an isolated Git worktree), check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
 ---
 
 # Claude delegation
@@ -35,7 +35,7 @@ Pass `mode: "write"` to `start_task` for a code change. The service creates a ne
 
 The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
 
-The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure (`error.workspace`), and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the diff with `git -C <path> diff <baseline>` in proportion to its risk, and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
+The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure (`error.workspace`), and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the changes in proportion to their risk — `git -C <path> log <baseline>..HEAD`, `git -C <path> diff <baseline>` (working files), and `git -C <path> status` (staged and untracked files) — and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
 
 ## Follow-ups and cancellation
 
