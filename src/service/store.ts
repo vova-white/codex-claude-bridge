@@ -45,6 +45,31 @@ const migrations: string[] = [
   ALTER TABLE executions ADD COLUMN request_hash TEXT;
   CREATE UNIQUE INDEX executions_by_request_key ON executions (task_id, request_key)
     WHERE request_key IS NOT NULL`,
+  `CREATE TABLE nested_tasks (
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    task_id TEXT NOT NULL,
+    tool_use_id TEXT,
+    parent_tool_use_id TEXT,
+    description TEXT NOT NULL,
+    agent_type TEXT,
+    background INTEGER NOT NULL,
+    depth INTEGER,
+    status TEXT NOT NULL,
+    summary TEXT,
+    termination TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    PRIMARY KEY (execution_id, task_id)
+  )`,
+  `CREATE TABLE workspaces (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    parent_dirty INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
   `CREATE TABLE requests (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL REFERENCES tasks (id),

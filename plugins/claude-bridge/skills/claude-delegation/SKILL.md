@@ -1,6 +1,6 @@
 ---
 name: claude-delegation
-description: Delegate read-only research and review assignments to Claude Code through the claude_bridge MCP tools, check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
+description: Delegate research, review, and code-change assignments to Claude Code through the claude_bridge MCP tools (read-only on the shared checkout, or writing in an isolated Git worktree), check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
 ---
 
 # Claude delegation
@@ -9,11 +9,11 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, and cancel work. Claude cannot edit files, publish changes, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, without nested agents). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, and cancel work. Claude cannot push or open pull requests yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
-Delegate a focused investigation or review that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
+Delegate a focused investigation, review, or implementation that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
 
 ## Delegating a read-only task
 
@@ -29,6 +29,14 @@ Delegate a focused investigation or review that Claude can complete from the rep
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, call `task_result` again with `part` and `offset` from `truncated.next` to read the rest, repeating until no `truncated` remains. Read further only if you need the omitted detail.
 
+## Delegating a writing task
+
+Pass `mode: "write"` to `start_task` for a code change. The service creates a new Git worktree on its own GitFlow task branch (`branchType`: `feature` by default, or `bugfix`, `hotfix`, `release`, `support`) before Claude starts, and Claude edits, installs dependencies, runs checks, and commits only there. Your checkout and other tasks' worktrees are not touched. A worktree isolates Git changes; it is not a sandbox.
+
+The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
+
+The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure (`error.workspace`), and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the changes in proportion to their risk — `git -C <path> log <baseline>..HEAD`, `git -C <path> diff <baseline>` (working files), and `git -C <path> status` (staged and untracked files) — and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
+
 ## Follow-ups and cancellation
 
 Use `send_followup` to continue the same Claude session: ask a clarifying question about the result, or request an adjustment. Each follow-up is a new execution with its own `executionId` and result; the original result never changes (`task_result` without `executionId` still returns it). Choose a new `requestKey` for each follow-up and reuse it only to retry the same message.
@@ -37,7 +45,15 @@ If an execution of the task is still active, the follow-up is queued behind it (
 
 If the follow-up fails with `reason: session_unavailable`, Claude Code can no longer resume the session (or the task never reached Claude). The message was not sent to any other conversation. Start a new task whose brief includes what the follow-up needs.
 
-`cancel_task` stops obsolete work: queued follow-ups are cancelled at once, and the running execution is stopped by ending Claude Code. `cancellation: confirmed` means Claude Code has exited; `requested` means termination is not confirmed yet, so check again with `task_status`. An execution that finished before the cancellation took effect keeps its result. Repeating the call is harmless. Cancellation stops Claude; it does not undo changes Claude already made. You can send a new follow-up to the session after cancelling.
+`cancel_task` stops obsolete work: queued follow-ups are cancelled at once, and the running execution is stopped by asking Claude Code to stop its nested agents and then ending Claude Code. `cancellation: confirmed` means Claude Code has exited; `requested` means termination is not confirmed yet, so check again with `task_status`. An execution that finished before the cancellation took effect keeps its result. Repeating the call is harmless. Cancellation stops Claude; it does not undo changes Claude already made. You can send a new follow-up to the session after cancelling. Each execution lists its nested agents with a `termination`: `reported` (Claude Code reported the agent stopped), `process_exit` (it ended with Claude Code's process without being reported), or `unconfirmed` (it may still run). `controlGap` is present when Claude Code did not report stopping some of them; tell the user when it matters. The bridge never controls work nested agents started outside Claude Code, such as background commands.
+
+## Nested agents
+
+Claude may start nested agents with its Agent tool for independent research or review subtasks, when the gain in quality or elapsed time justifies the extra usage and coordination; its instructions keep small, sequential, or tightly coupled work local. Nested agents get the same read-only tool policy: Claude Code applies the task's disabled edit tools to them too, whatever agent type Claude picks. You do not ask for nested agents, and they are not Codex collaboration agents: you interact only with the task. To keep a task small and cheap, say so in the brief.
+
+Claude remains accountable for nested work and incorporates it into its own result; the bridge records each nested agent separately and never merges or invents results. `task_status` lists them per execution as `nested`: `taskId`, `description`, `agentType`, `background`, `depth` and `parentToolUseId` (which nested agent's `toolUseId` started it; absent when Claude did), `status` (`running`, `completed`, `failed`, `stopped`, `unknown`), Claude Code's `summary`, and `termination`. `read_output` shows their starts, tool calls, progress, and ends as `nested` events.
+
+When Claude finishes its turn while nested agents it started still run, the execution stays `running` with `reason: waiting_for_children` and `detail.runningNested`. It is not complete: Claude continues when they end and its later result becomes the task result. `wait_task` keeps waiting through this state. If Claude Code exits while nested agents still run, the execution fails with `provider_error` rather than reporting a completed assignment. If nested agents never end, the execution waits until you cancel it.
 
 ## Questions and permission requests
 
@@ -61,11 +77,11 @@ A request is answerable only while `live` is true. When the Claude session that 
 
 Read progress only when it helps you decide something, such as whether a long task is on track. `read_output` returns the execution's events after a cursor: status changes, Claude's messages, the tools it called with their inputs, and the final summary. Keep reads small: start with the default `limit` and `maxChars`, pass the returned `nextCursor` as `after` to continue (cursors stay valid after reconnecting), and stop when `hasMore` is false. An event cut to fit `maxChars` is marked `truncated`; read just that event in full with `after` set to its `seq` minus 1, `limit: 1`, and a larger `maxChars`. `lastEventSeq` from `wait_task` tells you whether anything new arrived. Only the newest events of long executions are kept (`retention` says how many were dropped); results are never affected.
 
-Claude runs with the edit tools disabled and without nested agents, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`.
+In read-only tasks, Claude and its nested agents run with the edit tools disabled, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`. Writing tasks report their changes in `workspace.changedFiles` and `workspace.commits` instead.
 
 ## Reading status and results
 
-- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own. `reason: needs_input` means Claude waits for your response to `detail.requestId` (see above); the task does not continue until you answer, deny, or cancel.
+- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own. `reason: waiting_for_children` means Claude's turn ended while nested agents still run; the result is not ready yet. `reason: needs_input` means Claude waits for your response to `detail.requestId` (see above); the task does not continue until you answer, deny, or cancel.
 - `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
 - `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), `session_unavailable` (a follow-up whose session cannot be resumed), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
 - `cancelled`: stopped by `cancel_task`; `detail.processExited` confirms Claude Code exited.

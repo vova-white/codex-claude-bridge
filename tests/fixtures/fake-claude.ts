@@ -25,6 +25,21 @@ export type Step =
   | { exec: string[] }
   /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
   | { ignoreTermination: true }
+  /** The Agent tool call and Claude Code's task_started for a nested agent; `parent` spawns it inside another one. */
+  | {
+      nestedStart: {
+        id: string;
+        description: string;
+        agentType?: string;
+        background?: boolean;
+        parent?: string;
+      };
+    }
+  /** A tool call made inside a nested agent. */
+  | { nestedToolUse: { id: string; name: string; input: Record<string, unknown> } }
+  | { nestedProgress: { id: string; summary: string } }
+  /** Claude Code's task_notification for a nested agent. */
+  | { nestedEnd: { id: string; status: "completed" | "failed" | "stopped"; summary?: string } }
   | {
       result: {
         text?: string;
@@ -69,6 +84,8 @@ export interface Scenario {
   initializeWaitFor?: string;
   /** Makes `--resume` fail the way Claude Code does for a session it cannot find. */
   lostSessions?: boolean;
+  /** Nested agents that accept a stop_task request but never report stopping. */
+  ignoreStop?: string[];
 }
 
 const scenarioPath = process.env.FAKE_CLAUDE_SCENARIO;
@@ -140,7 +157,7 @@ function respond(requestId: string, response: unknown): void {
   });
 }
 
-function assistant(content: unknown[], error?: string): void {
+function assistant(content: unknown[], error?: string, parent: string | null = null): void {
   send({
     type: "assistant",
     message: {
@@ -153,7 +170,7 @@ function assistant(content: unknown[], error?: string): void {
       stop_sequence: null,
       usage: { input_tokens: 0, output_tokens: 0 },
     },
-    parent_tool_use_id: null,
+    parent_tool_use_id: parent,
     ...(error ? { error } : {}),
     uuid: randomUUID(),
     session_id: sessionId,
@@ -167,6 +184,23 @@ function promptText(message: { message?: { content?: unknown } }): string {
     return content.map((part: { text?: string }) => part.text ?? "").join("\n");
   }
   return "";
+}
+
+/** The Agent tool call that started a scripted nested agent. */
+const agentToolUse = (id: string) => `toolu_agent_${id}`;
+
+function taskNotification(id: string, status: string, summary = ""): void {
+  send({
+    type: "system",
+    subtype: "task_notification",
+    task_id: id,
+    tool_use_id: agentToolUse(id),
+    status,
+    output_file: "",
+    summary,
+    uuid: randomUUID(),
+    session_id: sessionId,
+  });
 }
 
 async function waitForFile(path: string): Promise<void> {
@@ -271,6 +305,54 @@ async function answer(prompt: string): Promise<void> {
       process.on("SIGTERM", () => {});
       // Stay alive after stdin closes, as a hung process would.
       setInterval(() => {}, 60_000);
+    } else if ("nestedStart" in step) {
+      const {
+        id,
+        description,
+        agentType = "general-purpose",
+        background = false,
+        parent,
+      } = step.nestedStart;
+      const input = { description, prompt: description, subagent_type: agentType };
+      assistant(
+        [{ type: "tool_use", id: agentToolUse(id), name: "Agent", input }],
+        undefined,
+        parent ? agentToolUse(parent) : null,
+      );
+      send({
+        type: "system",
+        subtype: "task_started",
+        task_id: id,
+        tool_use_id: agentToolUse(id),
+        description,
+        subagent_type: agentType,
+        is_backgrounded: background,
+        spawn_depth: parent ? 2 : 1,
+        task_type: "local_agent",
+        uuid: randomUUID(),
+        session_id: sessionId,
+      });
+    } else if ("nestedToolUse" in step) {
+      const { id, name, input } = step.nestedToolUse;
+      assistant(
+        [{ type: "tool_use", id: `toolu_${randomUUID()}`, name, input }],
+        undefined,
+        agentToolUse(id),
+      );
+    } else if ("nestedProgress" in step) {
+      send({
+        type: "system",
+        subtype: "task_progress",
+        task_id: step.nestedProgress.id,
+        tool_use_id: agentToolUse(step.nestedProgress.id),
+        description: step.nestedProgress.id,
+        summary: step.nestedProgress.summary,
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: randomUUID(),
+        session_id: sessionId,
+      });
+    } else if ("nestedEnd" in step) {
+      taskNotification(step.nestedEnd.id, step.nestedEnd.status, step.nestedEnd.summary);
     } else if ("exec" in step) {
       const [command = "true", ...commandArgs] = step.exec;
       execFileSync(command, commandArgs, { cwd: process.cwd() });
@@ -379,6 +461,12 @@ lines.on("line", (line) => {
           ...(scenario.settingsMcpServers ?? []),
         ],
       });
+      break;
+    case "stop_task":
+      if (!scenario.ignoreStop?.includes(request.task_id)) {
+        taskNotification(request.task_id, "stopped");
+      }
+      respond(requestId, {});
       break;
     default:
       send({
