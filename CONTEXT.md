@@ -17,6 +17,9 @@ A bounded assignment from the parent agent to a child agent, with an expected re
 **Execution**:
 One run of Claude Code for a delegated task, with its own identity, status, and result. The first execution carries the original assignment.
 
+**Execution slot**:
+One of the limited number of executions the bridge service runs at once. An execution holds its slot from start to end, whatever it waits for meanwhile (an answer, subscription capacity, nested agents); nested agents run inside it and take no slot of their own.
+
 **Request key**:
 A caller-chosen key that identifies one request so a retry returns what the first attempt created: a start request within a project and logical caller returns the existing task, and a follow-up within a task returns the existing execution.
 
