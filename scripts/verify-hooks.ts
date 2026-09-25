@@ -170,7 +170,7 @@ try {
   const sourceCommit = commit();
   assert.equal(sourceCommit.status, 0, sourceCommit.stdout + sourceCommit.stderr);
   assert.match(sourceCommit.stdout + sourceCommit.stderr, /test related --run/);
-  assert.match(sourceCommit.stdout + sourceCommit.stderr, /5 passed/);
+  assert.match(sourceCommit.stdout + sourceCommit.stderr, /Test Files +1 passed/);
   assert.match(sourceCommit.stdout + sourceCommit.stderr, /tsc --noEmit/);
   assert.doesNotMatch(
     sourceCommit.stdout + sourceCommit.stderr,
