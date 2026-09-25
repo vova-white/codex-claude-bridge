@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -22,6 +22,11 @@ export async function repositoryRoot(path: string): Promise<string | undefined> 
   } catch {
     return undefined;
   }
+}
+
+/** The Git directory that all checkouts of the repository at `root` share, with its refs. */
+export async function commonGitDirectory(root: string): Promise<string> {
+  return realpathSync(resolve(root, (await git(root, "rev-parse", "--git-common-dir")).trim()));
 }
 
 /** A comparable record of a checkout's HEAD, index, and working files. */

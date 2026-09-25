@@ -23,6 +23,7 @@ import {
   changedPaths,
   checkoutHead,
   checkoutState,
+  commonGitDirectory,
   deleteBranch,
   hasUncommittedChanges,
   registeredWorktrees,
@@ -394,9 +395,9 @@ export class TaskService {
     string,
     { resolve: (response: RequestResponse | undefined) => void; secrets: readonly string[] }
   >();
-  /** Tasks whose worktree or branch cleanup_task is removing. */
-  private readonly cleaning = new Set<string>();
-  /** The latest cleanup of each project, which the next one waits for. */
+  /** Tasks cleanup_task is checking or cleaning up, settled when it finishes. */
+  private readonly cleaning = new Map<string, Promise<void>>();
+  /** The latest cleanup of each repository, by common Git directory, which the next one waits for. */
   private readonly cleanups = new Map<string, Promise<void>>();
 
   constructor(
@@ -745,6 +746,8 @@ export class TaskService {
   async followUp(caller: string, params: unknown) {
     const { project, taskId, requestKey, message } = parse(followUpSchema, params);
     const task = await this.task(caller, project, taskId);
+    // A cleanup decides on the worktree's commits, so none may appear until it finishes.
+    while (this.cleaning.has(task.id)) await this.cleaning.get(task.id);
     const hash = createHash("sha256").update(message).digest("hex");
     const existing = this.db
       .prepare("SELECT * FROM executions WHERE task_id = ? AND request_key = ?")
@@ -764,11 +767,11 @@ export class TaskService {
       };
     }
     const workspace = this.workspace(task.id);
-    if (workspace && (this.cleaning.has(task.id) || cleanedStates.includes(workspace.state))) {
+    if (workspace && cleanedStates.includes(workspace.state)) {
       // Never run a follow-up in a different, recreated worktree.
       throw new ServiceError(
         "workspace_removed",
-        `The worktree of task ${task.id} ${this.cleaning.has(task.id) ? "is being removed" : "was removed"} by cleanup_task, so the follow-up was not sent; the task's results remain available. ${
+        `The worktree of task ${task.id} was removed by cleanup_task, so the follow-up was not sent; the task's results remain available. ${
           workspace.state === "branch_kept"
             ? `Its branch ${workspace.branch} is kept: start a new writing task with baseline "${workspace.branch}" to continue from it.`
             : "Start a new writing task with the context the follow-up needs."
@@ -887,17 +890,21 @@ export class TaskService {
         `Task ${task.id} is a read-only task on the shared checkout; it owns no worktree or branch to clean up.`,
       );
     }
-    // One cleanup per repository at a time: task branches may contain each
-    // other's commits, so each decision must see the refs earlier ones removed.
-    const previous = this.cleanups.get(task.project) ?? Promise.resolve();
+    // One cleanup per repository at a time, across all its checkouts: task
+    // branches may contain each other's commits, so each decision must see the
+    // refs earlier ones removed. Follow-ups to the task wait until it finishes.
+    const repository = await commonGitDirectory(task.project);
+    const previous = this.cleanups.get(repository) ?? Promise.resolve();
     const current = previous.then(() => this.cleanWorkspace(task, workspace, request));
     const settled = current.then(
       () => undefined,
       () => undefined,
     );
-    this.cleanups.set(task.project, settled);
+    this.cleanups.set(repository, settled);
+    this.cleaning.set(task.id, settled);
     void settled.then(() => {
-      if (this.cleanups.get(task.project) === settled) this.cleanups.delete(task.project);
+      if (this.cleanups.get(repository) === settled) this.cleanups.delete(repository);
+      if (this.cleaning.get(task.id) === settled) this.cleaning.delete(task.id);
     });
     return current;
   }
@@ -907,6 +914,13 @@ export class TaskService {
     workspace: WorkspaceRow,
     { scope, dryRun, discardUnintegrated }: z.infer<typeof cleanupSchema>,
   ) {
+    // Checked before inspecting Git: an execution active now could still commit
+    // during the inspection, and none can start until this cleanup finishes.
+    const active = this.db
+      .prepare(
+        "SELECT id, status FROM executions WHERE task_id = ? AND status IN ('queued', 'running') ORDER BY ordinal",
+      )
+      .all(task.id) as { id: string; status: string }[];
     const root = task.project;
     const { path, branch } = workspace;
     const worktreePresent = await this.worktreeRegistered(root, path);
@@ -934,12 +948,6 @@ export class TaskService {
       ? await unintegratedCommits(root, `refs/heads/${branch}`, branch).catch(() => undefined)
       : 0;
 
-    // Checked after inspecting Git, together with claiming the task, so no execution starts in between.
-    const active = this.db
-      .prepare(
-        "SELECT id, status FROM executions WHERE task_id = ? AND status IN ('queued', 'running') ORDER BY ordinal",
-      )
-      .all(task.id) as { id: string; status: string }[];
     const refusals: { code: string; message: string }[] = [];
     for (const execution of active) {
       refusals.push({
@@ -1001,41 +1009,36 @@ export class TaskService {
     if (refusals.length > 0) return report("refused");
     if (dryRun) return report("planned");
 
-    this.cleaning.add(task.id);
-    try {
-      if (removingWorktree) {
-        try {
-          await removeWorktree(root, path, discardUnintegrated);
-          worktreeAction = "removed";
-        } catch (error) {
-          worktreeAction = "failed";
-          failures.push({
-            resource: "worktree",
-            message: `git worktree remove ${exitStatus(error)}; the worktree at ${path} and branch ${branch} are kept.`,
-          });
-        }
+    if (removingWorktree) {
+      try {
+        await removeWorktree(root, path, discardUnintegrated);
+        worktreeAction = "removed";
+      } catch (error) {
+        worktreeAction = "failed";
+        failures.push({
+          resource: "worktree",
+          message: `git worktree remove ${exitStatus(error)}; the worktree at ${path} and branch ${branch} are kept.`,
+        });
       }
-      if (removingBranch && worktreeAction === "failed") branchAction = "keep";
-      else if (removingBranch) {
-        try {
-          await deleteBranch(root, branch);
-          branchAction = "removed";
-        } catch (error) {
-          branchAction = "failed";
-          failures.push({
-            resource: "branch",
-            message: `git branch -D ${exitStatus(error)}; branch ${branch} is kept.`,
-          });
-        }
+    }
+    if (removingBranch && worktreeAction === "failed") branchAction = "keep";
+    else if (removingBranch) {
+      try {
+        await deleteBranch(root, branch);
+        branchAction = "removed";
+      } catch (error) {
+        branchAction = "failed";
+        failures.push({
+          resource: "branch",
+          message: `git branch -D ${exitStatus(error)}; branch ${branch} is kept.`,
+        });
       }
-      if (!(await this.worktreeRegistered(root, path))) {
-        const branchKept = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
-        this.db
-          .prepare("UPDATE workspaces SET state = ? WHERE task_id = ?")
-          .run(branchKept ? "branch_kept" : "removed", task.id);
-      }
-    } finally {
-      this.cleaning.delete(task.id);
+    }
+    if (!(await this.worktreeRegistered(root, path))) {
+      const branchKept = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
+      this.db
+        .prepare("UPDATE workspaces SET state = ? WHERE task_id = ?")
+        .run(branchKept ? "branch_kept" : "removed", task.id);
     }
     return report(failures.length > 0 ? "partial" : "cleaned");
   }

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
@@ -302,6 +302,103 @@ describe("task cleanup", () => {
     for (const { shared } of [sequential, concurrent]) {
       expect(git(project, "branch", "--contains", shared)).not.toBe("");
     }
+  });
+
+  it("keeps a commit shared by task branches started from different checkouts of one repository", async () => {
+    const { fixture, project, client } = await setUp({
+      turns: [
+        { match: "Share", steps: [...commit("shared.txt"), finished("Shared.")] },
+        { steps: [finished("Reused.")] },
+      ],
+    });
+    const checkout = join(fixture.root, "second-checkout");
+    git(project, "worktree", "add", "--quiet", "-b", "user/second", checkout);
+    const owner = await run(client, project, "Share it.");
+    const started = await client.call("start_task", {
+      project: checkout,
+      requestKey: "reuse",
+      mode: "write",
+      assignment: "Reuse it.",
+      expectedResult: "Nothing.",
+      baseline: owner.workspace.branch,
+    });
+    const reuse = started.data.taskId as string;
+    await client.call("wait_task", { project: checkout, taskId: reuse, timeoutSeconds: 30 });
+    const shared = git(project, "rev-parse", owner.workspace.branch);
+
+    const reports = await Promise.all([
+      cleanup(client, project, owner.taskId),
+      cleanup(client, checkout, reuse),
+    ]);
+    expect(reports.map((report) => report.outcome).toSorted()).toEqual(["cleaned", "refused"]);
+    expect(git(project, "branch", "--contains", shared)).not.toBe("");
+  });
+
+  it("refuses when an execution commits and finishes while cleanup inspects Git", async () => {
+    const fixture = new BridgeFixture({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { signal: "started" },
+              { waitFor: "finish" },
+              ...commit("late.txt"),
+              finished("Late."),
+            ],
+          },
+        ],
+      },
+    });
+    fixtures.push(fixture);
+    // A git that holds the first commit count's answer until the test releases it.
+    const bin = join(fixture.root, "bin");
+    const paused = join(fixture.root, "count-paused");
+    const release = join(fixture.root, "count-release");
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh
+case " $* " in *" rev-list --count "*) ;; *) exec "${realGit}" "$@" ;; esac
+out=$("${realGit}" "$@"); code=$?
+if [ ! -e "${release}" ]; then
+  touch "${paused}"
+  while [ ! -e "${release}" ]; do sleep 0.01; done
+fi
+printf '%s\\n' "$out"; exit $code
+`,
+      { mode: 0o755 },
+    );
+    fixture.env.PATH = `${bin}:${fixture.env.PATH}`;
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const started = await client.call("start_task", {
+      project,
+      requestKey: "late",
+      mode: "write",
+      assignment: "Commit late.",
+      expectedResult: "A commit.",
+    });
+    const { taskId } = started.data;
+    await waitFor(() => fixture.signalled("started") || undefined);
+    const { workspace } = (await client.call("task_status", { project, taskId })).data;
+
+    const cleaning = client.call("cleanup_task", { project, taskId });
+    await waitFor(() => existsSync(paused) || undefined);
+    fixture.release("finish");
+    const waited = await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(waited.data.status).toBe("completed");
+    const late = git(workspace.path, "rev-parse", "HEAD");
+    writeFileSync(release, "");
+
+    const report = await cleaning;
+    expect(report.isError, report.text).toBe(false);
+    expect(report.data).toMatchObject({
+      outcome: "refused",
+      refusals: [{ code: "active_execution" }],
+    });
+    expect(git(project, "branch", "--contains", late)).toContain(workspace.branch);
+    expect(existsSync(workspace.path)).toBe(true);
   });
 
   it("refuses while an execution is active, whatever the caller decides", async () => {
