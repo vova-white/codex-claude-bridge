@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { lstatSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -22,6 +22,11 @@ export async function repositoryRoot(path: string): Promise<string | undefined> 
   } catch {
     return undefined;
   }
+}
+
+/** The Git directory that all checkouts of the repository at `root` share, with its refs. */
+export async function commonGitDirectory(root: string): Promise<string> {
+  return realpathSync(resolve(root, (await git(root, "rev-parse", "--git-common-dir")).trim()));
 }
 
 /** A comparable record of a checkout's HEAD, index, and working files. */
@@ -161,4 +166,56 @@ export async function worktreeChanges(
     ...new Set([working, staged, untracked].flatMap((list) => list.split("\0")).filter(Boolean)),
   ].toSorted();
   return { commits, changedFiles };
+}
+
+/** Paths of the worktrees Git has registered for the repository, including missing ones. */
+export async function registeredWorktrees(root: string): Promise<string[]> {
+  return (await git(root, "worktree", "list", "--porcelain"))
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+}
+
+/** The commit a checkout's HEAD names, and its branch unless HEAD is detached. */
+export async function checkoutHead(path: string): Promise<{ commit: string; branch?: string }> {
+  const commit = (await git(path, "rev-parse", "--verify", "HEAD")).trim();
+  const branch = (
+    await git(path, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "")
+  ).trim();
+  return { commit, ...(branch ? { branch } : {}) };
+}
+
+/**
+ * How many commits reachable from `tip` no branch, tag, remote-tracking ref, or
+ * the checkout's HEAD contains, leaving out the branch `deleting`: the work that
+ * removing `tip` and deleting that branch would lose.
+ */
+export async function unintegratedCommits(
+  root: string,
+  tip: string,
+  deleting?: string,
+): Promise<number> {
+  const count = await git(
+    root,
+    "rev-list",
+    "--count",
+    tip,
+    "--not",
+    ...(deleting ? [`--exclude=${deleting}`] : []),
+    "--branches",
+    "--remotes",
+    "--tags",
+    "HEAD",
+  );
+  return Number(count.trim());
+}
+
+/** Removes a registered worktree; without `force`, Git refuses one with changes. */
+export async function removeWorktree(root: string, path: string, force: boolean): Promise<void> {
+  await git(root, "worktree", "remove", ...(force ? ["--force"] : []), path);
+}
+
+/** Deletes a local branch whatever it contains; the caller decides that it may go. */
+export async function deleteBranch(root: string, branch: string): Promise<void> {
+  await git(root, "branch", "--quiet", "-D", branch);
 }

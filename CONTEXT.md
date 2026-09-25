@@ -30,7 +30,7 @@ The identity that owns delegated tasks across MCP connections, such as one Codex
 The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except Claude Code's own nested agents, and may start nested writers.
 
 **Task worktree**:
-The Git worktree and task branch a writing agent works in, created from a committed baseline. It isolates Git changes from other agents; it is not a sandbox.
+The Git worktree and task branch a writing agent works in, created from a committed baseline. It isolates Git changes from other agents; it is not a sandbox. It stays after the task ends until the parent agent cleans it up.
 
 **Task result**:
 The outcome of delegated work, including findings or code changes, verification evidence, and any associated pull request.

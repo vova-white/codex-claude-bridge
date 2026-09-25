@@ -9,7 +9,7 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, and may split independent changes among nested writers in worktrees of their own; see "Nested writers"). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, and cancel work. Claude cannot push or open pull requests yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, and may split independent changes among nested writers in worktrees of their own; see "Nested writers"). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, cancel work, and clean up a writing task's worktree and branch. Claude cannot push or open pull requests yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
@@ -36,6 +36,21 @@ Pass `mode: "write"` to `start_task` for a code change. The service creates a ne
 The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
 
 The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure, and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the changes in proportion to their risk — `git -C <path> log <baseline>..HEAD`, `git -C <path> diff <baseline>` (working files), and `git -C <path> status` (staged and untracked files) — and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
+
+## Cleaning up a writing task
+
+Worktrees and task branches stay until you call `cleanup_task`; finishing, failing, or cancelling a task never removes them. Clean up once you have integrated or abandoned the changes and need no more follow-ups: a follow-up to a cleaned-up task fails with `workspace_removed`, and one sent while `cleanup_task` runs waits for it to finish.
+
+Call `cleanup_task` with `project`, `taskId`, and `scope`: `all` (default) removes the worktree and deletes the task branch; `worktree` removes only the worktree and keeps the branch, for example while its pull request or merge is pending. Pass `dryRun: true` first when unsure: it reports the plan without acting. The response lists `worktree` (`path`, `uncommittedChanges`) and `branch` (`name`, `unintegratedCommits`: commits no other branch, tag, remote-tracking ref, or your checkout's HEAD contains), each with an `action`: `remove` (planned), `removed`, `keep`, `already_removed`, or `failed`.
+
+`outcome` is one of:
+
+- `refused`: nothing was removed. `refusals` gives each reason: `active_execution` (wait for or cancel the task first), `uncommitted_changes` in the worktree, or `unintegrated_commits`: commits no other branch, tag, remote-tracking ref, or your checkout's HEAD contains, either at the worktree's HEAD (for example a detached HEAD, reported as `worktree.unintegratedCommits`) or, with scope `all`, on the task branch. Another task branch at the same commits counts only while it exists: cleanups of one repository, from any of its checkouts, run one at a time, so the last branch holding them is refused. Integrate the work (merge or push the branch, commit the changes), use scope `worktree` to keep the branch, or, only when the user has decided the work is not wanted, repeat with `discardUnintegrated: true` to delete it. Never pass that on your own judgment.
+- `planned`: a dry run found nothing blocking.
+- `cleaned`: every planned resource is gone.
+- `partial`: some removals failed; `failures` names each resource and how Git failed. Call `cleanup_task` again later; resources already gone are reported as `already_removed`.
+
+Only the task's own worktree and branch are removed: never your checkout, other worktrees, remotes, or the task's results and session. `task_result` keeps returning the results after cleanup, and `task_status` shows `workspace.state` as `removed` or `branch_kept` (the branch remains; start a new writing task with it as `baseline` to continue from it). Repeating `cleanup_task` is safe. Read-only tasks own nothing to clean up (`no_workspace`).
 
 ## Parallel tasks and execution slots
 
