@@ -39,7 +39,10 @@ const trackerCall: Step = {
 const trackerConfig = { mcpServers: { tracker: { command: "tracker-mcp" } } };
 
 async function startTask(steps: Step[], options: BridgeOptions = {}) {
-  const fixture = new BridgeFixture({ ...options, scenario: { turns: [{ steps }] } });
+  const fixture = new BridgeFixture({
+    ...options,
+    scenario: { ...options.scenario, turns: [{ steps }] },
+  });
   fixtures.push(fixture);
   const project = fixture.createRepository();
   const client = await fixture.connect();
@@ -421,4 +424,90 @@ describe("stale requests", () => {
     expect(pids.every((pid) => !isAlive(pid))).toBe(true);
     await expectExpired(client, project, taskId, requestId);
   });
+});
+
+describe("requests with nested agents", () => {
+  const nestedRequest: Step[] = [
+    { nestedStart: { id: "docs", description: "Review the docs", background: true } },
+    // A nested agent's tool call waits for approval while the executor's turn ends.
+    { canUseTool: { ...trackerCall.canUseTool, await: false } },
+    finished("Started a background review of the docs."),
+  ];
+
+  it("keep needs_input over waiting for children, then wait for children after the answer", async () => {
+    const { fixture, client, project, taskId, executionId } = await startTask(
+      [
+        ...nestedRequest,
+        { waitFor: "child" },
+        { nestedEnd: { id: "docs", status: "completed" } },
+        finished("Done."),
+      ],
+      { config: trackerConfig },
+    );
+    const { requestId } = await pendingRequest(client, project, taskId);
+    await waitFor(async () =>
+      (await events(client, project, taskId)).some((text: string) =>
+        text.startsWith("Claude finished its turn"),
+      ),
+    );
+    const status = (await client.call("task_status", { project, taskId })).data;
+    expect(status).toMatchObject({ reason: "needs_input", detail: { requestId } });
+    const waited = await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(waited.data).toMatchObject({ reason: "needs_input", timedOut: false });
+
+    await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId,
+      response: { decision: "allow" },
+    });
+    const after = (await client.call("task_status", { project, taskId })).data;
+    expect(after).toMatchObject({
+      status: "running",
+      reason: "waiting_for_children",
+      detail: { runningNested: 1 },
+    });
+
+    fixture.release("child");
+    const done = await client.call("wait_task", {
+      project,
+      taskId,
+      executionId,
+      timeoutSeconds: 30,
+    });
+    expect(done.data.status).toBe("completed");
+  });
+
+  it("expire a pending request as soon as cancellation starts, while nested agents stop", async () => {
+    const { client, project, taskId } = await startTask(
+      [
+        { nestedStart: { id: "docs", description: "Review the docs", background: true } },
+        trackerCall,
+        { waitFor: "never" },
+      ],
+      // The nested agent never reports stopping, so the bridge waits its grace period.
+      { config: trackerConfig, scenario: { ignoreStop: ["docs"] } },
+    );
+    const { requestId } = await pendingRequest(client, project, taskId);
+
+    const cancelling = client.call("cancel_task", { project, taskId });
+    await waitFor(async () => {
+      const status = (await client.call("task_status", { project, taskId })).data;
+      return status.requests[0].state === "expired" || undefined;
+    }, 3_000);
+    const late = await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId,
+      response: { decision: "allow" },
+    });
+    expect(late.isError).toBe(true);
+    expect(late.text).toContain("expired");
+    await waitFor(async () =>
+      (await events(client, project, taskId)).some((text: string) =>
+        text.startsWith("mcp__tracker__create_issue denied"),
+      ),
+    );
+    expect((await cancelling).data).toMatchObject({ cancellation: "confirmed" });
+  }, 30_000);
 });

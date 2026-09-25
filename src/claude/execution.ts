@@ -93,8 +93,9 @@ export interface ExecutionObserver {
   /**
    * Claude waits for the parent agent: an answer to its question or a decision
    * on a tool call. Resolves with the parent's response, or with undefined if
-   * the request ended unanswered. `signal` aborts once no response can reach
-   * Claude any more: Claude Code withdrew the request or the execution ended.
+   * the request ended unanswered. `signal` aborts once no response may reach
+   * Claude any more: Claude Code withdrew the request, cancellation began, or
+   * the execution ended.
    */
   request(request: PendingRequest, signal: AbortSignal): Promise<RequestResponse | undefined>;
 }
@@ -331,9 +332,10 @@ export async function runExecution(
     } else {
       return { behavior: "allow", updatedInput: toolInput };
     }
+    // Cancellation ends the request at once, before nested agents are given time to stop.
     const response = await observer.request(
       pending,
-      AbortSignal.any([options.signal, ended.signal]),
+      AbortSignal.any([options.signal, request.signal, ended.signal]),
     );
     return permissionResult(toolInput, response);
   };

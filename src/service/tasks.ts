@@ -223,6 +223,17 @@ interface TaskRow {
   created_at: string;
 }
 
+/**
+ * What a running execution waits for: requests the caller must answer, oldest
+ * first; subscription capacity; and nested agents still running after the
+ * executor's turn.
+ */
+interface Waits {
+  requests: Set<string>;
+  capacity?: { resetsAt?: number };
+  runningNested: number;
+}
+
 interface RequestRow {
   id: string;
   task_id: string;
@@ -346,6 +357,8 @@ export class TaskService {
   /** Tasks whose next queued execution is about to start. */
   private readonly launching = new Set<string>();
   /** Requests Claude is waiting on in this process, with the means to answer them. */
+  /** What each execution running in this process waits for; its reason is derived from it. */
+  private readonly waits = new Map<string, Waits>();
   private readonly live = new Map<
     string,
     { resolve: (response: RequestResponse | undefined) => void; secrets: readonly string[] }
@@ -611,7 +624,7 @@ export class TaskService {
       "status",
       `Request ${requestId} answered${"decision" in answer ? ` (${answer.decision})` : ""}.`,
     );
-    this.showPendingRequest(request.execution_id);
+    this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
     live.resolve(answer);
     const answered = this.db
       .prepare("SELECT * FROM requests WHERE id = ?")
@@ -1018,7 +1031,7 @@ export class TaskService {
           ? `Needs input: request ${id} asks ${questions.join(" ")}`
           : `Needs input: request ${id} asks to call ${toolName}.`,
       );
-      this.showPendingRequest(executionId);
+      this.block(executionId, (waits) => waits.requests.add(id));
       if (signal.aborted) this.expire(id);
       else signal.addEventListener("abort", () => this.expire(id), { once: true });
     });
@@ -1039,28 +1052,35 @@ export class TaskService {
     this.live.delete(requestId);
     if (expired && request) {
       this.record(request.execution_id, "status", `Request ${requestId} expired unanswered.`);
-      this.showPendingRequest(request.execution_id);
+      this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
     }
     live?.resolve(undefined);
   }
 
-  /** Keeps a running execution's needs_input state in line with its oldest pending request. */
-  private showPendingRequest(executionId: string): void {
-    const oldest = this.db
-      .prepare(
-        "SELECT id FROM requests WHERE execution_id = ? AND state = 'pending' ORDER BY created_at, rowid LIMIT 1",
-      )
-      .get(executionId) as { id: string } | undefined;
+  /**
+   * Changes what a running execution waits for and shows the most pressing wait
+   * as its reason: a request the caller must answer, then subscription
+   * capacity, then nested agents after the executor's turn.
+   */
+  private block(executionId: string, change: (waits: Waits) => void): void {
+    const waits = this.waits.get(executionId);
+    if (!waits) return;
+    change(waits);
+    const [firstRequest] = waits.requests;
+    const [reason, detail] =
+      firstRequest !== undefined
+        ? ["needs_input", { requestId: firstRequest }]
+        : waits.capacity
+          ? ["waiting_for_capacity", waits.capacity]
+          : waits.runningNested > 0
+            ? ["waiting_for_children", { runningNested: waits.runningNested }]
+            : [null, null];
+    const shown = detail === null ? null : JSON.stringify(detail);
     const current = this.db
       .prepare("SELECT reason, detail FROM executions WHERE id = ?")
       .get(executionId) as { reason: string | null; detail: string | null };
-    if (oldest) {
-      const detail = JSON.stringify({ requestId: oldest.id });
-      if (current.reason !== "needs_input" || current.detail !== detail) {
-        this.update(executionId, { reason: "needs_input", detail });
-      }
-    } else if (current.reason === "needs_input") {
-      this.update(executionId, { reason: null, detail: null });
+    if (current.reason !== reason || current.detail !== shown) {
+      this.update(executionId, { reason, detail: shown });
     }
   }
 
@@ -1251,6 +1271,7 @@ export class TaskService {
       })
       .finally(() => {
         this.running.delete(executionId);
+        this.waits.delete(executionId);
         this.schedule(taskId);
       });
     this.running.set(executionId, { controller, done });
@@ -1258,6 +1279,7 @@ export class TaskService {
 
   private async execute(executionId: string, signal: AbortSignal): Promise<void> {
     if (!this.update(executionId, { status: "running", started_at: now() }, "queued")) return;
+    this.waits.set(executionId, { requests: new Set(), runningNested: 0 });
     this.record(executionId, "status", "Running.");
     const execution = this.db
       .prepare("SELECT * FROM executions WHERE id = ?")
@@ -1332,27 +1354,19 @@ export class TaskService {
               .run(sessionId, executionId);
           },
           capacity: (waiting) => {
-            const current = this.db
-              .prepare("SELECT reason, detail FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null; detail: string | null };
-            const detail = waiting ? JSON.stringify(waiting) : null;
-            const unchanged = waiting
-              ? current.reason === "waiting_for_capacity" && current.detail === detail
-              : current.reason !== "waiting_for_capacity";
-            if (unchanged) return;
-            const changed = this.update(
+            const waits = this.waits.get(executionId);
+            if (!waits || JSON.stringify(waits.capacity) === JSON.stringify(waiting)) return;
+            this.block(executionId, (current) => {
+              if (waiting) current.capacity = waiting;
+              else delete current.capacity;
+            });
+            this.record(
               executionId,
-              waiting ? { reason: "waiting_for_capacity", detail } : { reason: null, detail: null },
+              "status",
+              waiting
+                ? `Waiting for subscription capacity${waiting.resetsAt ? ` until ${new Date(waiting.resetsAt * 1000).toISOString()}` : ""}.`
+                : "Subscription capacity is available again.",
             );
-            if (changed) {
-              this.record(
-                executionId,
-                "status",
-                waiting
-                  ? `Waiting for subscription capacity${waiting.resetsAt ? ` until ${new Date(waiting.resetsAt * 1000).toISOString()}` : ""}.`
-                  : "Running.",
-              );
-            }
           },
           message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
           // Strings are redacted before serialization, which would escape them.
@@ -1406,26 +1420,17 @@ export class TaskService {
             );
           },
           waitingForChildren: (count) => {
-            const current = this.db
-              .prepare("SELECT reason FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null };
-            if (count === 0 && current.reason !== "waiting_for_children") return;
-            const changed = this.update(
-              executionId,
-              count > 0
-                ? {
-                    reason: "waiting_for_children",
-                    detail: JSON.stringify({ runningNested: count }),
-                  }
-                : { reason: null, detail: null },
-            );
-            if (changed && current.reason !== "waiting_for_children") {
+            const waits = this.waits.get(executionId);
+            if (!waits) return;
+            const previous = waits.runningNested;
+            this.block(executionId, (current) => (current.runningNested = count));
+            if (previous === 0 && count > 0) {
               this.record(
                 executionId,
                 "status",
                 `Claude finished its turn; waiting for ${count} nested agent(s).`,
               );
-            } else if (changed && count === 0) {
+            } else if (previous > 0 && count === 0) {
               this.record(executionId, "status", "Nested agents ended; Claude continues.");
             }
           },

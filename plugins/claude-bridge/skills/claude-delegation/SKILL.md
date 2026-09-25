@@ -71,7 +71,7 @@ Claude continues as soon as the response arrives; wait for the same execution ag
 
 A tool being available to Claude is not authority to use it. Answer or approve on your own only what the user's instructions already cover: a question about the assignment you can settle from its brief and context, or an action the user asked for. When a request needs a decision the user has not made, such as a tool call with effects outside the assignment, ask the user and relay their answer. Deny with a `message` rather than leaving Claude waiting when the action is not wanted; Claude then continues without it.
 
-A request is answerable only while `live` is true. When the Claude session that asked ends (completion, failure, cancellation, or a bridge service restart), its pending requests become `expired` and cannot be answered. Send a follow-up with the answer instead. Cancelling a task with a pending request stops Claude and expires the request.
+A request is answerable only while `live` is true. When the Claude session that asked ends (completion, failure, cancellation, or a bridge service restart), its pending requests become `expired` and cannot be answered. Send a follow-up with the answer instead. Cancelling a task expires its pending requests the moment cancellation starts, even while nested agents are still being stopped, and Claude is told the request was declined.
 
 ## Reading progress
 
@@ -81,7 +81,7 @@ In read-only tasks, Claude and its nested agents run with the edit tools disable
 
 ## Reading status and results
 
-- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own. `reason: waiting_for_children` means Claude's turn ended while nested agents still run; the result is not ready yet. `reason: needs_input` means Claude waits for your response to `detail.requestId` (see above); the task does not continue until you answer, deny, or cancel.
+- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own. `reason: waiting_for_children` means Claude's turn ended while nested agents still run; the result is not ready yet. `reason: needs_input` means Claude waits for your response to `detail.requestId` (see above); the task does not continue until you answer, deny, or cancel. When several apply, `reason` shows the most pressing: `needs_input`, then `waiting_for_capacity`, then `waiting_for_children`.
 - `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
 - `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), `session_unavailable` (a follow-up whose session cannot be resumed), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
 - `cancelled`: stopped by `cancel_task`; `detail.processExited` confirms Claude Code exited.
