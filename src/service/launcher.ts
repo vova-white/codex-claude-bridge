@@ -25,7 +25,7 @@ function logTail(paths: StatePaths): string {
 /**
  * Connects to the service that owns the state directory, starting it as a
  * detached process when none is running. Concurrent callers may each start a
- * service; all but one exit immediately because the state database is locked.
+ * service; exactly one takes the state database lock, and the rest exit.
  */
 export async function connectService(
   paths: StatePaths,
