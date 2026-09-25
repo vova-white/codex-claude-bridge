@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Deterministic stand-in for the GitHub CLI. It keeps pull requests in a JSON
-// file in FAKE_GH_DIR, records each call there, and reads branch heads from the
-// working directory's `origin` remote, a local repository in tests.
+// file in FAKE_GH_DIR, records each call there, and reads branch heads from
+// where the working directory's `origin` pushes, a local repository in tests.
+// Like GitHub, a pull request keeps its last head after its branch is deleted.
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,12 +12,15 @@ export interface FakePullRequest {
   headRefName: string;
   title: string;
   state: "OPEN" | "CLOSED" | "MERGED";
+  headRefOid: string;
 }
 
 export interface FakeGitHub {
   pullRequests: FakePullRequest[];
   /** Makes every call fail with this text on stderr. */
   failWith?: string;
+  /** Holds `pr list` until this file exists in FAKE_GH_DIR. */
+  listWaitsFor?: string;
 }
 
 const dir = process.env.FAKE_GH_DIR ?? process.cwd();
@@ -39,11 +43,17 @@ function option(name: string): string | undefined {
 
 const git = (...gitArgs: string[]) => execFileSync("git", gitArgs, { encoding: "utf8" }).trim();
 const url = (number: number) => `https://github.example/owner/repo/pull/${number}`;
-const head = (branch: string) => git("ls-remote", "origin", `refs/heads/${branch}`).split("\t")[0];
+const head = (branch: string) =>
+  git("ls-remote", git("remote", "get-url", "--push", "origin"), `refs/heads/${branch}`).split(
+    "\t",
+  )[0] ?? "";
 
 if (state.failWith) fail(state.failWith);
 const [group, action] = args;
 if (group === "pr" && action === "list") {
+  while (state.listWaitsFor && !existsSync(join(dir, state.listWaitsFor))) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  }
   const branch = option("--head");
   const fields = (option("--json") ?? "number").split(",");
   const listed = state.pullRequests
@@ -52,7 +62,7 @@ if (group === "pr" && action === "list") {
       const all: Record<string, unknown> = {
         ...pr,
         url: url(pr.number),
-        headRefOid: head(pr.headRefName),
+        headRefOid: head(pr.headRefName) || pr.headRefOid,
       };
       return Object.fromEntries(fields.map((field) => [field, all[field]]));
     });
@@ -61,13 +71,15 @@ if (group === "pr" && action === "list") {
   const branch = option("--head") ?? git("branch", "--show-current");
   const open = state.pullRequests.find((pr) => pr.headRefName === branch && pr.state === "OPEN");
   if (open) fail(`a pull request for branch "${branch}" already exists:\n${url(open.number)}`);
-  if (!head(branch)) fail(`you must first push the current branch to a remote`);
+  const headRefOid = head(branch);
+  if (!headRefOid) fail(`you must first push the current branch to a remote`);
   const number = state.pullRequests.length + 1;
   state.pullRequests.push({
     number,
     headRefName: branch,
     title: option("--title") ?? "",
     state: "OPEN",
+    headRefOid,
   });
   writeFileSync(statePath, JSON.stringify(state));
   console.log(url(number));

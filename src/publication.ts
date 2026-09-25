@@ -46,9 +46,15 @@ const pullRequests = z.array(
   }),
 );
 
-async function command(file: string, cwd: string, args: string[]): Promise<string> {
+async function command(
+  file: string,
+  cwd: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<string> {
   const { stdout } = await run(file, args, {
     cwd,
+    ...(signal ? { signal } : {}),
     timeout: 30_000,
     maxBuffer: 4 * 1024 * 1024,
     // A check must fail rather than wait for credentials nobody can type.
@@ -57,23 +63,34 @@ async function command(file: string, cwd: string, args: string[]): Promise<strin
   return stdout;
 }
 
+/** The first value Git has for one of these configuration keys, in order. */
+async function firstConfigured(worktree: string, keys: string[]): Promise<string | undefined> {
+  for (const key of keys) {
+    const value = await command("git", worktree, ["config", "--get", key]).catch(() => "");
+    if (value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
 /**
- * Reads the task branch's remote state: the revision its remote holds
- * (`git ls-remote`) and its pull request (`gh pr list`). Output is parsed into
- * known fields; the tools' error text is never kept. The GitHub CLI is asked
- * only once the branch is pushed or the remote could not be read.
+ * Reads the task branch's remote state: the revision its push destination
+ * holds (`git ls-remote`) and its pull request (`gh pr list`), which is asked
+ * for even when the branch is gone from the remote, as after a merge. Output is
+ * parsed into known fields; the tools' error text is never kept.
  */
 export async function remoteState(
   worktree: string,
   branch: string,
   secrets: readonly string[],
+  signal?: AbortSignal,
 ): Promise<RemoteState> {
-  const configured = await command("git", worktree, [
-    "config",
-    "--get",
-    `branch.${branch}.remote`,
-  ]).catch(() => "");
-  const remote = configured.trim() || "origin";
+  // The remote `git push` uses for the branch, as Git chooses it.
+  const remote =
+    (await firstConfigured(worktree, [
+      `branch.${branch}.pushRemote`,
+      "remote.pushDefault",
+      `branch.${branch}.remote`,
+    ])) ?? "origin";
   const state: RemoteState = {
     remote,
     revision: await resolveCommit(worktree, `refs/heads/${branch}`),
@@ -88,28 +105,40 @@ export async function remoteState(
     return state;
   }
   state.repository = redact(url.trim(), secrets);
+  // A separate push URL is where the branch was published, not the fetch URL.
+  const fetchUrl = await command("git", worktree, ["remote", "get-url", remote]).catch(() => "");
+  const target = fetchUrl.trim() === url.trim() ? remote : url.trim();
   try {
-    const listed = await command("git", worktree, ["ls-remote", remote, `refs/heads/${branch}`]);
+    const listed = await command(
+      "git",
+      worktree,
+      ["ls-remote", target, `refs/heads/${branch}`],
+      signal,
+    );
     const line = listed.split("\n").find((entry) => entry.endsWith(`\trefs/heads/${branch}`));
     const revision = line?.split("\t")[0] ?? "";
     state.pushedRevision = /^[0-9a-f]{40,64}$/.test(revision) ? revision : null;
   } catch {
     state.problems.push("remote_unavailable");
   }
-  if (state.pushedRevision === null) return state;
   try {
-    const output = await command("gh", worktree, [
-      "pr",
-      "list",
-      "--head",
-      branch,
-      "--state",
-      "all",
-      "--json",
-      "number,url,state,headRefOid",
-      "--limit",
-      "20",
-    ]);
+    const output = await command(
+      "gh",
+      worktree,
+      [
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        "all",
+        "--json",
+        "number,url,state,headRefOid",
+        "--limit",
+        "20",
+      ],
+      signal,
+    );
     const found = pullRequests.parse(JSON.parse(output));
     // An open pull request is the one to update; otherwise the latest one.
     const chosen =
@@ -172,7 +201,13 @@ export function publicationReport(publication: Publication, worktree: string) {
     });
   }
   if (!problems.has("no_remote") && !problems.has("remote_unavailable")) {
-    if (pushedRevision === null) {
+    if (pushedRevision === null && pullRequest) {
+      concerns.push({
+        code: "branch_not_on_remote",
+        message: `${branch} is no longer on ${remote}; its pull request #${pullRequest.number} is ${pullRequest.state} with head ${pullRequest.headRevision}.`,
+        ...(revision === pullRequest.headRevision ? {} : { action: push }),
+      });
+    } else if (pushedRevision === null) {
       concerns.push({
         code: "not_pushed",
         message: `${branch} is not on ${remote}; its commits exist only in the task worktree.`,

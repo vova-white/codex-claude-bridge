@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
 import type { FakeGitHub } from "../fixtures/fake-gh.ts";
-import { BridgeFixture, type BridgeClient } from "../support/bridge.ts";
+import { BridgeFixture, isAlive, waitFor, type BridgeClient } from "../support/bridge.ts";
 
 const fakeGh = resolve("tests/fixtures/fake-gh.ts");
 const fixtures: BridgeFixture[] = [];
@@ -57,7 +57,7 @@ const finished = (summary: string, failures: string[] = []): Step => ({
  * A bridge whose project has a local bare repository as `origin` and whose
  * service finds the fake GitHub CLI first on its PATH.
  */
-async function setUp(scenario: Scenario, github: FakeGitHub = { pullRequests: [] }) {
+async function setUp(scenario: Scenario, initial: FakeGitHub = { pullRequests: [] }) {
   const bin = mkdtempSync(join(tmpdir(), "bridge-gh-"));
   directories.push(bin);
   writeFileSync(
@@ -65,7 +65,7 @@ async function setUp(scenario: Scenario, github: FakeGitHub = { pullRequests: []
     `#!/bin/sh\nFAKE_GH_DIR='${bin}' exec '${process.execPath}' '${fakeGh}' "$@"\n`,
     { mode: 0o755 },
   );
-  writeFileSync(join(bin, "gh-state.json"), JSON.stringify(github));
+  writeFileSync(join(bin, "gh-state.json"), JSON.stringify(initial));
   const fixture = new BridgeFixture({
     scenario,
     env: { PATH: `${bin}:${process.env.PATH ?? ""}` },
@@ -85,7 +85,14 @@ async function setUp(scenario: Scenario, github: FakeGitHub = { pullRequests: []
       .filter(Boolean)
       .map((line) => JSON.parse(line).args);
   };
-  return { fixture, project, origin, client, ghCalls };
+  /** Changes what the fake GitHub serves from now on. */
+  const github = (change: (state: FakeGitHub) => void) => {
+    const path = join(bin, "gh-state.json");
+    const state = JSON.parse(readFileSync(path, "utf8")) as FakeGitHub;
+    change(state);
+    writeFileSync(path, JSON.stringify(state));
+  };
+  return { fixture, project, origin, client, ghCalls, github };
 }
 
 function writeTask(project: string, overrides: Record<string, unknown> = {}) {
@@ -270,7 +277,137 @@ describe("task publication", () => {
     expect(git(workspace.path, "log", "-1", "--format=%s")).toBe("docs: improve the README");
     expect(readFileSync(join(workspace.path, "README.md"), "utf8")).toBe("# Better fixture\n");
     expect(git(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads")).toBe("main");
-    expect(ghCalls()).toEqual([]);
+    expect(creates(ghCalls())).toEqual([]);
+  });
+
+  it("report a merged pull request truthfully after its branch was deleted", async () => {
+    const { fixture, project, origin, client, github } = await setUp({
+      turns: [
+        { match: "Anything", steps: [finished("Nothing left.")] },
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            finished("Opened the pull request."),
+          ],
+        },
+      ],
+    });
+    const { taskId } = await run(client, writeTask(project));
+    const { workspace } = (await client.call("task_result", { project, taskId })).data.result;
+    const revision = git(workspace.path, "rev-parse", "HEAD");
+    git(origin, "branch", "-D", workspace.branch);
+    github((state) => {
+      state.pullRequests[0]!.state = "MERGED";
+    });
+
+    const { publication } = (await followUp(client, project, taskId, "Anything left?")).result;
+    expect(publication).toMatchObject({
+      pushedRevision: null,
+      pushed: false,
+      pullRequest: { number: 1, state: "MERGED", headRevision: revision },
+    });
+    expect(publication.concerns).toEqual([
+      {
+        code: "branch_not_on_remote",
+        message: expect.stringContaining("pull request #1 is MERGED"),
+      },
+    ]);
+    expect(fixture.guidance()[1]!).toContain(`pull request #1 (${pullRequestUrl}, state MERGED)`);
+  });
+
+  it("check the push destination when the remote pushes elsewhere than it fetches", async () => {
+    const { fixture, project, origin, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            finished("Opened the pull request."),
+          ],
+        },
+      ],
+    });
+    const destination = join(fixture.root, "push.git");
+    git(fixture.root, "init", "--quiet", "--bare", destination);
+    git(project, "remote", "set-url", "--push", "origin", destination);
+
+    const { taskId } = await run(client, writeTask(project));
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    const revision = git(result.workspace.path, "rev-parse", "HEAD");
+    expect(result.publication).toMatchObject({
+      repository: destination,
+      pushedRevision: revision,
+      pushed: true,
+      pullRequest: { number: 1, headRevision: revision },
+      concerns: [],
+    });
+    expect(git(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads")).toBe("main");
+  });
+
+  it("cancel a follow-up during the remote check without starting Claude", async () => {
+    const { fixture, project, client, ghCalls, github } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            finished("Opened the pull request."),
+          ],
+        },
+      ],
+    });
+    const { taskId } = await run(client, writeTask(project));
+    const checked = (await client.call("task_status", { project, taskId })).data.publication;
+    github((state) => {
+      state.listWaitsFor = "never";
+    });
+    const listed = ghCalls().length;
+    await client.call("send_followup", { project, taskId, requestKey: "more", message: "More." });
+    await waitFor(() => ghCalls().length > listed || undefined);
+
+    const cancelled = (await client.call("cancel_task", { project, taskId })).data;
+    expect(cancelled).toMatchObject({
+      cancellation: "confirmed",
+      executions: [{ status: "cancelled" }],
+    });
+    expect(fixture.launches()).toHaveLength(1);
+    const status = (await client.call("task_status", { project, taskId })).data;
+    expect(status.publication).toEqual(checked);
+  });
+
+  it("find a pull request published before a service restart when a follow-up starts", async () => {
+    const { fixture, project, client, ghCalls } = await setUp({
+      turns: [
+        { match: "Continue", steps: [finished("Continued.")] },
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            { signal: "published" },
+            { waitFor: "never" },
+          ],
+        },
+      ],
+    });
+    const started = await client.call("start_task", writeTask(project));
+    const { taskId } = started.data;
+    await waitFor(() => fixture.signalled("published") || undefined, 15_000);
+    const pid = fixture.servicePid()!;
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid) || undefined);
+
+    const reconnected = await fixture.connect();
+    const status = (await reconnected.call("task_status", { project, taskId })).data;
+    expect(status.status).toBe("interrupted");
+    const { publication } = (await followUp(reconnected, project, taskId, "Continue.")).result;
+    expect(fixture.guidance()[1]!).toContain(`pull request #1 (${pullRequestUrl}, state OPEN)`);
+    expect(publication).toMatchObject({ pushed: true, pullRequest: { number: 1 } });
+    expect(creates(ghCalls())).toHaveLength(1);
   });
 
   it("report an unavailable GitHub CLI without copying its error text", async () => {

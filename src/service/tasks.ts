@@ -1009,13 +1009,16 @@ export class TaskService {
   /**
    * Checks the task branch on its remote and records the result as the task's
    * publication. What a check cannot determine keeps its earlier value, so a
-   * pull request once found stays known.
+   * pull request once found stays known. A check stopped by `signal` records
+   * nothing.
    */
   private async checkPublication(
     workspace: WorkspaceRow,
     secrets: readonly string[],
-  ): Promise<PublicationReport> {
-    const found = await remoteState(workspace.path, workspace.branch, secrets);
+    signal?: AbortSignal,
+  ): Promise<PublicationReport | undefined> {
+    const found = await remoteState(workspace.path, workspace.branch, secrets, signal);
+    if (signal?.aborted) return undefined;
     const earlier = this.publication(workspace.task_id);
     const pushedRevision =
       found.pushedRevision === undefined ? (earlier?.pushedRevision ?? null) : found.pushedRevision;
@@ -1169,7 +1172,9 @@ export class TaskService {
       // A follow-up may find an earlier execution's push or pull request, even one
       // whose outcome was never reported.
       const known =
-        publishing && followUp ? await this.checkPublication(workspace, secrets) : undefined;
+        publishing && followUp
+          ? await this.checkPublication(workspace, secrets, signal)
+          : undefined;
       outcome = await runExecution(
         {
           executable,
