@@ -72,6 +72,25 @@ async function run(client: BridgeClient, args: Record<string, unknown>) {
 }
 
 describe("writing tasks", () => {
+  it("keep configured secrets out of the task branch name", async () => {
+    const fixture = new BridgeFixture({
+      config: {
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-BRANCHSECRET" } } },
+      },
+      scenario: { turns: [{ steps: [finished("Done.")] }] },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await run(
+      client,
+      writeTask(project, { assignment: "tok-BRANCHSECRET rotation: update the README." }),
+    );
+    const { workspace } = (await client.call("task_status", { project, taskId })).data;
+    expect(workspace.branch).toMatch(/^feature\//);
+    expect(workspace.branch.toLowerCase()).not.toContain("branchsecret");
+  });
+
   it("report commits and files, including staged-only changes", async () => {
     const fixture = new BridgeFixture({
       scenario: {

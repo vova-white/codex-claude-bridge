@@ -40,7 +40,7 @@ The most common defect is a change that works on the path you tested and is miss
 - Complexity belongs at the Claude Code adapter boundary. The task lifecycle in the service and the MCP layer stay plain.
 - Inferred types over annotations. `any` is the enemy.
 - Comments describe how a thing is used and move with the code. They describe functions rather than annotate lines.
-- Claude's own content (assistant text, tool inputs, requests, nested summaries, commits, file names, results) passes through unchanged; diagnostics the bridge composes (readiness problems, execution `error`, `service.log`) use only known fields and never copy external text, secrets stay out of argv, and MCP responses never echo `config.json` values. Masking Claude's content protects nothing on this single-user machine, where every agent can already read the same files.
+- Claude's own content (assistant text, tool inputs, requests, nested summaries, commits, file names, results) passes through unchanged; diagnostics the bridge composes (readiness problems, execution `error`, `service.log`) use only known fields and never copy external text, secrets stay out of argv, and MCP responses never echo configured credentials. Masking Claude's content protects nothing on this single-user machine, where every agent can already read the same files.
 
 ## Pull requests
 

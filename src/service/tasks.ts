@@ -20,7 +20,7 @@ import {
 } from "../claude/nested-writers.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { errorOrigin } from "../redact.ts";
+import { errorOrigin, redact } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import {
@@ -646,7 +646,7 @@ export class TaskService {
           .run(
             taskId,
             join(this.paths.worktrees, taskId),
-            taskBranch(request.branchType ?? "feature", request.assignment, taskId),
+            this.branchName(request.branchType ?? "feature", request.assignment, taskId),
             workspace.baseline,
             workspace.parentDirty ? 1 : 0,
             createdAt,
@@ -1696,6 +1696,14 @@ export class TaskService {
   }
 
   /**
+   * A task or nested writer branch named after its assignment. Configured
+   * secrets are masked first: the name reaches Git's command line.
+   */
+  private branchName(type: string, assignment: string, id: string): string {
+    return taskBranch(type, redact(assignment, configSecrets(this.config())), id);
+  }
+
+  /**
    * The nested writers an execution may start. Each is bound to its own
    * worktree and branch, created from the executor's committed HEAD, before its
    * Claude Code process starts there. They stop when the execution is cancelled
@@ -1742,7 +1750,7 @@ export class TaskService {
         const uuid = randomUUID();
         const id = `writer_${uuid}`;
         const path = join(this.paths.worktrees, id);
-        const branch = taskBranch(request.branchType ?? "feature", stored.assignment, uuid);
+        const branch = this.branchName(request.branchType ?? "feature", stored.assignment, uuid);
         // The worktree is bound to the writer before any process can edit.
         this.db
           .prepare(
