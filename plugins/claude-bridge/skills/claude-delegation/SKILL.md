@@ -1,6 +1,6 @@
 ---
 name: claude-delegation
-description: Delegate research, review, and code-change assignments to Claude Code through the claude_bridge MCP tools (read-only on the shared checkout, or writing in an isolated Git worktree), check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
+description: Delegate research, review, and code-change assignments to Claude Code through the claude_bridge MCP tools (read-only on the shared checkout, or writing in an isolated Git worktree, optionally delivered as a pull request), check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
 ---
 
 # Claude delegation
@@ -9,7 +9,7 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, and may split independent changes among nested writers in worktrees of their own; see "Nested writers"). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, cancel work, and clean up a writing task's worktree and branch. Claude cannot push or open pull requests yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, may split independent changes among nested writers in worktrees of their own, and may publish the task branch as a pull request; see "Nested writers"). Several tasks can run in parallel within the service's configured limit (see "Parallel tasks and execution slots"). You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, cancel work, and clean up a writing task's worktree and branch. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
@@ -36,6 +36,16 @@ Pass `mode: "write"` to `start_task` for a code change. The service creates a ne
 The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
 
 The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure, and cancellation (`detail.workspace`, with `commitCount` and `changedFileCount`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the changes in proportion to their risk — `git -C <path> log <baseline>..HEAD`, `git -C <path> diff <baseline>` (working files), and `git -C <path> status` (staged and untracked files) — and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
+
+## Publishing a pull request
+
+Add `publish: "pull_request"` to a writing task when the user wants the change delivered as a pull request. This authorizes Claude to push the task branch and create or update its pull request with `gh`, following the repository's own contribution guidance, without asking you first. Claude never merges or closes it; integration stays with you and the user. Only the task branch is published: nested writers' branches stay local, and their work reaches the pull request once Claude has assembled it into the task branch. Omit `publish` (or pass `"none"`) to keep the commits in the worktree. Claude uses the Git and GitHub credentials of the machine the bridge runs on; readiness does not check them.
+
+After each execution that is not cancelled, the bridge reads the branch and its pull request from the remote itself and adds `publication` to the result (`detail.publication` when the execution failed; `task_status` shows the latest check): `repository`, `remote`, `branch`, `revision` (the worktree's branch tip), `pushedRevision`, `pushed` (the remote has that tip), `pullRequest` (`url`, `number`, `state`, `headRevision`, or `null`), `checkedAt`, and `concerns`. Each concern has a `code`, a `message`, and usually an `action`: `not_pushed` and `unpushed_commits` (commits exist only in the worktree), `branch_not_on_remote` (the branch is gone from the remote, as after a merge; `pullRequest.state` says what happened to it), `uncommitted_changes`, `no_pull_request`, `pull_request_closed`, and `no_remote`, `remote_unavailable`, or `github_unavailable` when the bridge could not complete its check (the values shown are then the last known ones). Publication problems never discard the worktree or its commits; relay the action or send a follow-up.
+
+Trust `publication` over Claude's summary for what reached the remote. An execution that failed or was interrupted may still have pushed or opened a pull request: check `publication` before asking for publication again. A follow-up re-checks the remote before it starts and tells Claude about the existing pull request, so Claude updates it rather than opening another.
+
+Review the pull request in proportion to its risk: read its diff (`gh pr diff <url>`, or the worktree against `workspace.baseline`), look at its checks (`gh pr checks <url>`) and Claude's `checks`, and verify what matters rather than repeating Claude's work. Then coordinate integration: request changes through a follow-up, or tell the user the pull request is ready to merge. Merge only when the user asks.
 
 ## Cleaning up a writing task
 

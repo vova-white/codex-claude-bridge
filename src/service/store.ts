@@ -104,6 +104,20 @@ const migrations: string[] = [
   );
   CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at);
   ALTER TABLE requests ADD COLUMN writer_id TEXT`,
+  `CREATE TABLE publications (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    remote TEXT NOT NULL,
+    repository TEXT,
+    revision TEXT,
+    uncommitted INTEGER NOT NULL,
+    pushed_revision TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    pr_head TEXT,
+    problems TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+  )`,
 ];
 
 export class StoreLockedError extends Error {}
@@ -112,6 +126,8 @@ export class StoreLockedError extends Error {}
  * Opens the state database and holds an exclusive lock on it for the lifetime of
  * the process. The operating system releases the lock if the service dies, so a
  * second service for the same state directory fails fast instead of sharing it.
+ * WAL with `synchronous = NORMAL` keeps committed state across a service crash;
+ * what an OS crash can roll back is described in ADR 0004.
  */
 export function openStore(path: string): DatabaseSync {
   const db = new DatabaseSync(path, { timeout: 0 });
@@ -124,9 +140,6 @@ export function openStore(path: string): DatabaseSync {
     }
     throw error;
   }
-  // NORMAL syncs at WAL checkpoints rather than on every commit: a crash of the
-  // service loses nothing, and an OS crash or power loss can drop only the last
-  // commits, when the Claude Code processes they describe end too.
   db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
   const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;

@@ -24,6 +24,13 @@ import { errorOrigin, redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import {
+  type Publication,
+  type PublicationReport,
+  publicationReport,
+  publishModes,
+  remoteState,
+} from "../publication.ts";
+import {
   addWorktree,
   branchTypes,
   changedPaths,
@@ -80,6 +87,12 @@ export const startSchema = z.object({
     .enum(branchTypes)
     .optional()
     .describe("Write mode: GitFlow prefix of the task branch (default feature)."),
+  publish: z
+    .enum(publishModes)
+    .optional()
+    .describe(
+      "Write mode: pull_request authorizes Claude to push the task branch and create or update its pull request, never merging it; none (default) keeps the commits in the worktree.",
+    ),
 });
 export type StartRequest = z.infer<typeof startSchema>;
 
@@ -249,6 +262,21 @@ interface WorkspaceRow {
   created_at: string;
 }
 
+interface PublicationRow {
+  task_id: string;
+  remote: string;
+  repository: string | null;
+  revision: string | null;
+  uncommitted: number;
+  pushed_revision: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  pr_state: string | null;
+  pr_head: string | null;
+  problems: string;
+  checked_at: string;
+}
+
 interface NestedWriterRow {
   id: string;
   execution_id: string;
@@ -382,12 +410,36 @@ Work without asking whenever you can: make reasonable assumptions, state them, a
 Finish with the structured result: summary (the answer or outcome), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), and remainingWork (what is left for the parent).`;
 }
 
-function writingGuidance(workspace: WorkspaceRow, parent: string): string {
+/**
+ * What a publishing task's guidance says about the remote: authority to push
+ * and open or update the pull request, and, for a follow-up, the pull request
+ * the bridge already found, so Claude updates it instead of creating another.
+ */
+function publishingGuidance(branch: string, known: PublicationReport | undefined): string {
+  const authority = `Publication is enabled for this task, and the assignment authorizes it without a further review: once your commits are in place, including the work of any nested writers you have assembled, and your checks have run, push ${branch} to its remote (normally \`git push -u origin ${branch}\`) and open a pull request for it with \`gh pr create\`, following the repository's own guidance for pull request titles, descriptions, and templates. Before creating a pull request, check whether one exists for the branch (\`gh pr list --head ${branch} --state all\`); if it does, update that one by pushing further commits, and with \`gh pr edit\` when its title or description needs to change, instead of creating another. Push only ${branch}, never a nested writer's branch, and do not rewrite commits you have already pushed. Never merge or close the pull request: the parent agent and the user decide on integration. If pushing or creating the pull request fails, keep your commits, report in failures what failed and what you tried, and finish rather than retrying repeatedly. The bridge checks the remote branch and pull request itself after you finish and reports them to the parent.`;
+  if (!known) return authority;
+  const pr = known.pullRequest;
+  const unsure = known.concerns.some((concern) => concern.code.endsWith("_unavailable"));
+  const state = pr
+    ? `The bridge found pull request #${pr.number} (${pr.url}, state ${pr.state}) for ${branch}. Update it rather than creating another; if it is no longer open, report that instead of opening a new one unless the follow-up asks for it.`
+    : unsure
+      ? "The bridge could not complete its check of the remote, so check it yourself before creating a pull request."
+      : known.pushedRevision
+        ? `The bridge found ${branch} on ${known.remote} at ${known.pushedRevision} and no pull request for it.`
+        : `The bridge did not find ${branch} on ${known.remote}.`;
+  return `${authority}\n\n${state}`;
+}
+
+function writingGuidance(
+  workspace: WorkspaceRow,
+  parent: string,
+  publish?: { known: PublicationReport | undefined },
+): string {
   return `You are the child agent carrying out a task delegated by Codex, the parent agent. Work autonomously on the assignment in the user message; the parent reviews your result.
 
 This task uses the writing profile in its own Git worktree at ${workspace.path}, on branch ${workspace.branch}, starting from commit ${workspace.baseline}. Work only inside this worktree: other checkouts, including the parent's at ${parent}, belong to other agents. The worktree isolates Git changes; it is not a sandbox.
 
-Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. Do not push or open pull requests: publication is not enabled for this task.
+Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. ${publish ? publishingGuidance(workspace.branch, publish.known) : "Do not push or open pull requests: publication is not enabled for this task."}
 
 Claude Code's Agent tool is not available, because its agents would share your worktree. To split independent changes among nested writers working in parallel, use the bridge's start_nested_writer tool. Each nested writer is a separate Claude Code run that the bridge starts in its own worktree, on its own branch, from the commit your HEAD points to: commit the state it should start from first, as a worktree with uncommitted changes is refused. The tool returns at once; wait_nested_writers returns each writer's branch, baseline, commits, changed files, checks, and result. Assemble their work yourself: merge or cherry-pick each branch into ${workspace.branch}, run the checks that matter, and report in failures any conflict you could not resolve, naming the branch. You remain accountable for the result; your task is not complete while nested writers run or before you have collected their reports, and if your turn ends first you are prompted to assemble their work once they have all ended.
 
@@ -547,11 +599,11 @@ export class TaskService {
         );
       }
       workspace = { baseline, parentDirty };
-    } else if (request.baseline || request.branchType) {
+    } else if (request.baseline || request.branchType || request.publish) {
       // Absent options also keep the request identity of read-only tasks as it was.
       throw new ServiceError(
         "invalid_arguments",
-        "baseline and branchType apply only to writing tasks; read-only tasks inspect the shared checkout as it is.",
+        "baseline, branchType, and publish apply only to writing tasks; read-only tasks inspect the shared checkout as it is.",
       );
     }
 
@@ -659,6 +711,7 @@ export class TaskService {
       .prepare("SELECT * FROM requests WHERE task_id = ? ORDER BY created_at, rowid")
       .all(task.id) as unknown as RequestRow[];
     const workspace = this.workspace(task.id);
+    const publication = this.publication(task.id);
     return {
       taskId: task.id,
       project: task.project,
@@ -666,6 +719,17 @@ export class TaskService {
       ...executionState(latest),
       ...(task.session_id ? { sessionId: task.session_id } : {}),
       ...(workspace ? { workspace: workspaceReport(workspace) } : {}),
+      ...(workspace && publication
+        ? {
+            publication: cleanedStates.includes(workspace.state)
+              ? publicationReport(
+                  publication,
+                  task.project,
+                  workspace.state as "removed" | "branch_kept",
+                )
+              : publicationReport(publication, workspace.path),
+          }
+        : {}),
       createdAt: task.created_at,
       request: intent,
       executions: executions.map((execution) => ({
@@ -1010,16 +1074,20 @@ export class TaskService {
       .all(task.id) as { id: string; status: string }[];
     const root = task.project;
     const { path, branch } = workspace;
-    const worktreePresent = await this.worktreeRegistered(root, path);
+    const registration = await this.registeredWorktree(root, path);
+    const worktreePresent = registration !== undefined;
     const worktreeFiles = worktreePresent && existsSync(path);
     // undefined: Git could not tell, which counts as work that might be lost.
     const uncommittedChanges = worktreeFiles
       ? await hasUncommittedChanges(path).catch(() => undefined)
       : false;
-    const head = worktreeFiles ? await checkoutHead(path).catch(() => undefined) : undefined;
+    // A registration whose directory is missing still records its HEAD.
+    const head = worktreeFiles
+      ? await checkoutHead(path).catch(() => undefined)
+      : registration?.head;
     // Commits only the worktree's HEAD holds, as on a detached HEAD, go with the
     // worktree. The task branch counts as keeping them only if cleanup keeps it.
-    const headUnintegrated = !worktreeFiles
+    const headUnintegrated = !worktreePresent
       ? 0
       : head === undefined
         ? undefined
@@ -1080,7 +1148,7 @@ export class TaskService {
         path,
         action: worktreeAction,
         ...(worktreePresent ? { uncommittedChanges } : {}),
-        ...(worktreeFiles ? { unintegratedCommits: headUnintegrated } : {}),
+        ...(worktreePresent ? { unintegratedCommits: headUnintegrated } : {}),
       },
       branch: {
         name: branch,
@@ -1121,7 +1189,7 @@ export class TaskService {
         });
       }
     }
-    if (!(await this.worktreeRegistered(root, path))) {
+    if (!(await this.registeredWorktree(root, path))) {
       const branchKept = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
       this.db
         .prepare("UPDATE workspaces SET state = ? WHERE task_id = ?")
@@ -1525,14 +1593,86 @@ export class TaskService {
       | undefined;
   }
 
-  /** Whether Git has the task worktree registered in the project, even if its directory is gone. */
-  private async worktreeRegistered(root: string, path: string): Promise<boolean> {
+  /** The task's publication as last recorded, if the bridge has checked it. */
+  private publication(taskId: string): Publication | undefined {
+    const row = this.db.prepare("SELECT * FROM publications WHERE task_id = ?").get(taskId) as
+      | PublicationRow
+      | undefined;
+    if (!row) return undefined;
+    const workspace = this.workspace(taskId)!;
+    return {
+      remote: row.remote,
+      repository: row.repository,
+      branch: workspace.branch,
+      revision: row.revision,
+      uncommitted: row.uncommitted === 1,
+      pushedRevision: row.pushed_revision,
+      pullRequest:
+        row.pr_number === null
+          ? null
+          : {
+              number: row.pr_number,
+              url: row.pr_url!,
+              state: row.pr_state as "OPEN" | "CLOSED" | "MERGED",
+              headRevision: row.pr_head!,
+            },
+      problems: JSON.parse(row.problems) as Publication["problems"],
+      checkedAt: row.checked_at,
+    };
+  }
+
+  /**
+   * Checks the task branch on its remote and records the result as the task's
+   * publication. What a check cannot determine keeps its earlier value, so a
+   * pull request once found stays known. A check stopped by `signal` records
+   * nothing.
+   */
+  private async checkPublication(
+    workspace: WorkspaceRow,
+    secrets: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<PublicationReport | undefined> {
+    const found = await remoteState(workspace.path, workspace.branch, secrets, signal);
+    if (signal?.aborted) return undefined;
+    const earlier = this.publication(workspace.task_id);
+    const pushedRevision =
+      found.pushedRevision === undefined ? (earlier?.pushedRevision ?? null) : found.pushedRevision;
+    const pullRequest =
+      found.pullRequest === undefined ? (earlier?.pullRequest ?? null) : found.pullRequest;
+    if (found.problems.length > 0) {
+      this.log(`publication check for ${workspace.task_id}: ${found.problems.join(", ")}`);
+    }
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO publications (task_id, remote, repository, revision, uncommitted,
+           pushed_revision, pr_number, pr_url, pr_state, pr_head, problems, checked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        workspace.task_id,
+        found.remote,
+        found.repository ?? earlier?.repository ?? null,
+        found.revision ?? null,
+        found.uncommitted ? 1 : 0,
+        pushedRevision,
+        pullRequest?.number ?? null,
+        pullRequest?.url ?? null,
+        pullRequest?.state ?? null,
+        pullRequest?.headRevision ?? null,
+        JSON.stringify(found.problems),
+        now(),
+      );
+    return publicationReport(this.publication(workspace.task_id)!, workspace.path);
+  }
+
+  /** Git's registration of the task worktree in the project, even if its directory is gone. */
+  private async registeredWorktree(root: string, path: string) {
     const worktrees = await registeredWorktrees(root);
     // Git may record the path with symbolic links resolved.
     const resolved = existsSync(this.paths.worktrees)
       ? join(realpathSync(this.paths.worktrees), basename(path))
       : path;
-    return worktrees.includes(path) || worktrees.includes(resolved);
+    return worktrees.find((worktree) => worktree.path === path || worktree.path === resolved);
   }
 
   /** Creates the task's worktree once; later executions reuse it. */
@@ -1989,6 +2129,7 @@ export class TaskService {
     const request = JSON.parse(task.request) as StartRequest;
     const followUp = execution.kind === "follow-up";
     const workspace = this.workspace(task.id);
+    const publishing = workspace !== undefined && request.publish === "pull_request";
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
@@ -2025,6 +2166,12 @@ export class TaskService {
       };
     } else {
       if (!workspace) before = await checkoutState(root);
+      // A follow-up may find an earlier execution's push or pull request, even one
+      // whose outcome was never reported.
+      const known =
+        publishing && followUp
+          ? await this.checkPublication(workspace, secrets, signal)
+          : undefined;
       if (workspace) writers = this.nestedWriters(executionId, request, workspace, signal);
       outcome = await runExecution(
         {
@@ -2035,7 +2182,9 @@ export class TaskService {
           prompt: followUp ? `<follow-up>\n${execution.input}\n</follow-up>` : prompt(request),
           ...(followUp && task.session_id ? { resume: task.session_id } : {}),
           signal,
-          guidance: workspace ? writingGuidance(workspace, root) : readOnlyGuidance(root),
+          guidance: workspace
+            ? writingGuidance(workspace, root, publishing ? { known } : undefined)
+            : readOnlyGuidance(root),
           disallowedTools: workspace ? writingDisallowedTools : readOnlyDisallowedTools,
           resultSchema: workspace ? writingResult : reportedResult,
           approvalServers: approvalServers(config),
@@ -2149,8 +2298,16 @@ export class TaskService {
       workspace && this.workspace(task.id)?.state === "ready"
         ? await listedChanges(workspace.path, workspace.baseline, secrets)
         : undefined;
+    // Cancellation is confirmed without waiting for the remote; the next follow-up checks it.
+    const publication =
+      publishing && changes && outcome.status !== "cancelled"
+        ? await this.checkPublication(workspace, secrets, signal)
+        : undefined;
     const retained = workspace
-      ? { workspace: { ...workspaceReport(this.workspace(task.id)!), ...changes } }
+      ? {
+          workspace: { ...workspaceReport(this.workspace(task.id)!), ...changes },
+          ...(publication ? { publication } : {}),
+        }
       : {};
     const violation =
       modifiedFiles.length > 0

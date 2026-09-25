@@ -35,6 +35,9 @@ The Git worktree and task branch a writing agent works in, created from a commit
 **Task result**:
 The outcome of delegated work, including findings or code changes, verification evidence, and any associated pull request.
 
+**Task publication**:
+A writing task's pushed task branch and its pull request, as the bridge last found them on the remote. The child agent publishes; the parent agent decides on integration and merging.
+
 **Writing agent**:
 A child agent assigned to change project files as part of its delegated task.
 
