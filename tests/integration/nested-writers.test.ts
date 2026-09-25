@@ -232,6 +232,92 @@ describe("nested writers", () => {
     );
   });
 
+  it("let the executor assemble a nested writer that ended before the executor's turn without collecting it", async () => {
+    const { fixture, project, client, taskId, status, wait } = await setUp({
+      turns: [
+        { match: "Alpha writer", steps: retitle("Alpha") },
+        {
+          match: "<nested-writers-ended>",
+          steps: [waitWriters("waited"), merge("alpha"), finished("Merged the alpha writer.")],
+        },
+        {
+          match: "Coordinate",
+          steps: [
+            startWriter("alpha", "Alpha writer: retitle the README."),
+            { waitFor: "alpha-ended" },
+            finished("Started a nested writer."),
+          ],
+        },
+      ],
+    });
+    await waitFor(async () =>
+      (await status()).executions[0]?.nestedWriters?.[0]?.status === "completed" ? true : undefined,
+    );
+    fixture.release("alpha-ended");
+
+    expect(await wait()).toMatchObject({ status: "completed" });
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    expect(result.summary).toBe("Merged the alpha writer.");
+    expect(readFileSync(join(result.workspace.path, "README.md"), "utf8")).toBe("# Alpha\n");
+    expect(fixture.prompts().some((prompt) => prompt.includes("<nested-writers-ended>"))).toBe(
+      true,
+    );
+  });
+
+  it("give a follow-up its own nested writers, starting from the branch the earlier execution assembled", async () => {
+    const { project, client, taskId, status, wait, saved } = await setUp({
+      turns: [
+        { match: "Alpha writer", steps: retitle("Alpha") },
+        { match: "Beta writer", steps: retitle("Beta") },
+        {
+          match: "Now retitle it Beta",
+          steps: [
+            startWriter("beta", "Beta writer: retitle the README."),
+            waitWriters("waited-later"),
+            merge("beta"),
+            finished("Merged the beta writer."),
+          ],
+        },
+        {
+          match: "Coordinate",
+          steps: [
+            startWriter("alpha", "Alpha writer: retitle the README."),
+            waitWriters("waited"),
+            merge("alpha"),
+            finished("Merged the alpha writer."),
+          ],
+        },
+      ],
+    });
+    expect(await wait()).toMatchObject({ status: "completed" });
+    const sent = await client.call("send_followup", {
+      project,
+      taskId,
+      requestKey: "more-1",
+      message: "Now retitle it Beta.",
+    });
+    expect(sent.isError, sent.text).toBe(false);
+    const done = await client.call("wait_task", {
+      project,
+      taskId,
+      executionId: sent.data.executionId,
+      timeoutSeconds: 30,
+    });
+    expect(done.data).toMatchObject({ status: "completed" });
+
+    const alpha = saved("alpha").data;
+    const beta = saved("beta").data;
+    expect(saved("waited-later").data.writers).toMatchObject([{ writerId: beta.writerId }]);
+    const { executions, workspace } = await status();
+    expect(
+      executions.map((execution: { nestedWriters: { writerId: string }[] }) =>
+        execution.nestedWriters.map((writer) => writer.writerId),
+      ),
+    ).toEqual([[alpha.writerId], [beta.writerId]]);
+    expect(git(beta.workspace.path, "log", "--format=%s")).toContain("docs: alpha title");
+    expect(readFileSync(join(workspace.path, "README.md"), "utf8")).toBe("# Beta\n");
+  });
+
   it("refuse a configured MCP server that takes the name of the bridge's own tools", async () => {
     const fixture = new BridgeFixture({
       config: { mcpServers: { codex_claude_bridge: { command: "impostor-mcp" } } },

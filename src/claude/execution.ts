@@ -309,6 +309,8 @@ function permissionResult(
  * Nested writers run outside Claude Code, so it does not start a turn when they
  * end: a result that arrives while some run waits for them too, and once they
  * have all ended the executor is prompted to collect and assemble their work.
+ * A result is not final while a writer that ended has reached the executor
+ * neither through wait_nested_writers nor through that prompt.
  */
 export async function runExecution(
   request: ExecutionRequest,
@@ -340,11 +342,21 @@ export async function runExecution(
   };
   /** Whether the executor's turn ended while nested writers ran. */
   let writersPending = false;
+  /** Ended writers the ended notice has told the executor about. */
+  const announced = new Set<string>();
+  /** Sends the ended notice if some ended writer's report reached the executor neither way; returns whether it did. */
+  const announceWriters = () => {
+    const unannounced = writers?.unreported().filter((id) => !announced.has(id)) ?? [];
+    if (unannounced.length === 0) return false;
+    for (const id of unannounced) announced.add(id);
+    input.push(nestedWritersEndedPrompt);
+    return true;
+  };
   const stopWatchingWriters = writers?.onEnded(() => {
     childEnded();
     if (!writersPending || writers.running() > 0 || request.signal.aborted) return;
     writersPending = false;
-    input.push(nestedWritersEndedPrompt);
+    announceWriters();
   });
   const allEnded = (taskIds: string[]) =>
     new Promise<void>((resolve) => {
@@ -549,6 +561,7 @@ export async function runExecution(
               observer.waitingForChildren(runningChildren());
               continue;
             }
+            if (announceWriters()) continue;
             return {
               status: "completed",
               text: message.result,

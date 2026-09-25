@@ -357,7 +357,7 @@ This task uses the writing profile in its own Git worktree at ${workspace.path},
 
 Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. Do not push or open pull requests: publication is not enabled for this task.
 
-Claude Code's Agent tool is not available, because its agents would share your worktree. To split independent changes among nested writers working in parallel, use the bridge's start_nested_writer tool. Each nested writer is a separate Claude Code run that the bridge starts in its own worktree, on its own branch, from the commit your HEAD points to: commit the state it should start from first, as a worktree with uncommitted changes is refused. The tool returns at once; wait_nested_writers returns each writer's branch, baseline, commits, changed files, checks, and result. Assemble their work yourself: merge or cherry-pick each branch into ${workspace.branch}, run the checks that matter, and report in failures any conflict you could not resolve, naming the branch. You remain accountable for the result; your task is not complete while nested writers run, and if your turn ends first you are prompted to assemble their work once they have all ended.
+Claude Code's Agent tool is not available, because its agents would share your worktree. To split independent changes among nested writers working in parallel, use the bridge's start_nested_writer tool. Each nested writer is a separate Claude Code run that the bridge starts in its own worktree, on its own branch, from the commit your HEAD points to: commit the state it should start from first, as a worktree with uncommitted changes is refused. The tool returns at once; wait_nested_writers returns each writer's branch, baseline, commits, changed files, checks, and result. Assemble their work yourself: merge or cherry-pick each branch into ${workspace.branch}, run the checks that matter, and report in failures any conflict you could not resolve, naming the branch. You remain accountable for the result; your task is not complete while nested writers run or before you have collected their reports, and if your turn ends first you are prompted to assemble their work once they have all ended.
 
 Use nested writers only when changes are independent and large enough that working in parallel outweighs the cost: each is a full Claude Code session on the same subscription, and you brief it, review its work, and merge it. Keep small, sequential, or tightly coupled changes yourself. Nested writers cannot start nested writers, and the bridge does not limit how many you start, so start only as many as the work justifies.
 
@@ -1313,6 +1313,7 @@ export class TaskService {
   ): NestedWriters {
     const runs = new Map<string, { controller: AbortController; done: Promise<void> }>();
     const listeners = new Set<() => void>();
+    const unreported = new Set<string>();
     let closed = false;
     /** Why writers still running are stopped: the task was cancelled, or the execution ended first. */
     let stopReason = "parent_ended";
@@ -1403,6 +1404,7 @@ export class TaskService {
           })
           .finally(() => {
             runs.delete(id);
+            unreported.add(id);
             for (const listener of listeners) listener();
           });
         runs.set(id, { controller, done });
@@ -1424,9 +1426,11 @@ export class TaskService {
         }
         const selected = writerIds ?? own;
         await Promise.all(selected.map((id) => runs.get(id)?.done));
+        for (const id of selected) unreported.delete(id);
         return selected.map((id) => nestedWriterReport(this.nestedWriterRow(id)));
       },
       running: () => runs.size,
+      unreported: () => [...unreported],
       onEnded: (listener) => {
         listeners.add(listener);
         return () => listeners.delete(listener);

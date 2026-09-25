@@ -36,6 +36,8 @@ export interface NestedWriterHost {
   wait(writerIds?: string[]): Promise<unknown[]>;
   /** How many writers are running. */
   running(): number;
+  /** Writers that have ended without a wait call returning their reports. */
+  unreported(): string[];
   /** Calls `listener` whenever a writer ends; returns a function that removes it. */
   onEnded(listener: () => void): () => void;
 }
