@@ -198,6 +198,8 @@ const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit"];
 /** Most commits and changed files a result lists, and the longest commit subject kept. */
 const maxListedChanges = 500;
 const maxSubjectChars = 1_000;
+/** Most commits and changed files an execution's state shows; task_result pages them all. */
+const maxShownChanges = 5;
 /** Writing tasks get every tool except nested agents, which could not be held to the worktree. */
 const writingDisallowedTools = ["Agent"];
 
@@ -645,8 +647,13 @@ export class TaskService {
       ? this.executionById(task.id, executionId)
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
-    if (!execution.result) return { ...state, result: null };
-    const stored = JSON.parse(execution.result) as Record<string, unknown> & StoredResult;
+    // A failed or cancelled writing execution has no result, but lists its worktree's changes like one.
+    const retained = (JSON.parse(execution.detail ?? "{}") as Pick<StoredResult, "workspace">)
+      .workspace;
+    const stored: (Record<string, unknown> & Partial<StoredResult>) | undefined = execution.result
+      ? JSON.parse(execution.result)
+      : retained && { workspace: retained };
+    if (!stored) return { ...state, result: null };
     const parts = resultParts(stored);
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
     const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
@@ -672,6 +679,23 @@ export class TaskService {
     );
     const shown = (field: string) => page.parts.filter((item) => item.field === field);
     const texts = (field: string) => shown(field).map((item) => item.text);
+    const workspace = stored.workspace
+      ? {
+          workspace: {
+            ...stored.workspace,
+            ...(stored.workspace.commits
+              ? {
+                  commits: shown("commits").map((item) => ({
+                    sha: item.sha,
+                    subject: item.text,
+                  })),
+                }
+              : {}),
+            ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
+          },
+        }
+      : {};
+    if (!execution.result) return { ...state, result: null, ...workspace, ...truncation };
     return {
       ...state,
       result: {
@@ -681,22 +705,7 @@ export class TaskService {
         remainingWork: texts("remainingWork"),
         ...(stored.checks ? { checks: shownChecks(page.parts, stored.checks) } : {}),
         ...rest,
-        ...(stored.workspace
-          ? {
-              workspace: {
-                ...stored.workspace,
-                ...(stored.workspace.commits
-                  ? {
-                      commits: shown("commits").map((item) => ({
-                        sha: item.sha,
-                        subject: item.text,
-                      })),
-                    }
-                  : {}),
-                ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
-              },
-            }
-          : {}),
+        ...workspace,
       },
       ...truncation,
     };
@@ -1456,7 +1465,8 @@ export class TaskService {
               // Long lists are cut; the worktree itself holds every change.
               commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
                 sha,
-                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+                // Redacted before the cut, which could otherwise split a secret.
+                subject: redactContent(subject, secrets).slice(0, maxSubjectChars),
               })),
               changedFiles: changedFiles
                 .slice(0, maxListedChanges)
@@ -1593,17 +1603,20 @@ interface StoredResult {
 /**
  * The text of a result as an ordered list of parts: the summary, each list
  * item, each check's command and details, and each commit subject and changed
- * file of a writing task's workspace.
+ * file of a writing task's workspace. A failed or cancelled writing execution
+ * has only the workspace.
  */
-function resultParts(result: StoredResult): ResultPart[] {
+function resultParts(result: Partial<StoredResult>): ResultPart[] {
   const fields = [
     ["evidence", result.evidence],
     ["failures", result.failures],
     ["remainingWork", result.remainingWork],
   ] as const;
   const parts: Omit<ResultPart, "part">[] = [
-    { field: "summary", text: result.summary },
-    ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
+    ...(result.summary === undefined ? [] : [{ field: "summary", text: result.summary }]),
+    ...fields.flatMap(([field, items = []]) =>
+      items.map((text, index) => ({ field, index, text })),
+    ),
     ...(result.checks ?? []).flatMap((check, index) => [
       { field: "checks", index, key: "command", outcome: check.outcome, text: check.command },
       ...(check.details === undefined
@@ -1724,11 +1737,31 @@ function workspaceReport(workspace: WorkspaceRow) {
   };
 }
 
+/**
+ * An execution's detail as its state shows it: the worktree a failed or
+ * cancelled writing execution retains lists only its first changes.
+ */
+function shownDetail(detail: Record<string, unknown> & Pick<StoredResult, "workspace">) {
+  const { workspace } = detail;
+  const commits = workspace?.commits ?? [];
+  const changedFiles = workspace?.changedFiles ?? [];
+  if (commits.length <= maxShownChanges && changedFiles.length <= maxShownChanges) return detail;
+  return {
+    ...detail,
+    workspace: {
+      ...workspace,
+      commits: commits.slice(0, maxShownChanges),
+      changedFiles: changedFiles.slice(0, maxShownChanges),
+      note: `Shows the first ${maxShownChanges} commits and changed files; task_result for this execution lists them all in pages.`,
+    },
+  };
+}
+
 function executionState(execution: ExecutionRow) {
   return {
     status: execution.status,
     ...(execution.reason ? { reason: execution.reason } : {}),
-    ...(execution.detail ? { detail: JSON.parse(execution.detail) } : {}),
+    ...(execution.detail ? { detail: shownDetail(JSON.parse(execution.detail)) } : {}),
     ...(execution.error ? { error: JSON.parse(execution.error) } : {}),
     terminal: terminalStatuses.includes(execution.status),
   };
