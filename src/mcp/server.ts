@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { ServiceConnection } from "../ipc.ts";
 import { connectService } from "../service/launcher.ts";
-import { startSchema } from "../service/tasks.ts";
+import { outputSchema, startSchema, waitSchema } from "../service/tasks.ts";
 import type { StatePaths } from "../state.ts";
 import metadata from "../../package.json" with { type: "json" };
 
@@ -104,6 +104,29 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     (args) => call("task_result", args),
+  );
+
+  server.registerTool(
+    "wait_task",
+    {
+      title: "Wait for a delegated task",
+      description:
+        "Wait up to timeoutSeconds for one execution to finish or become blocked (for example waiting for subscription capacity). The execution is the one given, or the task's latest at call time, and the response names it. Returns at once for finished executions. A timeout returns the current state with timedOut: true and never stops the task. lastEventSeq tells whether new output exists for read_output.",
+      inputSchema: waitSchema.shape,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    (args) => call("wait_task", args),
+  );
+  server.registerTool(
+    "read_output",
+    {
+      title: "Read a delegated task's progress",
+      description:
+        "Read progress events of an execution after a cursor: status changes, Claude's messages, the tools it calls, and the final summary. Bounded by limit and maxChars; pass nextCursor as after to continue, also after reconnecting. An event cut to fit maxChars is marked truncated; read it in full with after set to its seq minus 1, limit 1, and a larger maxChars. Only the newest events of long executions are kept; the durable result is never affected.",
+      inputSchema: outputSchema.shape,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    (args) => call("read_output", args),
   );
 
   // Codex closing stdin ends this entry point; the service and its work continue.

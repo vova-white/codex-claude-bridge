@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
@@ -38,7 +39,58 @@ export const startSchema = z.object({
 });
 export type StartRequest = z.infer<typeof startSchema>;
 
+/** Upper bound of one wait_task call, below the plugin's MCP tool timeout. */
+const maxWaitSeconds = 300;
+/** Diagnostics retention per execution, independent of the durable result. */
+const maxEventsPerExecution = 2000;
+const maxStoredEventChars = 16_000;
+
 const taskLookup = z.object({ project: z.string().min(1), taskId: z.string().min(1) });
+
+/** Arguments of wait_task. */
+export const waitSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  executionId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Execution to wait for; defaults to the task's latest execution at call time."),
+  timeoutSeconds: z
+    .number()
+    .int()
+    .min(0)
+    .max(maxWaitSeconds)
+    .default(60)
+    .describe(
+      `Longest time to wait, up to ${maxWaitSeconds} s. Timing out does not stop the task.`,
+    ),
+});
+
+/** Arguments of read_output. */
+export const outputSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  executionId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("Execution to read; defaults to the task's latest execution."),
+  after: z
+    .number()
+    .int()
+    .min(0)
+    .default(0)
+    .describe("Cursor: return events with a sequence number greater than this (nextCursor)."),
+  limit: z.number().int().min(1).max(200).default(50).describe("Most events to return."),
+  maxChars: z
+    .number()
+    .int()
+    .min(200)
+    .max(maxStoredEventChars)
+    .default(8000)
+    .describe("Most characters of event text to return in total."),
+});
 const resultLookup = taskLookup.extend({ executionId: z.string().min(1).optional() });
 const projectLookup = z.object({ project: z.string().min(1) });
 
@@ -67,12 +119,15 @@ interface ExecutionRow {
   error: string | null;
   session_id: string | null;
   result: string | null;
+  events_pruned: number;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
 }
 
 const terminalStatuses = ["completed", "failed", "interrupted"];
+/** Reasons a running execution cannot progress on its own; entering one ends a wait. */
+const blockedReasons = new Set(["waiting_for_capacity"]);
 
 function parse<T>(schema: z.ZodType<T>, params: unknown): T {
   const parsed = schema.safeParse(params ?? {});
@@ -114,6 +169,8 @@ export class TaskService {
   private readonly paths: StatePaths;
   private readonly config: () => BridgeConfig;
   private readonly log: (message: string) => void;
+  /** Emits an execution ID whenever that execution's state changes. */
+  private readonly changes = new EventEmitter();
 
   constructor(
     db: DatabaseSync,
@@ -125,6 +182,7 @@ export class TaskService {
     this.paths = paths;
     this.config = config;
     this.log = log;
+    this.changes.setMaxListeners(0);
   }
 
   /**
@@ -132,14 +190,24 @@ export class TaskService {
    * previous service left unfinished cannot be running any more.
    */
   interruptUnfinished(): void {
-    const changed = this.db
-      .prepare(
-        `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = NULL, ended_at = ?
-         WHERE status IN ('queued', 'running')`,
-      )
-      .run(now());
-    if (changed.changes > 0) {
-      this.log(`marked ${changed.changes} unfinished execution(s) interrupted`);
+    const unfinished = this.db
+      .prepare("SELECT id FROM executions WHERE status IN ('queued', 'running')")
+      .all() as { id: string }[];
+    for (const { id } of unfinished) {
+      this.db
+        .prepare(
+          `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = NULL, ended_at = ?
+           WHERE id = ?`,
+        )
+        .run(now(), id);
+      this.record(
+        id,
+        "status",
+        "Interrupted: the bridge service stopped while this execution ran.",
+      );
+    }
+    if (unfinished.length > 0) {
+      this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
     }
   }
 
@@ -199,6 +267,7 @@ export class TaskService {
       this.db.exec("ROLLBACK");
       throw error;
     }
+    this.record(executionId, "status", "Accepted.");
     // Accepted intent is durable before any Claude Code process starts.
     setImmediate(() => {
       this.execute(executionId, project, request).catch((error: unknown) => {
@@ -284,6 +353,98 @@ export class TaskService {
     };
   }
 
+  /**
+   * Waits for one execution, pinned at call time, to finish or to become blocked,
+   * for at most the timeout. Timing out reports the current state and never
+   * stops the execution.
+   */
+  async wait(caller: string, params: unknown) {
+    const { project, taskId, executionId, timeoutSeconds } = parse(waitSchema, params);
+    const task = await this.task(caller, project, taskId);
+    const pinned = executionId
+      ? this.executionById(task.id, executionId)
+      : this.latestExecution(task.id);
+    const initialReason = pinned.reason;
+    const deadline = Date.now() + timeoutSeconds * 1000;
+    for (;;) {
+      const current = this.executionById(task.id, pinned.id);
+      const blocked = current.reason !== initialReason && blockedReasons.has(current.reason ?? "");
+      const remaining = deadline - Date.now();
+      if (terminalStatuses.includes(current.status) || blocked || remaining <= 0) {
+        return {
+          taskId: task.id,
+          executionId: current.id,
+          timedOut: !terminalStatuses.includes(current.status) && !blocked,
+          ...executionState(current),
+          lastEventSeq: this.lastEventSeq(current.id),
+        };
+      }
+      await this.nextChange(current.id, remaining);
+    }
+  }
+
+  /**
+   * Reads an execution's progress events after a cursor, bounded by count and
+   * characters. An event longer than the remaining budget is cut and marked, and
+   * can be read in full by asking for that one event with a larger budget.
+   */
+  async readOutput(caller: string, params: unknown) {
+    const request = parse(outputSchema, params);
+    const task = await this.task(caller, request.project, request.taskId);
+    const execution = request.executionId
+      ? this.executionById(task.id, request.executionId)
+      : this.latestExecution(task.id);
+    const rows = this.db
+      .prepare(
+        "SELECT seq, at, kind, text FROM events WHERE execution_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+      )
+      .all(execution.id, request.after, request.limit + 1) as unknown as {
+      seq: number;
+      at: string;
+      kind: string;
+      text: string;
+    }[];
+    const events: { seq: number; at: string; kind: string; text: string; truncated?: object }[] =
+      [];
+    let budget = request.maxChars;
+    for (const row of rows.slice(0, request.limit)) {
+      if (row.text.length <= budget) {
+        events.push(row);
+        budget -= row.text.length;
+        continue;
+      }
+      if (events.length === 0) {
+        events.push({
+          ...row,
+          text: row.text.slice(0, budget),
+          truncated: { shownChars: budget, totalChars: row.text.length },
+        });
+      }
+      break;
+    }
+    const nextCursor = events.at(-1)?.seq ?? request.after;
+    const first = this.db
+      .prepare("SELECT MIN(seq) AS seq FROM events WHERE execution_id = ?")
+      .get(execution.id) as { seq: number | null };
+    return {
+      taskId: task.id,
+      executionId: execution.id,
+      ...executionState(execution),
+      events,
+      nextCursor,
+      hasMore: rows.some((row) => row.seq > nextCursor),
+      ...(execution.events_pruned > 0
+        ? {
+            retention: {
+              prunedEvents: execution.events_pruned,
+              firstAvailableSeq: first.seq,
+              note: `Only the newest ${maxEventsPerExecution} events of an execution are kept; the result is not affected.`,
+            },
+          }
+        : {}),
+    };
+  }
+
   private async projectRoot(path: string): Promise<string> {
     const root = await repositoryRoot(path);
     if (!root) {
@@ -315,17 +476,75 @@ export class TaskService {
 
   private update(executionId: string, fields: Record<string, string | null>, when = "running") {
     const columns = Object.keys(fields);
-    return (
+    const changed =
       this.db
         .prepare(
           `UPDATE executions SET ${columns.map((column) => `${column} = ?`).join(", ")} WHERE id = ? AND status = ?`,
         )
-        .run(...Object.values(fields), executionId, when).changes > 0
-    );
+        .run(...Object.values(fields), executionId, when).changes > 0;
+    if (changed) this.changes.emit("change", executionId);
+    return changed;
+  }
+
+  /** Appends progress output, keeping only the newest events of an execution. */
+  private record(executionId: string, kind: string, text: string): void {
+    let stored = text;
+    if (text.length > maxStoredEventChars) {
+      // The marker fits within the limit, so one read_output call can return the whole event.
+      const marker = `… [${text.length} characters, the rest not stored]`;
+      stored = `${text.slice(0, maxStoredEventChars - marker.length)}${marker}`;
+    }
+    this.db
+      .prepare("INSERT INTO events (execution_id, at, kind, text) VALUES (?, ?, ?, ?)")
+      .run(executionId, now(), kind, stored);
+    const pruned = this.db
+      .prepare(
+        `DELETE FROM events WHERE execution_id = ? AND seq <= (
+           SELECT seq FROM events WHERE execution_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?)`,
+      )
+      .run(executionId, executionId, maxEventsPerExecution).changes;
+    if (pruned > 0) {
+      this.db
+        .prepare("UPDATE executions SET events_pruned = events_pruned + ? WHERE id = ?")
+        .run(pruned, executionId);
+    }
+  }
+
+  private executionById(taskId: string, executionId: string): ExecutionRow {
+    const execution = this.db
+      .prepare("SELECT * FROM executions WHERE task_id = ? AND id = ?")
+      .get(taskId, executionId) as ExecutionRow | undefined;
+    if (!execution) {
+      throw new ServiceError("not_found", `Task ${taskId} has no execution ${executionId}.`);
+    }
+    return execution;
+  }
+
+  private lastEventSeq(executionId: string): number {
+    const row = this.db
+      .prepare("SELECT MAX(seq) AS seq FROM events WHERE execution_id = ?")
+      .get(executionId) as { seq: number | null };
+    return row.seq ?? 0;
+  }
+
+  private nextChange(executionId: string, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.changes.off("change", listener);
+        resolve();
+      };
+      const listener = (id: string) => {
+        if (id === executionId) done();
+      };
+      const timer = setTimeout(done, ms);
+      this.changes.on("change", listener);
+    });
   }
 
   private async execute(executionId: string, root: string, request: StartRequest): Promise<void> {
     if (!this.update(executionId, { status: "running", started_at: now() }, "queued")) return;
+    this.record(executionId, "status", "Running.");
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
@@ -363,13 +582,27 @@ export class TaskService {
               .run(sessionId, executionId);
           },
           capacity: (waiting) => {
-            this.update(
+            const current = this.db
+              .prepare("SELECT reason FROM executions WHERE id = ?")
+              .get(executionId) as { reason: string | null };
+            if ((current.reason === "waiting_for_capacity") === Boolean(waiting)) return;
+            const changed = this.update(
               executionId,
               waiting
                 ? { reason: "waiting_for_capacity", detail: JSON.stringify(waiting) }
                 : { reason: null, detail: null },
             );
+            if (changed) {
+              this.record(
+                executionId,
+                "status",
+                waiting
+                  ? `Waiting for subscription capacity${waiting.resetsAt ? ` until ${new Date(waiting.resetsAt * 1000).toISOString()}` : ""}.`
+                  : "Running.",
+              );
+            }
           },
+          output: (kind, text) => this.record(executionId, kind, redactContent(text, secrets)),
         },
       );
     }
@@ -380,7 +613,7 @@ export class TaskService {
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
         : [];
     if (outcome.status === "failed") {
-      this.update(executionId, {
+      const failed = this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
         detail: outcome.detail ? JSON.stringify(outcome.detail) : null,
@@ -391,6 +624,7 @@ export class TaskService {
         }),
         ended_at: endedAt,
       });
+      if (failed) this.record(executionId, "status", `Failed (${outcome.reason}).`);
       return;
     }
     const parsed = reportedResult.safeParse(outcome.structured);
@@ -406,13 +640,14 @@ export class TaskService {
       remainingWork: reported.remainingWork.map(clean),
       workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles },
     };
-    this.update(executionId, {
+    const completed = this.update(executionId, {
       status: "completed",
       reason: null,
       detail: null,
       result: JSON.stringify(result),
       ended_at: endedAt,
     });
+    if (completed) this.record(executionId, "result", result.summary);
   }
 }
 

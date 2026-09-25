@@ -34,6 +34,8 @@ export interface ExecutionObserver {
   session(id: string): void;
   /** Called with the reset time while Claude Code waits for subscription capacity, and with undefined once it proceeds. */
   capacity(waiting: { resetsAt?: number } | undefined): void;
+  /** Progress Claude reports: its text and the tools it calls. */
+  output(kind: "assistant" | "tool", text: string): void;
 }
 
 export type ExecutionOutcome =
@@ -193,6 +195,13 @@ export async function runExecution(
         }
       } else if (message.type === "assistant") {
         if (message.error) lastError = message.error;
+        for (const block of message.message.content) {
+          if (block.type === "text" && block.text.trim()) {
+            observer.output("assistant", block.text);
+          } else if (block.type === "tool_use") {
+            observer.output("tool", `${block.name} ${JSON.stringify(block.input)}`);
+          }
+        }
       } else if (message.type === "result") {
         if (message.subtype === "success" && !message.is_error) {
           return {
