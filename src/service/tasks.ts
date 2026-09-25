@@ -1265,7 +1265,12 @@ export class TaskService {
         this.update(executionId, {
           status: "failed",
           reason: "provider_error",
-          error: JSON.stringify({ message: "The bridge could not run this execution." }),
+          // The error's own text can carry Claude Code's output; only its type is reported.
+          error: JSON.stringify({
+            message: `Execution failed with provider_error: the bridge service could not run it (${errorOrigin(error)}).`,
+            action:
+              "Call readiness for the project and fix any problem it reports, then start a new task with a new request key.",
+          }),
           ended_at: now(),
         });
       })
@@ -1300,7 +1305,7 @@ export class TaskService {
       outcome = {
         status: "failed",
         reason: "provider_error",
-        message: "Claude Code was not found.",
+        message: "Execution failed with provider_error: Claude Code was not found.",
         action: `Install Claude Code, or set "claudeExecutable" in ${this.paths.config}.`,
         processExited: true,
       };
@@ -1309,7 +1314,8 @@ export class TaskService {
       outcome = {
         status: "failed",
         reason: "session_unavailable",
-        message: "The task has no Claude session to continue; the follow-up was not sent.",
+        message:
+          "Execution failed with session_unavailable: the task has no Claude session to continue; the follow-up was not sent.",
         action:
           "Start a new task with the context the follow-up needs; the earlier results stay available.",
         processExited: true,
@@ -1318,7 +1324,7 @@ export class TaskService {
       outcome = {
         status: "failed",
         reason: "workspace_error",
-        message: `Could not create the task worktree at ${workspace.path} on branch ${workspace.branch}; no execution was started.`,
+        message: `Execution failed with workspace_error: could not create the task worktree at ${workspace.path} on branch ${workspace.branch}; no execution was started.`,
         action:
           "Check that the repository accepts new worktrees and branches (for example with `git worktree add`), then start a new task.",
         processExited: true,
@@ -1438,7 +1444,10 @@ export class TaskService {
       );
     }
     const endedAt = now();
-    const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
+    // Claude chooses file names; redaction is a backstop for credentials in them.
+    const modifiedFiles = (before ? changedPaths(before, await checkoutState(root)) : []).map(
+      (path) => redactContent(path, secrets),
+    );
     // A writing task's changes stay in its worktree whatever the outcome.
     const changes =
       workspace && this.workspace(task.id)?.state === "ready"
@@ -1464,6 +1473,10 @@ export class TaskService {
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
         : [];
+    // Cancellation wins over a failure it raced, even after Claude Code has returned.
+    if (outcome.status === "failed" && signal.aborted) {
+      outcome = { status: "cancelled", processExited: outcome.processExited };
+    }
     if (outcome.status === "cancelled") {
       const cancelled = this.update(executionId, {
         status: "cancelled",
@@ -1490,18 +1503,31 @@ export class TaskService {
       const failed = this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
+        // Claude chooses file names and commit subjects, so they stay out of `error`.
         detail:
-          outcome.detail || !outcome.processExited
+          outcome.detail || !outcome.processExited || modifiedFiles.length > 0 || workspace
             ? JSON.stringify({
                 ...outcome.detail,
                 ...(outcome.processExited ? {} : { processExited: false }),
+                ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+                ...retained,
               })
             : null,
         error: JSON.stringify({
-          message: [outcome.message, ...violation].join(" "),
-          ...(outcome.action ? { action: outcome.action } : {}),
-          ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
-          ...retained,
+          message: [
+            outcome.message,
+            ...(modifiedFiles.length > 0
+              ? [
+                  `The read-only task changed ${plural(modifiedFiles.length, "file")} in the shared checkout (see detail.modifiedFiles).`,
+                ]
+              : []),
+            ...(changes
+              ? [
+                  `The task's worktree holds ${plural(changes.commitCount, "commit")} and ${plural(changes.changedFileCount, "changed file")} (see detail.workspace).`,
+                ]
+              : []),
+          ].join(" "),
+          action: outcome.action,
         }),
         ended_at: endedAt,
       });
@@ -1679,6 +1705,11 @@ function redactStrings(value: unknown, clean: (text: string) => string): unknown
     );
   }
   return value;
+}
+
+/** A number with its noun, such as "1 file" or "2 files". */
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
 function workspaceReport(workspace: WorkspaceRow) {

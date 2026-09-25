@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { realpathSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { delimiter, join } from "node:path";
@@ -9,6 +9,8 @@ import {
   type McpServerStatus,
   type ModelInfo,
   type SDKUserMessage,
+  type SpawnedProcess,
+  type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { redact } from "../redact.ts";
@@ -139,8 +141,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   }
 
   const abort = new AbortController();
-  const exit: ProcessExit = {};
-  let exited = Promise.resolve();
+  const claude = claudeProcess();
   const session = query({
     prompt: withoutPrompt(abort.signal),
     options: {
@@ -149,23 +150,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       env: claudeEnvironment(config),
       extraArgs: mcpConfigArgs(paths, config),
       abortController: abort,
-      // The bridge spawns Claude Code itself so a failed start is described by the
-      // process's exit, not by text; its stderr is never read.
-      spawnClaudeCodeProcess: (options) => {
-        const child = spawn(options.command, options.args, {
-          cwd: options.cwd,
-          env: options.env as NodeJS.ProcessEnv,
-          stdio: ["pipe", "pipe", "ignore"],
-          signal: options.signal,
-        });
-        exited = new Promise((resolve) => {
-          child.once("exit", (code, signal) => resolve(void Object.assign(exit, { code, signal })));
-          child.once("error", (error: NodeJS.ErrnoException) =>
-            resolve(void Object.assign(exit, { spawnError: error.code })),
-          );
-        });
-        return child;
-      },
+      spawnClaudeCodeProcess: claude.spawn,
     },
   });
   try {
@@ -222,9 +207,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       }
     }
   } catch (error) {
-    // The SDK can report the failure before the process's exit event arrives.
-    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
-    const stage = startFailure(error, exit);
+    const stage = claudeFailure(error, await claude.exit(), initializeTimeoutMs);
     problem(
       "claude_start",
       `Claude Code could not start a session (${stage}).`,
@@ -400,9 +383,59 @@ interface ProcessExit {
   spawnError?: string | undefined;
 }
 
-/** The start-up stage that failed, from the timeout or the process's own exit. */
-function startFailure(error: unknown, exit: ProcessExit): string {
-  if (error instanceof TimeoutError) return `no response within ${initializeTimeoutMs / 1000} s`;
+/**
+ * Spawns Claude Code for the Agent SDK (`spawnClaudeCodeProcess`) so a failure
+ * can be described by the process's exit rather than by text; its stderr is
+ * never read.
+ */
+export function claudeProcess() {
+  const exit: ProcessExit = {};
+  let child: ChildProcess | undefined;
+  let exited = Promise.resolve();
+  /** Whether the process exits within `ms`. */
+  const exitsWithin = (ms: number) =>
+    Promise.race([
+      exited.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
+    ]);
+  return {
+    spawn: (options: SpawnOptions): SpawnedProcess => {
+      const process = spawn(options.command, options.args, {
+        cwd: options.cwd,
+        env: options.env as NodeJS.ProcessEnv,
+        stdio: ["pipe", "pipe", "ignore"],
+        signal: options.signal,
+      });
+      child = process;
+      // Only the exit event proves the process is gone: an abort also emits
+      // "error" while the process may still run. A spawn failure has no process.
+      exited = new Promise((resolve) => {
+        process.once("exit", (code, signal) => resolve(void Object.assign(exit, { code, signal })));
+        process.once("error", (error: NodeJS.ErrnoException) => {
+          if (process.pid !== undefined) return;
+          resolve(void Object.assign(exit, { spawnError: error.code }));
+        });
+      });
+      return process;
+    },
+    /** How the process ended; the SDK can report a failure before the exit event arrives. */
+    exit: async (): Promise<ProcessExit> => {
+      await exitsWithin(2_000);
+      return exit;
+    },
+    /** Waits for the process to exit, killing it after a grace period; reports whether it exited. */
+    stop: async (): Promise<boolean> => {
+      if (!child) return true;
+      if (await exitsWithin(10_000)) return true;
+      child.kill("SIGKILL");
+      return exitsWithin(5_000);
+    },
+  };
+}
+
+/** What went wrong with a Claude Code process, from a timeout or the process's own exit. */
+export function claudeFailure(error: unknown, exit: ProcessExit, timeoutMs: number): string {
+  if (error instanceof TimeoutError) return `no response within ${timeoutMs / 1000} s`;
   if (exit.spawnError === "ENOENT") return "the executable was not found";
   if (exit.spawnError === "EACCES") return "the executable is not permitted to run";
   if (typeof exit.code === "number") return `Claude Code exited with code ${exit.code}`;
