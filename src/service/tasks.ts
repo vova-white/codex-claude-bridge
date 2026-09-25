@@ -1840,13 +1840,23 @@ function responseHash(response: object): string {
   return createHash("sha256").update(JSON.stringify(response)).digest("hex");
 }
 
-/** Applies `clean` to every string inside a JSON-like value. */
+/**
+ * Applies `clean` to every string inside a JSON-like value, object keys
+ * included. A key that cleaning makes equal to an earlier one gets
+ * " (key N)" appended, N being its position, so no entry is lost.
+ */
 function redactStrings(value: unknown, clean: (text: string) => string): unknown {
   if (typeof value === "string") return clean(value);
   if (Array.isArray(value)) return value.map((item) => redactStrings(item, clean));
   if (value && typeof value === "object") {
+    const keys = new Set<string>();
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, redactStrings(item, clean)]),
+      Object.entries(value).map(([key, item], index) => {
+        let shown = clean(key);
+        while (keys.has(shown)) shown = `${shown} (key ${index + 1})`;
+        keys.add(shown);
+        return [shown, redactStrings(item, clean)];
+      }),
     );
   }
   return value;
