@@ -147,6 +147,22 @@ describe("readiness", () => {
     expect(fixture.serviceLog()).not.toContain("LEAKEDVALUE");
   });
 
+  it("keeps MCP URL credentials out of the service log when Claude Code fails to start", async () => {
+    const url = "https://user:url-password-1@tracker.invalid/mcp?sig=my+private+sig";
+    const fixture = bridge({
+      config: { mcpServers: { tracker: { type: "http", url } } },
+      scenario: { startupError: `cannot reach ${url.replace("+", "%20").replace("+", "%20")}` },
+    });
+    const report = await readiness(fixture);
+
+    expect(problemCodes(report)).toContain("claude_start");
+    expect(fixture.serviceLog()).toContain("tracker.invalid");
+    for (const secret of ["url-password-1", "private", "sig%20"]) {
+      expect(JSON.stringify(report)).not.toContain(secret);
+      expect(fixture.serviceLog()).not.toContain(secret);
+    }
+  });
+
   it("distinguishes configured MCP integrations from Codex tools and redacts their secrets", async () => {
     const fixture = bridge({
       config: {

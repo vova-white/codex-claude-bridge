@@ -72,7 +72,7 @@ The CLI accepts `--help`, `--version`, `mcp` (the stdio MCP entry point), and `s
 
 ## Test boundaries
 
-- `tests/unit/**/*.test.ts`: argument parsing and Claude Code version compatibility.
+- `tests/unit/**/*.test.ts`: argument parsing, Claude Code version compatibility, and credential redaction.
 - `tests/integration/**/*.test.ts`: the public MCP boundary. `tests/support/bridge.ts` gives each test a temporary state directory and launches the real MCP entry point and background service as subprocesses, with real SQLite. `tests/fixtures/fake-claude.ts` replaces the Claude Code executable: it speaks the Agent SDK's stream-json control protocol and follows a per-test scenario, so the real SDK and adapter run without credentials or model calls.
 - `tests/e2e/**/*.e2e.ts`: Playwright Test launches the built CLI outside the source checkout, and runs the plugin as Codex installs it: copied without `node_modules`, launched from its `.mcp.json`.
 

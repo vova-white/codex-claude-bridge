@@ -24,6 +24,14 @@ describe("MCP URL credential redaction", () => {
     expect(message).not.toContain("c'd");
   });
 
+  it("masks all of the user info when it contains a literal @", () => {
+    const message = redactFor(
+      "https://a@b:pw-secret@tracker.invalid/mcp",
+      "failed: https://a@b:pw-secret@tracker.invalid/mcp",
+    );
+    expect(message).toBe("failed: https://[REDACTED]@tracker.invalid/mcp");
+  });
+
   it("keeps credentials out of diagnostics that quote them without the URL", () => {
     const message = redactFor(
       "https://bad%XX:pw-secret@tracker.invalid/mcp?token=token-secret",
