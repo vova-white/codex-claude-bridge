@@ -386,9 +386,10 @@ interface ProcessExit {
 /**
  * Spawns Claude Code for the Agent SDK (`spawnClaudeCodeProcess`) so a failure
  * can be described by the process's exit rather than by text; its stderr is
- * never read.
+ * never read. `spawned` receives the new process's PID before the SDK can send
+ * it anything.
  */
-export function claudeProcess() {
+export function claudeProcess(spawned?: (pid: number) => void) {
   const exit: ProcessExit = {};
   let child: ChildProcess | undefined;
   let exited = Promise.resolve();
@@ -407,6 +408,7 @@ export function claudeProcess() {
         signal: options.signal,
       });
       child = process;
+      if (process.pid !== undefined) spawned?.(process.pid);
       // Only the exit event proves the process is gone: an abort also emits
       // "error" while the process may still run. A spawn failure has no process.
       exited = new Promise((resolve) => {

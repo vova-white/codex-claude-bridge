@@ -510,6 +510,42 @@ describe("task publication", () => {
     expect(creates(ghCalls())).toHaveLength(1);
   });
 
+  it("reconcile what an execution interrupted by a service crash published, without publishing again", async () => {
+    const { fixture, project, client, ghCalls } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            { signal: "published" },
+            { waitFor: "never" },
+          ],
+        },
+      ],
+    });
+    const { taskId } = (await client.call("start_task", writeTask(project))).data;
+    await waitFor(() => fixture.signalled("published") || undefined, 15_000);
+    await fixture.killService();
+
+    const reconnected = await fixture.connect();
+    const recovered = await waitFor(async () => {
+      const status = (await reconnected.call("task_status", { project, taskId })).data;
+      return status.executions[0].detail?.publication ? status.executions[0] : undefined;
+    }, 15_000);
+    expect(recovered).toMatchObject({
+      status: "interrupted",
+      reason: "service_restarted",
+      detail: {
+        recovery: { process: "ended" },
+        workspace: { commits: [{ subject: "docs: improve the README" }] },
+        publication: { pushed: true, pullRequest: { number: 1, state: "OPEN" } },
+      },
+    });
+    expect(creates(ghCalls())).toHaveLength(1);
+    expect(fixture.launches()).toHaveLength(1);
+  });
+
   it("report an unavailable GitHub CLI without copying its error text", async () => {
     const { fixture, project, client } = await setUp(
       {

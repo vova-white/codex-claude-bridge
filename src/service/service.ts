@@ -73,7 +73,7 @@ async function start(
 ): Promise<void> {
   const store = openStore(paths.database);
   const tasks = new TaskService(store, paths, config, log);
-  tasks.interruptUnfinished();
+  await tasks.recover();
   try {
     if (statSync(paths.log).size > maxLogBytes) renameSync(paths.log, `${paths.log}.1`);
   } catch {

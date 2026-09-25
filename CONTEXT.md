@@ -17,6 +17,12 @@ A bounded assignment from the parent agent to a child agent, with an expected re
 **Execution**:
 One run of Claude Code for a delegated task, with its own identity, status, and result. The first execution carries the original assignment.
 
+**Interrupted execution**:
+An execution that was running when the bridge service stopped. Its Claude Code process is ended, or proven already gone, when the next service starts; it is never run again on the bridge's own initiative. A follow-up resumes its Claude session, and Claude is told it was interrupted.
+
+**Recovery**:
+What a starting bridge service does with the work its predecessor left unfinished: it checks each recorded Claude Code process by PID and start time, interrupts executions that had started, keeps queued ones queued when its database provably lost nothing, expires pending requests, and records what interrupted writing tasks left in their worktrees and on the remote.
+
 **Execution slot**:
 One of the limited number of executions the bridge service runs at once. An execution holds its slot from start to end, whatever it waits for meanwhile (an answer, subscription capacity, nested agents, nested writers); nested agents and nested writers run as part of it and take no slot of their own.
 

@@ -198,32 +198,6 @@ describe("follow-ups", () => {
   });
 });
 
-describe("recovery", () => {
-  it("reports queued follow-ups as interrupted after the service restarts, never starting them", async () => {
-    const { fixture, project, client, taskId, first } = await setUp({
-      turns: [{ steps: [{ waitFor: "never" }] }],
-    });
-    await waitFor(() => fixture.prompts().length === 1 || undefined);
-    const queued = await followUp(client, project, taskId, "more-1", "Later.");
-    const pid = fixture.servicePid()!;
-    process.kill(pid, "SIGKILL");
-    await waitFor(() => !isAlive(pid) || undefined);
-
-    const reconnected = await fixture.connect();
-    const status = (await reconnected.call("task_status", { project, taskId })).data;
-    expect(
-      status.executions.map((execution: { executionId: string; status: string }) => [
-        execution.executionId,
-        execution.status,
-      ]),
-    ).toEqual([
-      [first, "interrupted"],
-      [queued.executionId, "interrupted"],
-    ]);
-    expect(fixture.launches()).toHaveLength(1);
-  });
-});
-
 describe("cancellation", () => {
   it("stops running work, cancels queued follow-ups, confirms termination, and is idempotent", async () => {
     const { fixture, project, client, taskId, first } = await setUp({

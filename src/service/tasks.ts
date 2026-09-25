@@ -18,6 +18,7 @@ import {
   type NestedWriterBrief,
   type NestedWriterHost,
 } from "../claude/nested-writers.ts";
+import { bootId, reclaimProcess, type ProcessIdentity } from "../claude/processes.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { errorOrigin, redactContent } from "../redact.ts";
@@ -289,6 +290,8 @@ interface NestedWriterRow {
   session_id: string | null;
   outcome: string | null;
   process_exited: number | null;
+  /** The ProcessIdentity of its Claude Code process, once spawned. */
+  process: string | null;
   created_at: string;
   ended_at: string | null;
 }
@@ -369,6 +372,8 @@ interface ExecutionRow {
   input: string | null;
   request_key: string | null;
   request_hash: string | null;
+  /** The ProcessIdentity of its Claude Code process, once spawned. */
+  process: string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
@@ -464,6 +469,24 @@ Work without asking whenever you can: make reasonable assumptions, state them, a
 Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the executor), and checks (each check you ran and whether it passed).`;
 }
 
+/**
+ * Opens a follow-up whose session's previous execution was cut off by a service
+ * stop, with what the bridge knows of the worktree it left.
+ */
+function interruptionNotice(uncommitted: boolean | undefined): string {
+  const worktree =
+    uncommitted === undefined
+      ? ""
+      : uncommitted
+        ? " The worktree has uncommitted changes, which may be partial work of that execution."
+        : " The worktree has no uncommitted changes.";
+  return `<previous-execution-interrupted>
+Your previous execution in this session did not finish: the bridge service stopped while it ran. This conversation may lack its last steps, and an action it started may or may not have taken effect.${worktree} Check the current state before continuing, and do not repeat a commit, push, pull request, or other action whose effect is already present.
+</previous-execution-interrupted>
+
+`;
+}
+
 const ending = () => new NestedWriterRefusal("The task is ending; no nested writer was started.");
 
 /**
@@ -514,43 +537,154 @@ export class TaskService {
   }
 
   /**
-   * A new service never inherits live Claude Code processes, so executions the
-   * previous service left unfinished cannot be running any more.
+   * Reconciles the work a previous service left unfinished; called once at
+   * startup, before requests are served. No one observes or controls a Claude
+   * Code process that service spawned any more, and its running status proves
+   * nothing: a process whose recorded PID and start time show it still runs is
+   * stopped, and its execution becomes interrupted with `detail.recovery`
+   * saying what was found. It is never run again on the bridge's initiative.
+   * Queued executions never reached Claude Code and stay queued, but only when
+   * the database provably holds every commit of the previous service: after a
+   * machine restart it may have lost the latest ones (ADR 0004), so they are
+   * interrupted too. Pending requests expire, as no process is left to receive
+   * an answer. The worktrees and remotes of interrupted writing executions are
+   * reconciled afterwards, in the background.
    */
-  interruptUnfinished(): void {
+  async recover(): Promise<void> {
+    const boot = bootId();
+    const previous = this.db
+      .prepare("SELECT value FROM service_state WHERE key = 'boot_id'")
+      .get() as { value: string } | undefined;
+    const exact = boot !== undefined && previous?.value === boot;
+    if (boot) {
+      this.db
+        .prepare("INSERT OR REPLACE INTO service_state (key, value) VALUES ('boot_id', ?)")
+        .run(boot);
+    }
+    // Without a recorded process, a running execution had not launched Claude Code yet.
+    const found = (recorded: string | null) =>
+      recorded
+        ? reclaimProcess(JSON.parse(recorded) as ProcessIdentity)
+        : Promise.resolve(exact ? ("none" as const) : ("unknown" as const));
     const unfinished = this.db
-      .prepare("SELECT id FROM executions WHERE status IN ('queued', 'running')")
-      .all() as { id: string }[];
-    for (const { id } of unfinished) {
+      .prepare(
+        "SELECT * FROM executions WHERE status IN ('queued', 'running') ORDER BY created_at, rowid",
+      )
+      .all() as unknown as ExecutionRow[];
+    const writers = this.db
+      .prepare("SELECT * FROM nested_writers WHERE status = 'running'")
+      .all() as unknown as NestedWriterRow[];
+    const [processes, writerProcesses] = await Promise.all([
+      Promise.all(
+        unfinished.map((execution) =>
+          execution.status === "queued" ? ("unknown" as const) : found(execution.process),
+        ),
+      ),
+      Promise.all(writers.map((writer) => found(writer.process))),
+    ]);
+    const endedAt = now();
+    const interrupted: string[] = [];
+    unfinished.forEach((execution, index) => {
+      if (execution.status === "queued" && exact) {
+        this.record(
+          execution.id,
+          "status",
+          "The bridge service restarted before this execution started; it stays queued.",
+        );
+        return;
+      }
+      const recovery = processes[index]!;
       this.db
         .prepare(
-          `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = NULL, ended_at = ?
+          `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = ?, ended_at = ?
            WHERE id = ?`,
         )
-        .run(now(), id);
+        .run(JSON.stringify({ recovery: { process: recovery } }), endedAt, execution.id);
       this.record(
-        id,
+        execution.id,
         "status",
         "Interrupted: the bridge service stopped while this execution ran.",
       );
-    }
-    this.db
-      .prepare(
-        "UPDATE nested_tasks SET status = 'unknown', termination = 'unconfirmed', ended_at = ? WHERE status = 'running'",
-      )
-      .run(now());
-    this.db
-      .prepare(
-        "UPDATE nested_writers SET status = 'interrupted', reason = 'service_restarted', ended_at = ? WHERE status = 'running'",
-      )
-      .run(now());
+      // Nested agents run inside the Claude Code process, so they ended with it.
+      const exited = recovery === "ended" || recovery === "stopped";
+      this.db
+        .prepare(
+          "UPDATE nested_tasks SET status = ?, termination = ?, ended_at = ? WHERE execution_id = ? AND status = 'running'",
+        )
+        .run(
+          exited ? "stopped" : "unknown",
+          exited ? "process_exit" : "unconfirmed",
+          endedAt,
+          execution.id,
+        );
+      if (execution.status === "running") interrupted.push(execution.id);
+    });
+    writers.forEach((writer, index) => {
+      const recovery = writerProcesses[index]!;
+      this.endNestedWriter(
+        writer.id,
+        "interrupted",
+        "service_restarted",
+        { recovery: { process: recovery } },
+        recovery !== "unknown",
+      );
+    });
+    const requeued = unfinished.length - interrupted.length;
     if (unfinished.length > 0) {
-      this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
+      this.log(`recovered ${interrupted.length} interrupted and ${requeued} queued execution(s)`);
     }
     const pending = this.db.prepare("SELECT id FROM requests WHERE state = 'pending'").all() as {
       id: string;
     }[];
     for (const { id } of pending) this.expire(id);
+    this.schedule();
+    void this.reconcile(interrupted).catch((error: unknown) =>
+      this.log(`reconciling interrupted executions failed: ${errorOrigin(error)}`),
+    );
+  }
+
+  /**
+   * Records what interrupted writing executions left: the commits and changes
+   * in their worktrees and, for publishing tasks, what reached the remote, so
+   * the parent sees them before deciding on a retry. The bridge only reads the
+   * remote; it never pushes or creates a pull request itself.
+   */
+  private async reconcile(executionIds: string[]): Promise<void> {
+    if (executionIds.length === 0) return;
+    const secrets = configSecrets(this.config());
+    for (const id of executionIds) {
+      const { task_id: taskId, detail } = this.db
+        .prepare("SELECT task_id, detail FROM executions WHERE id = ?")
+        .get(id) as { task_id: string; detail: string | null };
+      const workspace = this.workspace(taskId);
+      if (workspace?.state !== "ready") continue;
+      const { request } = this.db.prepare("SELECT request FROM tasks WHERE id = ?").get(taskId) as {
+        request: string;
+      };
+      const changes = await listedChanges(workspace.path, workspace.baseline, secrets);
+      const publication =
+        (JSON.parse(request) as StartRequest).publish === "pull_request"
+          ? await this.checkPublication(workspace, secrets)
+          : undefined;
+      const reconciled = this.update(
+        id,
+        {
+          detail: JSON.stringify({
+            ...(JSON.parse(detail ?? "{}") as object),
+            workspace: { ...workspaceReport(workspace), ...changes },
+            ...(publication ? { publication } : {}),
+          }),
+        },
+        "interrupted",
+      );
+      if (reconciled) {
+        this.record(
+          id,
+          "status",
+          `Reconciled after the restart: see detail.workspace${publication ? " and detail.publication" : ""}.`,
+        );
+      }
+    }
   }
 
   async start(caller: string, params: unknown) {
@@ -923,6 +1057,7 @@ export class TaskService {
     );
     this.schedule();
     const current = this.executionById(task.id, executionId);
+    const interrupted = active ? undefined : this.interruptedBefore(current);
     return {
       taskId: task.id,
       executionId,
@@ -931,6 +1066,15 @@ export class TaskService {
       // Follow-ups never steer a running turn: they wait for it and then continue the session.
       delivery: active || current.reason === "waiting_for_slot" ? "queued" : "starting",
       ...(active ? { queuedBehind: active.id } : {}),
+      ...(interrupted && task.session_id
+        ? {
+            resumes: {
+              interruptedExecution: interrupted.id,
+              sessionId: task.session_id,
+              note: "The follow-up resumes the Claude session with what Claude Code recorded of the interrupted execution; that execution is not replayed. Claude is told it was interrupted and to check the current state before continuing.",
+            },
+          }
+        : {}),
     };
   }
 
@@ -1537,6 +1681,16 @@ export class TaskService {
     };
   }
 
+  /** The task's last execution before this one that started, if the service stopped while it ran. */
+  private interruptedBefore(execution: ExecutionRow): ExecutionRow | undefined {
+    const previous = this.db
+      .prepare(
+        "SELECT * FROM executions WHERE task_id = ? AND ordinal < ? AND started_at IS NOT NULL ORDER BY ordinal DESC LIMIT 1",
+      )
+      .get(execution.task_id, execution.ordinal) as ExecutionRow | undefined;
+    return previous?.status === "interrupted" ? previous : undefined;
+  }
+
   private executionById(taskId: string, executionId: string): ExecutionRow {
     const execution = this.db
       .prepare("SELECT * FROM executions WHERE task_id = ? AND id = ?")
@@ -1844,6 +1998,11 @@ export class TaskService {
     const event = (text: string) =>
       this.record(writer.execution_id, "nested", `${writer.id}${text}`);
     const observer: ExecutionObserver = {
+      launched: (identity) => {
+        this.db
+          .prepare("UPDATE nested_writers SET process = ? WHERE id = ?")
+          .run(JSON.stringify(identity), writer.id);
+      },
       session: (sessionId) => {
         this.db
           .prepare("UPDATE nested_writers SET session_id = ? WHERE id = ?")
@@ -2170,13 +2329,30 @@ export class TaskService {
           ? await this.checkPublication(workspace, secrets, signal)
           : undefined;
       if (workspace) writers = this.nestedWriters(executionId, request, workspace, signal);
+      const interrupted = followUp ? this.interruptedBefore(execution) : undefined;
+      if (interrupted) {
+        this.record(
+          executionId,
+          "status",
+          `Resuming the Claude session after interrupted execution ${interrupted.id}; Claude is told it was interrupted.`,
+        );
+      }
+      const notice = interrupted
+        ? interruptionNotice(
+            workspace
+              ? await hasUncommittedChanges(workspace.path).catch(() => undefined)
+              : undefined,
+          )
+        : "";
       outcome = await runExecution(
         {
           executable,
           env: claudeEnvironment(config),
           extraArgs: mcpConfigArgs(this.paths, config),
           cwd: workspace?.path ?? root,
-          prompt: followUp ? `<follow-up>\n${execution.input}\n</follow-up>` : prompt(request),
+          prompt: followUp
+            ? `${notice}<follow-up>\n${execution.input}\n</follow-up>`
+            : prompt(request),
           ...(followUp && task.session_id ? { resume: task.session_id } : {}),
           signal,
           guidance: workspace
@@ -2191,6 +2367,11 @@ export class TaskService {
           ...(writers ? { nestedWriters: writers } : {}),
         },
         {
+          launched: (identity) => {
+            this.db
+              .prepare("UPDATE executions SET process = ? WHERE id = ?")
+              .run(JSON.stringify(identity), executionId);
+          },
           session: (sessionId) => {
             this.update(executionId, { session_id: sessionId });
             this.db
@@ -2607,6 +2788,7 @@ function nestedWriterReport(row: NestedWriterRow) {
     result?: object;
     error?: object;
     changes?: object;
+    recovery?: object;
   };
   return {
     writerId: row.id,
@@ -2623,6 +2805,7 @@ function nestedWriterReport(row: NestedWriterRow) {
     },
     ...(outcome.result ? { result: outcome.result } : {}),
     ...(outcome.error ? { error: outcome.error } : {}),
+    ...(outcome.recovery ? { recovery: outcome.recovery } : {}),
     ...(row.process_exited === 0 ? { processExited: false } : {}),
     ...(row.session_id ? { sessionId: row.session_id } : {}),
     startedAt: row.created_at,
