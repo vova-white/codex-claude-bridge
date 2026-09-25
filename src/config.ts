@@ -18,6 +18,7 @@ const configSchema = z.strictObject({
   claudeExecutable: z.string().min(1).optional(),
   claudeConfigDir: z.string().min(1).optional(),
   mcpServers: z.record(z.string(), mcpServer).default({}),
+  maxConcurrentExecutions: z.number().int().positive().default(2),
 });
 
 /** User-editable settings stored as config.json in the state directory. */

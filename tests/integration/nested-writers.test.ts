@@ -232,6 +232,37 @@ describe("nested writers", () => {
     );
   });
 
+  it("take no execution slot, so an executor holding the only slot still runs its writers", async () => {
+    const { fixture, project, client, wait } = await setUp(
+      {
+        turns: [
+          {
+            match: "Alpha writer",
+            steps: retitle("Alpha", { signal: "running" }, { waitFor: "go" }),
+          },
+          {
+            match: "Coordinate",
+            steps: [
+              startWriter("alpha", "Alpha writer: retitle the README."),
+              waitWriters("waited"),
+              merge("alpha"),
+              finished("Merged the alpha writer."),
+            ],
+          },
+        ],
+      },
+      { config: { maxConcurrentExecutions: 1 } },
+    );
+    await waitFor(() => fixture.signalled("running"));
+    expect((await client.call("list_tasks", { project })).data.slots).toEqual({
+      limit: 1,
+      running: 1,
+      queued: 0,
+    });
+    fixture.release("go");
+    expect(await wait()).toMatchObject({ status: "completed" });
+  });
+
   it("let the executor assemble a nested writer that ended before the executor's turn without collecting it", async () => {
     const { fixture, project, client, taskId, status, wait } = await setUp({
       turns: [
