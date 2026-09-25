@@ -92,7 +92,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Read a delegated task's result",
       description:
-        "The durable result of a task's original execution, or of executionId: summary, evidence, failures, remainingWork, and the workspace used. result is null until the execution completes. At most maxChars characters of result text are returned; when parts are cut or omitted, truncated lists them and gives readOutputAfter, the read_output cursor from which every part can be read in full. Reading does not consume the result.",
+        "The durable result of a task's original execution, or of executionId: summary, evidence, failures, remainingWork, and the workspace used. result is null until the execution completes. At most maxChars characters of result text are returned. When the result is longer, truncated.next gives the part and offset where it was cut; calling task_result again with them returns the following parts (summary, then each evidence, failure, and remaining-work item, marked complete: false when cut) until no truncated.next remains. Reading does not consume the result.",
       inputSchema: resultSchema.shape,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },

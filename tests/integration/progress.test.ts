@@ -175,40 +175,33 @@ describe("waiting and progress", () => {
     expect(JSON.stringify(events)).not.toContain("SECRET");
   });
 
-  it("bounds the result and serves every part through cursor-based reads", async () => {
-    const evidence = Array.from({ length: 30 }, (_, index) => `${index}:${"e".repeat(500)}`);
+  it("bounds the result and serves all of it from the stored result, whatever its size", async () => {
+    const summary = `${"s".repeat(17_000)}-END`;
+    const evidence = Array.from({ length: 2_200 }, (_, index) => `evidence ${index}`);
     const fixture = bridge();
     const { client, project, taskId } = await startTask(fixture, [
       {
-        result: {
-          structured: { summary: "Big.", evidence, failures: ["one failure"], remainingWork: [] },
-        },
+        result: { structured: { summary, evidence, failures: ["one failure"], remainingWork: [] } },
       },
     ]);
     await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
 
-    const bounded = (await client.call("task_result", { project, taskId, maxChars: 1_200 })).data;
-    expect(bounded.result.summary).toBe("Big.");
-    expect(bounded.result.evidence.join("").length).toBeLessThanOrEqual(1_200);
-    expect(bounded.truncated).toMatchObject({
-      omittedItems: { evidence: expect.any(Number), failures: 1 },
-    });
-    expect(bounded.truncated.cutFields.length).toBeGreaterThan(0);
+    const first = (await client.call("task_result", { project, taskId, maxChars: 1_200 })).data;
+    expect(first.result.summary).toBe(summary.slice(0, 1_200));
+    expect(first.result.evidence).toEqual([]);
+    expect(first.truncated.next).toEqual({ part: 0, offset: 1_200 });
 
-    const parts = await readAll(
-      client,
-      { project, taskId, maxChars: 16_000 },
-      50,
-      bounded.truncated.readOutputAfter,
-    );
-    expect(parts.map((event) => event.kind)).toEqual([
-      "result",
-      ...evidence.map(() => "evidence"),
-      "failure",
-    ]);
-    expect(parts.filter((event) => event.kind === "evidence").map((event) => event.text)).toEqual(
-      evidence,
-    );
+    const texts = new Map<number, string>([[0, first.result.summary]]);
+    let next = first.truncated.next;
+    while (next) {
+      const page = (
+        await client.call("task_result", { project, taskId, maxChars: 16_000, ...next })
+      ).data;
+      for (const part of page.parts) texts.set(part.part, (texts.get(part.part) ?? "") + part.text);
+      next = page.truncated?.next;
+    }
+    expect(texts.get(0)).toBe(summary);
+    expect([...texts.values()].slice(1)).toEqual([...evidence, "one failure"]);
   });
 
   it("keeps the task running when the client disconnects during a wait", async () => {

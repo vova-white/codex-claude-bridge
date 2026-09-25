@@ -107,6 +107,18 @@ export const resultSchema = z.object({
     .max(maxStoredEventChars)
     .default(12_000)
     .describe("Most characters of result text to return."),
+  part: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Continue from this result part (from truncated.next); returns parts."),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Character offset within that part (from truncated.next)."),
 });
 const projectLookup = z.object({ project: z.string().min(1) });
 
@@ -351,71 +363,57 @@ export class TaskService {
   }
 
   /**
-   * The durable result of an execution, bounded by maxChars. Parts that do not
-   * fit are cut or omitted and listed in `truncated`, with the read_output cursor
-   * where every part of the result can be read in full.
+   * The durable result of an execution, bounded by maxChars and read from the
+   * stored result itself. Without a cursor it returns the result's usual shape,
+   * cut where the budget ends; `truncated.next` then continues from the first
+   * character not shown, returning `parts` until nothing is left.
    */
   async result(caller: string, params: unknown) {
-    const { project, taskId, executionId, maxChars } = parse(resultSchema, params);
+    const { project, taskId, executionId, maxChars, part, offset } = parse(resultSchema, params);
     const task = await this.task(caller, project, taskId);
     const execution = executionId
       ? this.executionById(task.id, executionId)
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
     if (!execution.result) return { ...state, result: null };
-    const { summary, evidence, failures, remainingWork, ...rest } = JSON.parse(
-      execution.result,
-    ) as { summary: string; evidence: string[]; failures: string[]; remainingWork: string[] };
-    let budget = maxChars;
-    const cutFields: string[] = [];
-    const take = (text: string, field: string) => {
-      if (text.length <= budget) {
-        budget -= text.length;
-        return text;
-      }
-      cutFields.push(field);
-      const shown = text.slice(0, budget);
-      budget = 0;
-      return shown;
+    const stored = JSON.parse(execution.result) as Record<string, unknown> & {
+      summary: string;
+      evidence: string[];
+      failures: string[];
+      remainingWork: string[];
     };
-    const omitted: Record<string, number> = {};
-    const list = (items: string[], field: string) => {
-      const kept: string[] = [];
-      for (const [index, item] of items.entries()) {
-        if (budget === 0) {
-          omitted[field] = items.length - index;
-          break;
+    const parts = resultParts(stored);
+    const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
+    const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
+    const truncation = next
+      ? {
+          truncated: {
+            next,
+            totalParts: parts.length,
+            note: "Call task_result again with part and offset from next to read the rest.",
+          },
         }
-        kept.push(take(item, `${field}[${index}]`));
-      }
-      return kept;
-    };
-    const bounded = {
-      summary: take(summary, "summary"),
-      evidence: list(evidence, "evidence"),
-      failures: list(failures, "failures"),
-      remainingWork: list(remainingWork, "remainingWork"),
-      ...rest,
-    };
-    if (cutFields.length === 0 && Object.keys(omitted).length === 0) {
-      return { ...state, result: bounded };
+      : {};
+    if (part !== undefined || offset !== undefined) {
+      return { ...state, parts: page.parts, ...truncation };
     }
-    const first = this.db
-      .prepare("SELECT MIN(seq) AS seq FROM events WHERE execution_id = ? AND kind = 'result'")
-      .get(execution.id) as { seq: number | null };
+    const rest = Object.fromEntries(
+      Object.entries(stored).filter(
+        ([key]) => !["summary", "evidence", "failures", "remainingWork"].includes(key),
+      ),
+    );
+    const shown = (field: string) =>
+      page.parts.filter((item) => item.field === field).map((item) => item.text);
     return {
       ...state,
-      result: bounded,
-      truncated: {
-        cutFields,
-        omittedItems: omitted,
-        ...(first.seq === null
-          ? {}
-          : {
-              readOutputAfter: first.seq - 1,
-              note: "read_output from this cursor returns the summary and every evidence, failure, and remaining_work item as separate events.",
-            }),
+      result: {
+        summary: shown("summary")[0] ?? "",
+        evidence: shown("evidence"),
+        failures: shown("failures"),
+        remainingWork: shown("remainingWork"),
+        ...rest,
       },
+      ...truncation,
     };
   }
 
@@ -720,14 +718,58 @@ export class TaskService {
       result: JSON.stringify(result),
       ended_at: endedAt,
     });
-    if (completed) {
-      // Every part of the result is also readable in bounded, cursor-based pieces.
-      this.record(executionId, "result", result.summary);
-      for (const item of result.evidence) this.record(executionId, "evidence", item);
-      for (const item of result.failures) this.record(executionId, "failure", item);
-      for (const item of result.remainingWork) this.record(executionId, "remaining_work", item);
+    if (completed) this.record(executionId, "result", result.summary);
+  }
+}
+
+interface ResultPart {
+  part: number;
+  field: string;
+  index?: number;
+  text: string;
+}
+
+/** The text of a result as an ordered list of parts: the summary, then each list item. */
+function resultParts(result: {
+  summary: string;
+  evidence: string[];
+  failures: string[];
+  remainingWork: string[];
+}): ResultPart[] {
+  const fields = [
+    ["evidence", result.evidence],
+    ["failures", result.failures],
+    ["remainingWork", result.remainingWork],
+  ] as const;
+  const parts: Omit<ResultPart, "part">[] = [
+    { field: "summary", text: result.summary },
+    ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
+  ];
+  return parts.map((item, part) => ({ part, ...item }));
+}
+
+/** Reads parts from a position, returning at most `budget` characters and where to continue. */
+function readParts(parts: ResultPart[], start: number, offset: number, budget: number) {
+  const page: (ResultPart & { offset?: number; complete?: false })[] = [];
+  let remaining = budget;
+  for (let part = start; part < parts.length; part++) {
+    const from = part === start ? offset : 0;
+    const whole = parts[part]!;
+    const text = whole.text.slice(from);
+    if (remaining === 0) return { parts: page, next: { part, offset: from } };
+    const shown = text.slice(0, remaining);
+    page.push({
+      ...whole,
+      text: shown,
+      ...(from > 0 ? { offset: from } : {}),
+      ...(shown.length < text.length ? { complete: false as const } : {}),
+    });
+    remaining -= shown.length;
+    if (shown.length < text.length) {
+      return { parts: page, next: { part, offset: from + shown.length } };
     }
   }
+  return { parts: page };
 }
 
 /** Applies `clean` to every string inside a JSON-like value. */
