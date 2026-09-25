@@ -1,7 +1,7 @@
 {
   "name": "claude-bridge",
   "version": "0.1.0",
-  "description": "Delegate read-only research and review tasks from Codex to Claude Code through a local background service that uses your Claude subscription.",
+  "description": "Delegate research, review, and code changes from Codex to Claude Code through a local background service that uses your Claude subscription: read-only tasks on your checkout, writing tasks in isolated Git worktrees that can publish a pull request, and nested writers in worktrees of their own.",
   "author": {
     "name": "vova-white"
   },
@@ -10,9 +10,9 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Claude Bridge",
-    "shortDescription": "Delegate read-only tasks to Claude Code",
+    "shortDescription": "Delegate reviews and code changes, up to a pull request, to Claude Code",
     "developerName": "vova-white",
     "category": "Coding",
-    "capabilities": ["Read"]
+    "capabilities": ["Read", "Write"]
   }
 }
