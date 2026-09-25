@@ -76,4 +76,9 @@ describe("service log error origin", () => {
     );
     expect(errorOrigin(error)).toBe("Error (ECONNRESET)");
   });
+
+  it("ignores error names and codes Node does not define", () => {
+    const error = Object.assign(new Error("x"), { name: "SDKSECRET", code: "TOKENVALUE" });
+    expect(errorOrigin(error)).toBe("Error");
+  });
 });

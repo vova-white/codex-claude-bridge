@@ -1,5 +1,6 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { realpathSync, writeFileSync } from "node:fs";
+import { constants } from "node:os";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -55,11 +56,12 @@ export interface ReadinessReport {
     apiProvider?: string;
     apiKeySource?: string;
   };
-  models: Pick<ModelInfo, "value" | "displayName" | "description" | "supportedEffortLevels">[];
+  models: Pick<ModelInfo, "value" | "supportedEffortLevels">[];
   git: { version?: string; supported: boolean; project?: { path: string; root?: string } };
   integrations: {
     configured: { name: string; status: string }[];
-    fromClaudeSettings: { name: string; status: string; scope?: string }[];
+    /** Number of MCP servers from Claude Code's own settings, by status. */
+    fromClaudeSettings: Record<string, number>;
     codexTools: { inherited: false; note: string };
   };
   problems: Problem[];
@@ -97,7 +99,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     git,
     integrations: {
       configured: [],
-      fromClaudeSettings: [],
+      fromClaudeSettings: {},
       codexTools: {
         inherited: false,
         note: `Codex built-in tools, connectors, credentials, and approval policies are not available to Claude. Configure compatible MCP servers for Claude explicitly under "mcpServers" in ${paths.config}.`,
@@ -137,6 +139,8 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   }
 
   const abort = new AbortController();
+  const exit: ProcessExit = {};
+  let exited = Promise.resolve();
   const session = query({
     prompt: withoutPrompt(abort.signal),
     options: {
@@ -145,20 +149,40 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       env: claudeEnvironment(config),
       extraArgs: mcpConfigArgs(paths, config),
       abortController: abort,
-      // Claude Code's own error output never reaches readiness results or the log.
-      stderr: () => {},
+      // The bridge spawns Claude Code itself so a failed start is described by the
+      // process's exit, not by text; its stderr is never read.
+      spawnClaudeCodeProcess: (options) => {
+        const child = spawn(options.command, options.args, {
+          cwd: options.cwd,
+          env: options.env as NodeJS.ProcessEnv,
+          stdio: ["pipe", "pipe", "ignore"],
+          signal: options.signal,
+        });
+        exited = new Promise((resolve) => {
+          child.once("exit", (code, signal) => resolve(void Object.assign(exit, { code, signal })));
+          child.once("error", (error: NodeJS.ErrnoException) =>
+            resolve(void Object.assign(exit, { spawnError: error.code })),
+          );
+        });
+        return child;
+      },
     },
   });
   try {
     const init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
-    report.models = init.models.map(
-      ({ value, displayName, description, supportedEffortLevels }) => ({
+    // Model identifiers and effort levels only: descriptions are Claude Code's text.
+    report.models = init.models
+      .filter(({ value }) => modelIdentifier.test(value))
+      .map(({ value, supportedEffortLevels }) => ({
         value,
-        displayName,
-        description,
-        ...(supportedEffortLevels ? { supportedEffortLevels } : {}),
-      }),
-    );
+        ...(supportedEffortLevels
+          ? {
+              supportedEffortLevels: supportedEffortLevels.filter((level) =>
+                effortLevels.has(level),
+              ),
+            }
+          : {}),
+      }));
     report.credentials = classifyCredentials(init.account);
     const action = credentialAction(report.credentials);
     if (action) {
@@ -171,18 +195,22 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     const statuses = await settledIntegrations(() => session.mcpServerStatus(), config);
     // Only configured names and known statuses are reported: error text from an
     // MCP server can quote its credentials in forms no filter recognizes.
-    for (const status of statuses) {
-      const state = knownServerStatuses.has(status.status) ? status.status : "unknown";
-      if (Object.hasOwn(config.mcpServers, status.name)) {
-        report.integrations.configured.push({ name: status.name, status: state });
-      } else {
-        report.integrations.fromClaudeSettings.push({
-          name: status.name,
-          status: state,
-          ...(status.scope && knownScopes.has(status.scope) ? { scope: status.scope } : {}),
-        });
-      }
+    // Servers from Claude's own settings are counted by status: their names are
+    // Claude Code's text, not keys of the bridge configuration.
+    const fromSettings: Record<string, number> = {};
+    for (const name of Object.keys(config.mcpServers)) {
+      const status = statuses.find((candidate) => candidate.name === name);
+      report.integrations.configured.push({
+        name,
+        status: status && knownServerStatuses.has(status.status) ? status.status : "unknown",
+      });
     }
+    for (const status of statuses) {
+      if (Object.hasOwn(config.mcpServers, status.name)) continue;
+      const state = knownServerStatuses.has(status.status) ? status.status : "unknown";
+      fromSettings[state] = (fromSettings[state] ?? 0) + 1;
+    }
+    report.integrations.fromClaudeSettings = fromSettings;
     for (const server of report.integrations.configured) {
       if (server.status !== "connected") {
         problem(
@@ -194,7 +222,9 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       }
     }
   } catch (error) {
-    const stage = startFailure(error);
+    // The SDK can report the failure before the process's exit event arrives.
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    const stage = startFailure(error, exit);
     problem(
       "claude_start",
       `Claude Code could not start a session (${stage}).`,
@@ -268,16 +298,26 @@ const apiProviders = new Set([
   "gateway",
 ]);
 
+const subscriptionTypes = new Set([
+  "Claude Pro",
+  "Claude Max",
+  "Claude Team",
+  "Claude Enterprise",
+  "pro",
+  "max",
+  "team",
+  "enterprise",
+]);
+
 /** Keeps an account field only when it has one of the values the bridge knows. */
-function known(value: string | undefined, allowed: Set<string> | RegExp): string | undefined {
+function known(value: string | undefined, allowed: Set<string>): string | undefined {
   if (value === undefined) return undefined;
-  const ok = allowed instanceof Set ? allowed.has(value) : allowed.test(value);
-  return ok ? value : "other";
+  return allowed.has(value) ? value : "other";
 }
 
 export function classifyCredentials(account: AccountInfo): ReadinessReport["credentials"] {
   // Account fields come from Claude Code, so only known values are reported.
-  const subscriptionType = known(account.subscriptionType, /^Claude [A-Za-z]{2,20}$/);
+  const subscriptionType = known(account.subscriptionType, subscriptionTypes);
   const apiProvider = known(account.apiProvider, apiProviders);
   const apiKeySource = known(account.apiKeySource, apiKeySources);
   const details = {
@@ -330,15 +370,10 @@ async function settledIntegrations(
 }
 
 const knownServerStatuses = new Set(["connected", "failed", "needs-auth", "pending", "disabled"]);
-const knownScopes = new Set([
-  "user",
-  "project",
-  "local",
-  "dynamic",
-  "claudeai",
-  "enterprise",
-  "managed",
-]);
+const knownSignals = new Set(Object.keys(constants.signals));
+const effortLevels = new Set(["low", "medium", "high", "xhigh", "max"]);
+/** Model values Claude Code accepts as identifiers, such as `sonnet` or `claude-opus-5[1m]`. */
+const modelIdentifier = /^[a-z][a-z0-9.-]{0,62}(\[[0-9a-z]{1,8}\])?$/;
 
 class TimeoutError extends Error {}
 
@@ -354,15 +389,21 @@ function processFailure(error: unknown, timeoutSeconds: number): string {
   return "it could not be run";
 }
 
-/** The start-up stage that failed; the SDK's message is matched, never copied. */
-function startFailure(error: unknown): string {
+interface ProcessExit {
+  code?: number | null;
+  signal?: NodeJS.Signals | null;
+  spawnError?: string | undefined;
+}
+
+/** The start-up stage that failed, from the timeout or the process's own exit. */
+function startFailure(error: unknown, exit: ProcessExit): string {
   if (error instanceof TimeoutError) return `no response within ${initializeTimeoutMs / 1000} s`;
-  const exit = /exited with code (\d+)/.exec((error as Error).message ?? "");
-  if (exit) return `Claude Code exited with code ${exit[1]}`;
-  if (/signal/i.test((error as Error).message ?? ""))
-    return "Claude Code was terminated by a signal";
-  const code = (error as NodeJS.ErrnoException).code;
-  if (code === "ENOENT" || code === "EACCES") return processFailure(error, 0);
+  if (exit.spawnError === "ENOENT") return "the executable was not found";
+  if (exit.spawnError === "EACCES") return "the executable is not permitted to run";
+  if (typeof exit.code === "number") return `Claude Code exited with code ${exit.code}`;
+  if (exit.signal && knownSignals.has(exit.signal)) {
+    return `Claude Code was terminated by ${exit.signal}`;
+  }
   return "Claude Code ended before answering";
 }
 

@@ -100,7 +100,15 @@ describe("readiness", () => {
     const report = await readiness(
       bridge({
         scenario: {
-          account: { apiKeySource: "helper red+blue", apiProvider: "vendor SECRET-X" },
+          account: {
+            apiKeySource: "helper red+blue",
+            apiProvider: "vendor SECRET-X",
+            subscriptionType: "Claude SECRETPLAN",
+          },
+          models: [
+            { value: "sonnet", displayName: "Sonnet DISPLAY-SECRET", description: "DESC-SECRET" },
+            { value: "bad value MODEL-SECRET", displayName: "x", description: "y" },
+          ],
         },
       }),
     );
@@ -109,8 +117,10 @@ describe("readiness", () => {
       source: "third-party-provider",
       apiProvider: "other",
       apiKeySource: "other",
+      subscriptionType: "other",
     });
-    expect(JSON.stringify(report)).not.toMatch(/red\+blue|SECRET-X/);
+    expect(report.models).toEqual([{ value: "sonnet" }]);
+    expect(JSON.stringify(report)).not.toMatch(/red\+blue|SECRET/);
   });
 
   it("reports Claude Code versions older than the SDK supports", async () => {
@@ -209,7 +219,9 @@ describe("readiness", () => {
               "MCP-ERROR-MARKER 401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=RED%20BLUE&key=a%2Fkey%2Fvalue; token red+blue, key a/key/value",
           },
         },
-        settingsMcpServers: [{ name: "docs", status: "connected", scope: "user" }],
+        settingsMcpServers: [
+          { name: "docs SETTINGS-NAME-SECRET", status: "connected", scope: "user" },
+        ],
       },
     });
     const report = await readiness(fixture);
@@ -218,9 +230,7 @@ describe("readiness", () => {
       { name: "github", status: "connected" },
       { name: "tracker", status: "failed" },
     ]);
-    expect(report.integrations.fromClaudeSettings).toEqual([
-      { name: "docs", status: "connected", scope: "user" },
-    ]);
+    expect(report.integrations.fromClaudeSettings).toEqual({ connected: 1 });
     expect(report.integrations.codexTools).toMatchObject({ inherited: false });
     const problem = report.problems.find(
       (item: { code: string }) => item.code === "integration_unavailable",
@@ -228,6 +238,7 @@ describe("readiness", () => {
     expect(problem).toMatchObject({ blocking: false, message: 'MCP server "tracker" is failed.' });
     expect(problem.action).toContain("/mcp");
     for (const text of [
+      "SETTINGS-NAME-SECRET",
       "MCP-ERROR-MARKER",
       "ghp_TOPSECRETVALUE",
       "hdr-secret-123",
