@@ -592,8 +592,10 @@ export class TaskService {
       }
       const recovery = processes[index]!;
       // What a writing execution left is recorded later; `reconciled` shows whether that is done.
-      // An uncertain queued one may have started before an OS crash lost that, so it counts too.
-      const reconciles = this.workspace(execution.task_id)?.state === "ready";
+      // An uncertain queued one may have started before an OS crash lost that, so it counts too,
+      // as does a pending worktree, whose creation the crash may have lost.
+      const state = this.workspace(execution.task_id)?.state;
+      const reconciles = state === "ready" || state === "pending";
       this.db
         .prepare(
           `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = ?, ended_at = ?
@@ -671,6 +673,8 @@ export class TaskService {
    * remote; it never pushes or creates a pull request itself. An execution whose
    * worktree Git cannot read is reconciled with `recovery.worktree: "unreadable"`
    * instead, so the parent inspects the worktree itself rather than waiting.
+   * A worktree recorded as pending is reconciled once Git shows it was created;
+   * otherwise the execution is reconciled with `recovery.worktree: "missing"`.
    */
   private async reconcile(executionIds: string[]): Promise<void> {
     if (executionIds.length === 0) return;
@@ -681,15 +685,36 @@ export class TaskService {
         .get(id) as { task_id: string; detail: string | null };
       const recorded = JSON.parse(detail ?? "{}") as { recovery?: object };
       const done = { ...recorded, recovery: { ...recorded.recovery, reconciled: true } };
-      const workspace = this.workspace(taskId);
+      const { request, project } = this.db
+        .prepare("SELECT request, project FROM tasks WHERE id = ?")
+        .get(taskId) as { request: string; project: string };
+      let workspace = this.workspace(taskId);
+      if (workspace?.state === "pending") {
+        const { path, branch } = workspace;
+        if (await this.registeredWorktree(project, path).catch(() => undefined)) {
+          this.db
+            .prepare(
+              "UPDATE workspaces SET state = 'ready' WHERE task_id = ? AND state = 'pending'",
+            )
+            .run(taskId);
+          workspace = this.workspace(taskId);
+        } else {
+          const branchKept = (await resolveCommit(project, `refs/heads/${branch}`)) !== undefined;
+          const missing = { ...done, recovery: { ...done.recovery, worktree: "missing" } };
+          this.update(id, { detail: JSON.stringify(missing) }, "interrupted");
+          this.record(
+            id,
+            "status",
+            `Git lists no worktree at ${path} after the restart, so no changes were recorded${branchKept ? `; its branch ${branch} remains: inspect it with git log` : ""}.`,
+          );
+          continue;
+        }
+      }
       // cleanup_task removed the worktree meanwhile, so nothing is left to reconcile.
       if (workspace?.state !== "ready") {
         this.update(id, { detail: JSON.stringify(done) }, "interrupted");
         continue;
       }
-      const { request } = this.db.prepare("SELECT request FROM tasks WHERE id = ?").get(taskId) as {
-        request: string;
-      };
       const changes = await listedChanges(workspace.path, workspace.baseline);
       if (!changes) {
         this.log(`reconciling ${id}: Git could not read its worktree`);
