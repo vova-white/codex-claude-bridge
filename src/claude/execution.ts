@@ -9,6 +9,8 @@ import { redact } from "../redact.ts";
 import { classifyCredentials, credentialAction, withTimeout } from "./readiness.ts";
 
 const initializeTimeoutMs = 60_000;
+/** How long cancellation waits for Claude Code to report stopped nested agents before ending its process. */
+const nestedStopGraceMs = 5_000;
 
 /** Why an execution failed, in terms the parent agent can act on. */
 export type FailureReason =
@@ -36,14 +38,48 @@ export interface ExecutionRequest {
   secrets: readonly string[];
 }
 
+/** A nested agent Claude Code reported starting through its Agent tool. */
+export interface NestedStart {
+  taskId: string;
+  /** The Agent tool call that started it. */
+  toolUseId?: string;
+  /** The Agent tool call of the nested agent it runs inside; absent when the executor started it. */
+  parentToolUseId?: string;
+  description: string;
+  agentType?: string;
+  background: boolean;
+  depth?: number;
+}
+
+/**
+ * How a nested agent ended. `reported`: Claude Code reported it. `process_exit`:
+ * it was still running when Claude Code's process exited, which ends every agent
+ * inside that process. `unconfirmed`: the process did not exit either.
+ */
+export interface NestedEnd {
+  status: "completed" | "failed" | "stopped" | "unknown";
+  summary?: string;
+  termination: "reported" | "process_exit" | "unconfirmed";
+}
+
 export interface ExecutionObserver {
   session(id: string): void;
   /** Called with the reset time while Claude Code waits for subscription capacity, and with undefined once it proceeds. */
   capacity(waiting: { resetsAt?: number } | undefined): void;
   /** Text Claude writes while it works. */
   message(text: string): void;
-  /** A tool Claude calls, with its input as Claude sent it. */
-  toolCall(name: string, input: unknown): void;
+  /** A tool Claude calls, with its input as Claude sent it, and the nested agent that called it, if any. */
+  toolCall(name: string, input: unknown, nestedTaskId?: string): void;
+  nestedStarted(task: NestedStart): void;
+  /** A nested agent's progress summary, when Claude Code gives one. */
+  nestedProgress(taskId: string, summary: string): void;
+  nestedEnded(taskId: string, end: NestedEnd): void;
+  /**
+   * Called with the number of running nested agents while the executor's turn
+   * has finished before them, and with 0 once they have all ended. The
+   * execution then continues until the executor's next result.
+   */
+  waitingForChildren(count: number): void;
 }
 
 type TurnOutcome =
@@ -131,6 +167,13 @@ function within(event: Promise<void>, ms: number): Promise<boolean> {
  * Runs one prompt through Claude Code. The session's credential source and the
  * requested model are checked before the prompt is sent, so a rejected
  * execution never reaches a model.
+ *
+ * The outcome is the executor's first successful result while none of the
+ * nested agents Claude Code reported is running. A result that arrives while
+ * some still run only moves the execution to waiting: Claude Code runs another
+ * turn for each nested agent that finishes, and that later result carries the
+ * incorporated work. Cancellation asks Claude Code to stop running nested
+ * agents before it ends the process.
  */
 export async function runExecution(
   request: ExecutionRequest,
@@ -149,7 +192,40 @@ export async function runExecution(
     child.kill("SIGKILL");
     return within(exited, 5_000);
   };
-  const cancel = () => abort.abort();
+  /** Running nested agents by task ID, with the Agent tool calls that started them. */
+  const nested = new Map<string, string | undefined>();
+  const nestedChanged = new Set<() => void>();
+  /** The nested agent whose Agent tool call each tool call belongs to. */
+  const toolUseParents = new Map<string, string>();
+  let waiting = false;
+  const endNested = (taskId: string, end: NestedEnd) => {
+    if (!nested.delete(taskId)) return;
+    observer.nestedEnded(taskId, end);
+    for (const listener of nestedChanged) listener();
+    if (waiting) {
+      observer.waitingForChildren(nested.size);
+      waiting = nested.size > 0;
+    }
+  };
+  const allEnded = (taskIds: string[]) =>
+    new Promise<void>((resolve) => {
+      const check = () => {
+        if (taskIds.some((taskId) => nested.has(taskId))) return;
+        nestedChanged.delete(check);
+        resolve();
+      };
+      nestedChanged.add(check);
+      check();
+    });
+  // Nested agents are asked to stop first, so their ends are reported rather than inferred.
+  const cancel = () => {
+    const taskIds = [...nested.keys()];
+    if (taskIds.length === 0) return abort.abort();
+    const stopped = Promise.all(
+      taskIds.map((taskId) => session.stopTask(taskId).catch(() => undefined)),
+    ).then(() => allEnded(taskIds));
+    void within(stopped, nestedStopGraceMs).then(() => abort.abort());
+  };
   request.signal.addEventListener("abort", cancel, { once: true });
   let child: ChildProcess | undefined;
   let exited: Promise<void> = Promise.resolve();
@@ -261,17 +337,51 @@ export async function runExecution(
           } else {
             observer.capacity(undefined);
           }
+        } else if (message.type === "system" && message.subtype === "task_started") {
+          if (message.task_type !== "local_agent" || message.ambient) continue;
+          nested.set(message.task_id, message.tool_use_id);
+          const parent = message.tool_use_id && toolUseParents.get(message.tool_use_id);
+          observer.nestedStarted({
+            taskId: message.task_id,
+            ...(message.tool_use_id ? { toolUseId: message.tool_use_id } : {}),
+            ...(parent ? { parentToolUseId: parent } : {}),
+            description: message.description,
+            ...(message.subagent_type ? { agentType: message.subagent_type } : {}),
+            background: message.is_backgrounded === true,
+            ...(message.spawn_depth === undefined ? {} : { depth: message.spawn_depth }),
+          });
+        } else if (message.type === "system" && message.subtype === "task_progress") {
+          if (nested.has(message.task_id) && message.summary) {
+            observer.nestedProgress(message.task_id, message.summary);
+          }
+        } else if (message.type === "system" && message.subtype === "task_notification") {
+          endNested(message.task_id, {
+            status: message.status,
+            ...(message.summary ? { summary: message.summary } : {}),
+            termination: "reported",
+          });
         } else if (message.type === "assistant") {
           if (message.error) lastError = message.error;
+          const caller = message.parent_tool_use_id ?? undefined;
+          const callerTask = caller
+            ? [...nested].find(([, toolUseId]) => toolUseId === caller)?.[0]
+            : undefined;
           for (const block of message.message.content) {
             if (block.type === "text" && block.text.trim()) {
               observer.message(block.text);
             } else if (block.type === "tool_use") {
-              observer.toolCall(block.name, block.input);
+              if (caller) toolUseParents.set(block.id, caller);
+              observer.toolCall(block.name, block.input, callerTask);
             }
           }
         } else if (message.type === "result") {
+          if (request.signal.aborted) return { status: "cancelled" };
           if (message.subtype === "success" && !message.is_error) {
+            if (nested.size > 0) {
+              waiting = true;
+              observer.waitingForChildren(nested.size);
+              continue;
+            }
             return {
               status: "completed",
               text: message.result,
@@ -294,6 +404,12 @@ export async function runExecution(
         }
       }
       if (request.signal.aborted) return { status: "cancelled" };
+      if (waiting) {
+        return failed(
+          "provider_error",
+          "Claude Code exited while nested agents were still running; the assignment is incomplete.",
+        );
+      }
       return failed(
         "provider_error",
         `Claude Code exited without a result. ${diagnostics()}`.trim(),
@@ -311,5 +427,14 @@ export async function runExecution(
   const outcome = await turn();
   const processExited = await shutdown();
   abort.abort();
+  waiting = false;
+  for (const taskId of nested.keys()) {
+    endNested(
+      taskId,
+      processExited
+        ? { status: "stopped", termination: "process_exit" }
+        : { status: "unknown", termination: "unconfirmed" },
+    );
+  }
   return { ...outcome, processExited };
 }
