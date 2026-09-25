@@ -170,6 +170,116 @@ describe("writing tasks", () => {
     expect(parts.get("changedFiles:0:")).toBe("notes.txt");
   });
 
+  it("list the changes of failed and cancelled executions in bounded pages", async () => {
+    const files = Array.from({ length: 80 }, (_, index) => `${"f".repeat(100)}-${index}.txt`);
+    // Subjects near the 1,000-character limit, so listing even a few would exceed small pages.
+    const padding = "s".repeat(980);
+    const subjects = Array.from({ length: 8 }, (_, index) => `feat: change ${index} ${padding}`);
+    const changes: Step = {
+      exec: [
+        "sh",
+        "-c",
+        `for f in ${files.join(" ")}; do echo x > "$f"; done
+         for i in 0 1 2 3 4 5 6 7; do
+           git -c user.name=Child -c user.email=child@example.invalid commit -q --allow-empty -m "feat: change $i ${padding}"
+         done`,
+      ],
+    };
+    const { fixture, project, client } = await setUp({
+      turns: [
+        { match: "Fail", steps: [changes, { exit: { code: 1 } }] },
+        { match: "Stop", steps: [changes, { signal: "changed" }, { waitFor: "never" }] },
+      ],
+    });
+
+    /** Checks that status stays bounded and task_result pages every commit and file. */
+    const expectPaged = async (taskId: string, shown: string) => {
+      expect(shown.length).toBeLessThan(3_000);
+      const status = await client.call("task_status", { project, taskId });
+      expect(status.text.length).toBeLessThan(3_000);
+      expect(status.data.detail.workspace).toMatchObject({ commitCount: 8, changedFileCount: 80 });
+
+      const first = await client.call("task_result", { project, taskId, maxChars: 200 });
+      expect(first.text.length).toBeLessThan(2_500);
+      expect(first.data.result).toBeNull();
+      const commits: string[] = first.data.workspace.commits.map(
+        (item: { subject: string }) => item.subject,
+      );
+      const changed: string[] = [...first.data.workspace.changedFiles];
+      let next = first.data.truncated.next;
+      while (next) {
+        const page = (await client.call("task_result", { project, taskId, maxChars: 200, ...next }))
+          .data;
+        expect(JSON.stringify(page).length).toBeLessThan(2_500);
+        for (const part of page.parts) {
+          const list = part.field === "commits" ? commits : changed;
+          if (part.offset) list[list.length - 1] += part.text;
+          else list.push(part.text);
+        }
+        next = page.truncated?.next;
+      }
+      expect(commits.toSorted()).toEqual(subjects);
+      expect(changed).toEqual(files.toSorted());
+    };
+
+    const failed = await run(
+      client,
+      writeTask(project, { requestKey: "fail", assignment: "Fail midway." }),
+    );
+    expect(failed.status.status).toBe("failed");
+    await expectPaged(failed.taskId, JSON.stringify(failed.status));
+
+    const started = await client.call(
+      "start_task",
+      writeTask(project, { requestKey: "stop", assignment: "Stop midway." }),
+    );
+    await waitFor(() => fixture.signalled("changed") || undefined);
+    const cancelled = await client.call("cancel_task", { project, taskId: started.data.taskId });
+    expect(cancelled.data.executions[0].status).toBe("cancelled");
+    await expectPaged(started.data.taskId, cancelled.text);
+  });
+
+  it("count commit SHAs against the page size of a failed execution's changes", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            {
+              exec: [
+                "sh",
+                "-c",
+                `for i in $(seq 1 120); do
+                   git -c user.name=Child -c user.email=child@example.invalid commit -q --allow-empty -m x
+                 done`,
+              ],
+            },
+            { exit: { code: 1 } },
+          ],
+        },
+      ],
+    });
+    const failed = await run(client, writeTask(project));
+    expect(failed.status.status).toBe("failed");
+
+    const shas: string[] = [];
+    let next: object | undefined = {};
+    while (next) {
+      const page = await client.call("task_result", {
+        project,
+        taskId: failed.taskId,
+        maxChars: 200,
+        ...next,
+      });
+      expect(page.text.length).toBeLessThan(2_500);
+      const items: { sha?: string; field?: string }[] =
+        page.data.workspace?.commits ??
+        page.data.parts.filter((part: { field: string }) => part.field === "commits");
+      shas.push(...items.map((item) => item.sha!));
+      next = page.data.truncated?.next;
+    }
+    expect(new Set(shas).size).toBe(120);
+  });
+
   it("refuse writing options on read-only tasks", async () => {
     const { project, client } = await setUp({ turns: [{ steps: [finished("Done.")] }] });
     const refused = await client.call("start_task", {
@@ -370,7 +480,9 @@ describe("writing tasks", () => {
     );
     expect(failed.status.status).toBe("failed");
     // File names and commit subjects are Claude's text: only their counts reach `error`.
-    expect(failed.status.detail.workspace).toMatchObject({ changedFiles: ["partial.txt"] });
+    expect(failed.status.detail.workspace).toMatchObject({ changedFileCount: 1 });
+    const failedResult = await client.call("task_result", { project, taskId: failed.taskId });
+    expect(failedResult.data.workspace.changedFiles).toEqual(["partial.txt"]);
     expect(failed.status.error.message).toContain("0 commits and 1 changed file");
     expect(JSON.stringify(failed.status.error)).not.toContain("partial");
     expect(existsSync(join(failed.status.detail.workspace.path, "partial.txt"))).toBe(true);
@@ -386,7 +498,9 @@ describe("writing tasks", () => {
     const cancelled = (await client.call("cancel_task", { project, taskId })).data;
     const [execution] = cancelled.executions;
     expect(execution).toMatchObject({ status: "cancelled", detail: { processExited: true } });
-    expect(execution.detail.workspace.changedFiles).toEqual(["stopped.txt"]);
+    expect(execution.detail.workspace).toMatchObject({ changedFileCount: 1 });
+    const cancelledResult = await client.call("task_result", { project, taskId });
+    expect(cancelledResult.data.workspace.changedFiles).toEqual(["stopped.txt"]);
     expect(existsSync(join(execution.detail.workspace.path, "stopped.txt"))).toBe(true);
   });
 });
