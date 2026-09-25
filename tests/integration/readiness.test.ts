@@ -147,6 +147,22 @@ describe("readiness", () => {
     expect(fixture.serviceLog()).not.toContain("LEAKEDVALUE");
   });
 
+  it("keeps MCP URL credentials out of the service log when Claude Code fails to start", async () => {
+    const url = "https://user:url-password-1@tracker.invalid/mcp?sig=my+private+sig";
+    const fixture = bridge({
+      config: { mcpServers: { tracker: { type: "http", url } } },
+      scenario: { startupError: `cannot reach ${url.replace("+", "%20").replace("+", "%20")}` },
+    });
+    const report = await readiness(fixture);
+
+    expect(problemCodes(report)).toContain("claude_start");
+    expect(fixture.serviceLog()).toContain("tracker.invalid");
+    for (const secret of ["url-password-1", "private", "sig%20"]) {
+      expect(JSON.stringify(report)).not.toContain(secret);
+      expect(fixture.serviceLog()).not.toContain(secret);
+    }
+  });
+
   it("distinguishes configured MCP integrations from Codex tools and redacts their secrets", async () => {
     const fixture = bridge({
       config: {
@@ -158,7 +174,7 @@ describe("readiness", () => {
           },
           tracker: {
             type: "http",
-            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
+            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
             headers: { Authorization: "Bearer hdr-secret-123" },
           },
         },
@@ -168,7 +184,7 @@ describe("readiness", () => {
           tracker: {
             status: "failed",
             error:
-              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
+              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
           },
         },
         settingsMcpServers: [{ name: "docs", status: "connected", scope: "user" }],
@@ -190,6 +206,10 @@ describe("readiness", () => {
       "hdr-secret-123",
       "url-password-1",
       "url-token-456",
+      "private+sig",
+      "private sig",
+      "key%2fvalue",
+      "key/value",
     ]) {
       expect(JSON.stringify(report)).not.toContain(secret);
       expect(fixture.serviceLog()).not.toContain(secret);

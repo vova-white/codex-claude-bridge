@@ -64,16 +64,32 @@ export function configSecrets(config: BridgeConfig): string[] {
 
 function urlSecrets(url: string | undefined): string[] {
   if (!url) return [];
+  // Diagnostics may quote the URL as configured or in any re-encoding of it.
+  const rawQuery = /^[^?#]*\?([^#]*)/.exec(url)?.[1] ?? "";
+  const rawQueryValues = rawQuery.split("&").map((pair) => pair.slice(pair.indexOf("=") + 1));
+  const rawUserInfo = /^[a-z][\w+.-]*:\/\/([^/?#]*)@/i.exec(url)?.[1] ?? "";
+  const parsedValues: string[] = [];
   try {
     const parsed = new URL(url);
-    return [
-      parsed.username,
-      parsed.password,
-      decodeURIComponent(parsed.password),
-      ...parsed.searchParams.values(),
-      ...[...parsed.searchParams.values()].map((value) => encodeURIComponent(value)),
-    ].filter(Boolean);
+    parsedValues.push(...parsed.searchParams.values(), parsed.username, parsed.password);
   } catch {
-    return [url];
+    parsedValues.push(url);
+  }
+  return [
+    rawUserInfo,
+    ...rawUserInfo.split(":"),
+    ...rawQueryValues,
+    ...parsedValues,
+    ...parsedValues.map(safeDecode),
+  ]
+    .flatMap((value) => [value, encodeURIComponent(value)])
+    .filter(Boolean);
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
