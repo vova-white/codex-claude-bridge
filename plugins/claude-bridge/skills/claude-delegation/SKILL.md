@@ -74,7 +74,7 @@ Claude works autonomously with the tools the task profile grants; using them nee
 - a **question** (`kind: question`), when it needs a decision it cannot reasonably make itself;
 - a **permission request** (`kind: permission`) before calling a tool of an MCP server configured in the bridge's `config.json`, unless that server sets `autoApprove: true`.
 
-While Claude waits, the execution stays `running` with `reason: needs_input` and `detail.requestId`, and `wait_task` returns. `task_status` lists the task's `requests`: the `question` (questions with their options) or the `action` (the tool, its MCP server, and its input), the `state` (`pending`, `answered`, `expired`), `live`, and for a live request the `responseShape` to use. Answer with `respond_to_request`:
+While Claude waits, the execution stays `running` with `reason: needs_input` and `detail.requestId`, and `wait_task` returns. `task_status` lists the task's `requests`: the `question` (questions with their options) or the `action` (the tool, its MCP server, and its input, with credentials in its values and keys shown as `[REDACTED]` and ` (key N)` appended to a key that then repeats an earlier one), the `state` (`pending`, `answered`, `expired`), `live`, and for a live request the `responseShape` to use. Answer with `respond_to_request`:
 
 - a question: `{ "answers": { "<question text>": "<option label or your own answer>" } }`, one answer per question keyed exactly as `responseShape` shows it: the question text, with credentials shown as `[REDACTED]`, and ` (question N)` appended when an earlier question displays the same text, several labels comma-separated for a multi-select question;
 - a permission request: `{ "decision": "allow" }`, or `{ "decision": "deny", "message": "why" }`.
