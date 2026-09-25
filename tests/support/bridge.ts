@@ -117,6 +117,14 @@ export class BridgeFixture {
     }
   }
 
+  /** Kills the running service with SIGKILL, as a crash would, and waits until it is gone. */
+  async killService(): Promise<void> {
+    const pid = this.servicePid();
+    if (pid === undefined) throw new Error("No service is running.");
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid) || undefined);
+  }
+
   /** Replaces the scripted Claude Code behaviour for processes started from now on. */
   scenario(scenario: Scenario): void {
     writeFileSync(join(this.root, "scenario.json"), JSON.stringify(scenario));

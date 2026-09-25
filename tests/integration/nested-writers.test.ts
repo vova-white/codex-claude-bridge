@@ -863,7 +863,9 @@ describe("nested writers", () => {
     const recovered = (await reconnected.call("task_status", { project, taskId })).data;
     expect(recovered.executions[0]).toMatchObject({
       status: "interrupted",
-      nestedWriters: [{ status: "interrupted", reason: "service_restarted" }],
+      nestedWriters: [
+        { status: "interrupted", reason: "service_restarted", recovery: { process: "ended" } },
+      ],
     });
   });
 });

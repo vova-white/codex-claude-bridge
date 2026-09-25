@@ -315,7 +315,7 @@ describe("cancellation with nested agents", () => {
 });
 
 describe("recovery with nested agents", () => {
-  it("reports nested agents of an interrupted execution as unknown", async () => {
+  it("reports nested agents of an interrupted execution as ended with its process", async () => {
     const { fixture, project, taskId, status } = await setUp({
       turns: [
         {
@@ -335,7 +335,8 @@ describe("recovery with nested agents", () => {
     const recovered = (await reconnected.call("task_status", { project, taskId })).data;
     expect(recovered.executions[0]).toMatchObject({
       status: "interrupted",
-      nested: [{ taskId: "docs", status: "unknown", termination: "unconfirmed" }],
+      detail: { recovery: { process: "ended" } },
+      nested: [{ taskId: "docs", status: "stopped", termination: "process_exit" }],
     });
   });
 });

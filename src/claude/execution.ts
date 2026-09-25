@@ -14,6 +14,7 @@ import {
   credentialAction,
   withTimeout,
 } from "./readiness.ts";
+import { processIdentity, type ProcessIdentity } from "./processes.ts";
 import {
   nestedWriterServer,
   nestedWriterServerName,
@@ -89,6 +90,11 @@ export interface NestedEnd {
 }
 
 export interface ExecutionObserver {
+  /**
+   * Called once Claude Code's process is spawned, before it receives anything,
+   * so a later service can tell whether it still runs.
+   */
+  launched(process: ProcessIdentity): void;
   session(id: string): void;
   /** Called with the reset time while Claude Code waits for subscription capacity, and with undefined once it proceeds. */
   capacity(waiting: { resetsAt?: number } | undefined): void;
@@ -319,7 +325,7 @@ export async function runExecution(
   const input = new Input();
   const abort = new AbortController();
   if (request.signal.aborted) return { status: "cancelled", processExited: true };
-  const claude = claudeProcess();
+  const claude = claudeProcess((pid) => observer.launched(processIdentity(pid)));
   /** Running nested agents by task ID, with the Agent tool calls that started them. */
   const nested = new Map<string, string | undefined>();
   const nestedChanged = new Set<() => void>();

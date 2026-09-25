@@ -510,6 +510,108 @@ describe("task publication", () => {
     expect(creates(ghCalls())).toHaveLength(1);
   });
 
+  it("reconcile what an execution interrupted by a service crash published, without publishing again", async () => {
+    const { fixture, project, client, ghCalls } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            { signal: "published" },
+            { waitFor: "never" },
+          ],
+        },
+      ],
+    });
+    const { taskId } = (await client.call("start_task", writeTask(project))).data;
+    await waitFor(() => fixture.signalled("published") || undefined, 15_000);
+    await fixture.killService();
+
+    const reconnected = await fixture.connect();
+    const recovered = await waitFor(async () => {
+      const status = (await reconnected.call("task_status", { project, taskId })).data;
+      return status.executions[0].detail?.publication ? status.executions[0] : undefined;
+    }, 15_000);
+    expect(recovered).toMatchObject({
+      status: "interrupted",
+      reason: "service_restarted",
+      detail: {
+        recovery: { process: "ended" },
+        workspace: { commitCount: 1, changedFileCount: 1 },
+        publication: { pushed: true, pullRequest: { number: 1, state: "OPEN" } },
+      },
+    });
+    expect(recovered.detail.workspace.commits).toBeUndefined();
+    const result = await reconnected.call("task_result", {
+      project,
+      taskId,
+      executionId: recovered.executionId,
+    });
+    expect(result.data).toMatchObject({
+      result: null,
+      workspace: {
+        commits: [{ subject: "docs: improve the README" }],
+        changedFiles: ["README.md"],
+      },
+    });
+    const cleanup = await reconnected.call("cleanup_task", {
+      project,
+      taskId,
+      scope: "worktree",
+      dryRun: true,
+    });
+    expect(cleanup.data.outcome).toBe("planned");
+    expect(creates(ghCalls())).toHaveLength(1);
+    expect(fixture.launches()).toHaveLength(1);
+  });
+
+  it("finish reconciling an interrupted execution after the service dies again while reconciling it", async () => {
+    const { fixture, project, client, ghCalls, github, bin } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            { signal: "published" },
+            { waitFor: "never" },
+          ],
+        },
+      ],
+    });
+    const { taskId } = (await client.call("start_task", writeTask(project))).data;
+    await waitFor(() => fixture.signalled("published") || undefined, 15_000);
+    await fixture.killService();
+
+    // The next service's reconciliation holds while it asks GitHub for pull requests.
+    github((state) => (state.listWaitsFor = "list-go"));
+    try {
+      const reconnected = await fixture.connect();
+      const pending = (await reconnected.call("task_status", { project, taskId })).data
+        .executions[0];
+      expect(pending.detail).toEqual({ recovery: { process: "ended", reconciled: false } });
+      await waitFor(() => ghCalls().some(([group, action]) => group === "pr" && action === "list"));
+      await fixture.killService();
+    } finally {
+      // Also lets the held GitHub CLI of the killed service exit.
+      writeFileSync(join(bin, "list-go"), "");
+    }
+
+    const restarted = await fixture.connect();
+    const recovered = await waitFor(async () => {
+      const status = (await restarted.call("task_status", { project, taskId })).data;
+      return status.executions[0].detail.recovery.reconciled ? status.executions[0] : undefined;
+    }, 15_000);
+    expect(recovered.detail).toMatchObject({
+      recovery: { process: "ended", reconciled: true },
+      workspace: { commitCount: 1, changedFileCount: 1 },
+      publication: { pushed: true, pullRequest: { number: 1, state: "OPEN" } },
+    });
+    expect(creates(ghCalls())).toHaveLength(1);
+    expect(fixture.launches()).toHaveLength(1);
+  });
+
   it("report an unavailable GitHub CLI without copying its error text", async () => {
     const { fixture, project, client } = await setUp(
       {

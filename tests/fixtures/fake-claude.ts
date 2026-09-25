@@ -38,8 +38,11 @@ export type Step =
         saveAs?: string;
       };
     }
-  /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
-  | { ignoreTermination: true }
+  /**
+   * From now on ignores SIGTERM and stdin closing, like a process that hangs on
+   * shutdown; `signalOnTerm` names a file it creates on each SIGTERM it ignores.
+   */
+  | { ignoreTermination: true; signalOnTerm?: string }
   /** The Agent tool call and Claude Code's task_started for a nested agent; `parent` spawns it inside another one. */
   | {
       nestedStart: {
@@ -417,7 +420,10 @@ async function answer(prompt: string): Promise<void> {
       writeFileSync(resolve(process.cwd(), step.writeFile.path), step.writeFile.content);
     } else if ("ignoreTermination" in step) {
       ignoreTermination = true;
-      process.on("SIGTERM", () => {});
+      const { signalOnTerm } = step;
+      process.on("SIGTERM", () => {
+        if (signalOnTerm) writeFileSync(resolve(scenarioDir, signalOnTerm), "");
+      });
       // Stay alive after stdin closes, as a hung process would.
       setInterval(() => {}, 60_000);
     } else if ("nestedStart" in step) {
