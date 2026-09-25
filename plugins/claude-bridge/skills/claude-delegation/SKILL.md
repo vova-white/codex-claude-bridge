@@ -35,7 +35,7 @@ Claude runs with the edit tools disabled and without nested agents, but shell co
 
 - `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own.
 - `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
-- `failed`: `reason` is `authentication` (not a verified subscription login; the brief was not sent), `subscription_limit`, `invalid_request` (for example an unavailable model), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
+- `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
 - `interrupted`: the bridge service stopped while the task ran. The result may be incomplete; decide whether to start a new task with a new request key.
 
 Review the result in proportion to its risk: check the evidence behind claims you will act on, rather than repeating the whole investigation.

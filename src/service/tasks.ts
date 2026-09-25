@@ -52,7 +52,7 @@ interface TaskRow {
   request_key: string;
   request_hash: string;
   mode: string;
-  assignment: string;
+  request: string;
   session_id: string | null;
   created_at: string;
 }
@@ -176,7 +176,7 @@ export class TaskService {
     try {
       this.db
         .prepare(
-          `INSERT INTO tasks (id, project, caller, request_key, request_hash, mode, assignment, created_at)
+          `INSERT INTO tasks (id, project, caller, request_key, request_hash, mode, request, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
@@ -223,7 +223,7 @@ export class TaskService {
     return {
       tasks: tasks.map((task) => {
         const latest = this.latestExecution(task.id);
-        const intent = JSON.parse(task.assignment) as { assignment: string };
+        const intent = JSON.parse(task.request) as { assignment: string };
         return {
           taskId: task.id,
           status: latest.status,
@@ -246,7 +246,7 @@ export class TaskService {
       .prepare("SELECT * FROM executions WHERE task_id = ? ORDER BY ordinal")
       .all(task.id) as unknown as ExecutionRow[];
     const latest = executions.at(-1)!;
-    const intent = JSON.parse(task.assignment) as Omit<StartRequest, "project" | "requestKey">;
+    const intent = JSON.parse(task.request) as Omit<StartRequest, "project" | "requestKey">;
     return {
       taskId: task.id,
       project: task.project,
