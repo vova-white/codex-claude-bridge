@@ -170,6 +170,9 @@ async function smoke(): Promise<void> {
     GIT_AUTHOR_EMAIL: "smoke@example.invalid",
     GIT_COMMITTER_NAME: "Bridge Smoke",
     GIT_COMMITTER_EMAIL: "smoke@example.invalid",
+    // The fixture must not depend on the user's Git setup, such as commit signing.
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
   };
   const git = (...args: string[]) => execFileSync("git", args, { cwd: project, env: gitEnv });
   git("init", "--quiet", "--initial-branch=main");
