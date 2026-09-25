@@ -538,10 +538,30 @@ describe("task publication", () => {
       reason: "service_restarted",
       detail: {
         recovery: { process: "ended" },
-        workspace: { commits: [{ subject: "docs: improve the README" }] },
+        workspace: { commitCount: 1, changedFileCount: 1 },
         publication: { pushed: true, pullRequest: { number: 1, state: "OPEN" } },
       },
     });
+    expect(recovered.detail.workspace.commits).toBeUndefined();
+    const result = await reconnected.call("task_result", {
+      project,
+      taskId,
+      executionId: recovered.executionId,
+    });
+    expect(result.data).toMatchObject({
+      result: null,
+      workspace: {
+        commits: [{ subject: "docs: improve the README" }],
+        changedFiles: ["README.md"],
+      },
+    });
+    const cleanup = await reconnected.call("cleanup_task", {
+      project,
+      taskId,
+      scope: "worktree",
+      dryRun: true,
+    });
+    expect(cleanup.data.outcome).toBe("planned");
     expect(creates(ghCalls())).toHaveLength(1);
     expect(fixture.launches()).toHaveLength(1);
   });

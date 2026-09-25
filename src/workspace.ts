@@ -201,13 +201,13 @@ export async function checkoutHead(path: string): Promise<{ commit: string; bran
 
 /**
  * How many commits reachable from `tip` no branch, tag, remote-tracking ref, or
- * the checkout's HEAD contains, leaving out the branch `deleting`: the work that
- * removing `tip` and deleting that branch would lose.
+ * the checkout's HEAD contains, leaving out the branches `deleting`: the work that
+ * removing `tip` and deleting those branches would lose.
  */
 export async function unintegratedCommits(
   root: string,
   tip: string,
-  deleting?: string,
+  deleting: readonly string[] = [],
 ): Promise<number> {
   const count = await git(
     root,
@@ -215,7 +215,7 @@ export async function unintegratedCommits(
     "--count",
     tip,
     "--not",
-    ...(deleting ? [`--exclude=${deleting}`] : []),
+    ...deleting.map((branch) => `--exclude=${branch}`),
     "--branches",
     "--remotes",
     "--tags",

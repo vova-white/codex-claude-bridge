@@ -118,6 +118,7 @@ const migrations: string[] = [
     problems TEXT NOT NULL,
     checked_at TEXT NOT NULL
   )`,
+  `ALTER TABLE nested_writers ADD COLUMN workspace_state TEXT`,
   `ALTER TABLE executions ADD COLUMN process TEXT;
   ALTER TABLE nested_writers ADD COLUMN process TEXT;
   CREATE TABLE service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
