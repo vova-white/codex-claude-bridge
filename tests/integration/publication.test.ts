@@ -184,6 +184,40 @@ describe("task publication", () => {
     expect(guidance).not.toContain("Do not push");
   });
 
+  it("point publication actions at the project once cleanup removed the worktree", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            ...commit("NOTES.md", "notes\n", "docs: add notes"),
+            finished("Opened the pull request."),
+          ],
+        },
+      ],
+    });
+    const { taskId, status } = await run(client, writeTask(project));
+    expect(status.status).toBe("completed");
+    const before = (await client.call("task_status", { project, taskId })).data.publication;
+    expect(before.concerns.map((concern: { code: string }) => concern.code)).toEqual([
+      "unpushed_commits",
+    ]);
+
+    const cleanup = await client.call("cleanup_task", { project, taskId, scope: "worktree" });
+    expect(cleanup.data.outcome).toBe("cleaned");
+    const { workspace, publication } = (await client.call("task_status", { project, taskId })).data;
+    expect(workspace.state).toBe("branch_kept");
+    expect(publication.concerns).toEqual([
+      {
+        code: "unpushed_commits",
+        message: expect.any(String),
+        action: `Push it yourself with \`git -C ${project} push origin ${workspace.branch}\`.`,
+      },
+    ]);
+  });
+
   it("have a follow-up update the existing pull request instead of creating another", async () => {
     const { fixture, project, client, ghCalls } = await setUp({
       turns: [
@@ -270,7 +304,7 @@ describe("task publication", () => {
     expect(publication.concerns).toEqual([
       {
         code: "not_pushed",
-        message: expect.stringContaining("exist only in the task worktree"),
+        message: expect.stringContaining("exist only locally"),
         action: expect.stringContaining(`git -C ${workspace.path} push origin ${workspace.branch}`),
       },
     ]);

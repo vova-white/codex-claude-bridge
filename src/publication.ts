@@ -187,32 +187,47 @@ export interface Publication {
 
 /**
  * The publication section of results and task status, with the concerns the
- * bridge derives from it: each has a code, a message, and an action.
+ * bridge derives from it: each has a code, a message, and usually an action.
+ * Actions run Git in `checkout`: the task worktree, or the project checkout
+ * once cleanup_task has removed the worktree (`cleanedUp`), when follow-ups
+ * are no longer possible and a removed branch cannot be pushed at all.
  */
-export function publicationReport(publication: Publication, worktree: string) {
+export function publicationReport(
+  publication: Publication,
+  checkout: string,
+  cleanedUp?: "removed" | "branch_kept",
+) {
   const { remote, branch, revision, pushedRevision, pullRequest } = publication;
-  const push = `Send a follow-up asking Claude to push, or push it yourself with \`git -C ${worktree} push ${remote} ${branch}\`.`;
+  const pushCommand = `\`git -C ${checkout} push ${remote} ${branch}\``;
+  const push =
+    cleanedUp === "removed"
+      ? undefined
+      : cleanedUp
+        ? `Push it yourself with ${pushCommand}.`
+        : `Send a follow-up asking Claude to push, or push it yourself with ${pushCommand}.`;
   const concerns: { code: string; message: string; action?: string }[] = [];
   const problems = new Set(publication.problems);
   if (problems.has("no_remote")) {
     concerns.push({
       code: "no_remote",
       message: `The repository has no remote named ${remote}, so ${branch} cannot be published.`,
-      action: `Add the remote, then ${push.charAt(0).toLowerCase()}${push.slice(1)}`,
+      ...(push
+        ? { action: `Add the remote, then ${push.charAt(0).toLowerCase()}${push.slice(1)}` }
+        : {}),
     });
   }
   if (problems.has("remote_unavailable")) {
     concerns.push({
       code: "remote_unavailable",
       message: `The bridge could not read ${branch} from ${remote}; the pushed revision shown is from an earlier check, if any.`,
-      action: `Check access with \`git -C ${worktree} ls-remote ${remote}\`.`,
+      action: `Check access with \`git -C ${checkout} ls-remote ${remote}\`.`,
     });
   }
   if (problems.has("github_unavailable")) {
     concerns.push({
       code: "github_unavailable",
       message: `The bridge could not list pull requests for ${branch} with the GitHub CLI; the pull request shown is from an earlier check, if any.`,
-      action: `Check that the GitHub CLI is installed and signed in for the bridge service (\`gh auth status\`), then run \`gh pr list --head ${branch}\` in ${worktree}.`,
+      action: `Check that the GitHub CLI is installed and signed in for the bridge service (\`gh auth status\`), then run \`gh pr list --head ${branch}\` in ${checkout}.`,
     });
   }
   if (!problems.has("no_remote") && !problems.has("remote_unavailable")) {
@@ -220,34 +235,34 @@ export function publicationReport(publication: Publication, worktree: string) {
       concerns.push({
         code: "branch_not_on_remote",
         message: `${branch} is no longer on ${remote}; its pull request #${pullRequest.number} is ${pullRequest.state} with head ${pullRequest.headRevision}.`,
-        ...(revision === pullRequest.headRevision ? {} : { action: push }),
+        ...(revision === pullRequest.headRevision || !push ? {} : { action: push }),
       });
     } else if (pushedRevision === null) {
       concerns.push({
         code: "not_pushed",
-        message: `${branch} is not on ${remote}; its commits exist only in the task worktree.`,
-        action: push,
+        message: `${branch} is not on ${remote}; its commits exist only locally.`,
+        ...(push ? { action: push } : {}),
       });
     } else if (revision !== pushedRevision) {
       concerns.push({
         code: "unpushed_commits",
-        message: `The task worktree has ${branch} at ${revision}, but ${remote} has ${pushedRevision}.`,
-        action: push,
+        message: `The task branch ${branch} is at ${revision}, but ${remote} has ${pushedRevision}.`,
+        ...(push ? { action: push } : {}),
       });
     }
   }
-  if (publication.uncommitted) {
+  if (publication.uncommitted && !cleanedUp) {
     concerns.push({
       code: "uncommitted_changes",
       message: "The task worktree has uncommitted changes, which are not published.",
-      action: `Inspect them with \`git -C ${worktree} status\`; send a follow-up asking Claude to commit and push them if they belong to the task.`,
+      action: `Inspect them with \`git -C ${checkout} status\`; send a follow-up asking Claude to commit and push them if they belong to the task.`,
     });
   }
   if (pushedRevision !== null && pullRequest === null && !problems.has("github_unavailable")) {
     concerns.push({
       code: "no_pull_request",
       message: `No pull request exists for ${branch}.`,
-      action: `Send a follow-up asking Claude to open it, or open it yourself with \`gh pr create --head ${branch}\`.`,
+      action: `${cleanedUp ? "Open it" : "Send a follow-up asking Claude to open it, or open it yourself"} with \`gh pr create --head ${branch}\`.`,
     });
   }
   if (pullRequest?.state === "CLOSED") {

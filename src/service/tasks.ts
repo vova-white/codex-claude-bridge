@@ -670,7 +670,15 @@ export class TaskService {
       ...(task.session_id ? { sessionId: task.session_id } : {}),
       ...(workspace ? { workspace: workspaceReport(workspace) } : {}),
       ...(workspace && publication
-        ? { publication: publicationReport(publication, workspace.path) }
+        ? {
+            publication: cleanedStates.includes(workspace.state)
+              ? publicationReport(
+                  publication,
+                  task.project,
+                  workspace.state as "removed" | "branch_kept",
+                )
+              : publicationReport(publication, workspace.path),
+          }
         : {}),
       createdAt: task.created_at,
       request: intent,
