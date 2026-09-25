@@ -70,6 +70,20 @@ const migrations: string[] = [
     state TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE publications (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    remote TEXT NOT NULL,
+    repository TEXT,
+    revision TEXT,
+    uncommitted INTEGER NOT NULL,
+    pushed_revision TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    pr_head TEXT,
+    problems TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+  )`,
 ];
 
 export class StoreLockedError extends Error {}

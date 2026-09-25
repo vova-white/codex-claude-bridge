@@ -21,8 +21,8 @@ export type Step =
   | { signal: string }
   /** Writes a file relative to the working directory, as a shell command could. */
   | { writeFile: { path: string; content: string } }
-  /** Runs a command in the working directory, as the Bash tool could. */
-  | { exec: string[] }
+  /** Runs a command in the working directory, as the Bash tool could; `mayFail` carries on after a failure. */
+  | { exec: string[]; mayFail?: boolean }
   /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
   | { ignoreTermination: true }
   /** The Agent tool call and Claude Code's task_started for a nested agent; `parent` spawns it inside another one. */
@@ -295,7 +295,11 @@ async function answer(prompt: string): Promise<void> {
       taskNotification(step.nestedEnd.id, step.nestedEnd.status, step.nestedEnd.summary);
     } else if ("exec" in step) {
       const [command = "true", ...commandArgs] = step.exec;
-      execFileSync(command, commandArgs, { cwd: process.cwd() });
+      try {
+        execFileSync(command, commandArgs, { cwd: process.cwd() });
+      } catch (error) {
+        if (!step.mayFail) throw error;
+      }
     } else if ("result" in step) {
       const { text = "", structured, isError = false, subtype = "success", errors } = step.result;
       send({
@@ -339,6 +343,12 @@ lines.on("line", (line) => {
   const { request_id: requestId, request } = message;
   switch (request.subtype) {
     case "initialize":
+      if (process.env.FAKE_CLAUDE_GUIDANCE_LOG) {
+        appendFileSync(
+          process.env.FAKE_CLAUDE_GUIDANCE_LOG,
+          `${JSON.stringify(request.appendSystemPrompt ?? "")}\n`,
+        );
+      }
       if (resumed && scenario.lostSessions) {
         // Claude Code answers an unknown --resume with an error result and exits.
         send({
