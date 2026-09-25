@@ -737,6 +737,8 @@ export class TaskService {
    * character not shown, returning `parts` until nothing is left. A failed or
    * cancelled writing execution has no result (`result: null`) but pages the
    * changes of its retained worktree the same way, as a top-level `workspace`.
+   * The reports of an ended execution's nested writers follow as further parts,
+   * shown as `nestedWriters`.
    */
   async result(caller: string, params: unknown) {
     const { project, taskId, executionId, maxChars, part, offset } = parse(resultSchema, params);
@@ -750,8 +752,14 @@ export class TaskService {
     const stored: (Record<string, unknown> & Partial<StoredResult>) | undefined = execution.result
       ? JSON.parse(execution.result)
       : retained && { workspace: retained };
-    if (!stored) return { ...state, result: null };
-    const parts = resultParts(stored);
+    const writers = terminalStatuses.includes(execution.status)
+      ? this.nestedWriterRows(execution.id)
+      : [];
+    if (!stored && writers.length === 0) return { ...state, result: null };
+    const parts = [
+      ...(stored ? resultParts(stored) : []),
+      ...writers.flatMap((row, index) => writerParts(row, index)),
+    ].map((item, index) => ({ part: index, ...item }));
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
     const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
     const truncation = next
@@ -766,43 +774,45 @@ export class TaskService {
     if (part !== undefined || offset !== undefined) {
       return { ...state, parts: page.parts, ...truncation };
     }
+    const own = page.parts.filter((item) => item.writerId === undefined);
+    const nestedWriters =
+      writers.length > 0 ? { nestedWriters: shownWriters(writers, page.parts) } : {};
+    if (!execution.result || !stored) {
+      const workspace = stored && shownResult(stored, own).workspace;
+      return {
+        ...state,
+        result: null,
+        ...(workspace ? { workspace } : {}),
+        ...nestedWriters,
+        ...truncation,
+      };
+    }
     const rest = Object.fromEntries(
       Object.entries(stored).filter(
         ([key]) =>
-          !["summary", "evidence", "failures", "remainingWork", "checks", "workspace"].includes(
-            key,
-          ),
+          ![
+            "summary",
+            "evidence",
+            "failures",
+            "remainingWork",
+            "checks",
+            "workspace",
+            "nestedWriters",
+          ].includes(key),
       ),
     );
-    const shown = (field: string) => page.parts.filter((item) => item.field === field);
-    const texts = (field: string) => shown(field).map((item) => item.text);
-    const workspace = stored.workspace
-      ? {
-          workspace: {
-            ...stored.workspace,
-            ...(stored.workspace.commits
-              ? {
-                  commits: shown("commits").map((item) => ({
-                    sha: item.sha,
-                    subject: item.text,
-                  })),
-                }
-              : {}),
-            ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
-          },
-        }
-      : {};
-    if (!execution.result) return { ...state, result: null, ...workspace, ...truncation };
+    const shown = shownResult(stored, own);
     return {
       ...state,
       result: {
-        summary: texts("summary")[0] ?? "",
-        evidence: texts("evidence"),
-        failures: texts("failures"),
-        remainingWork: texts("remainingWork"),
-        ...(stored.checks ? { checks: shownChecks(page.parts, stored.checks) } : {}),
+        summary: shown.summary ?? "",
+        evidence: shown.evidence ?? [],
+        failures: shown.failures ?? [],
+        remainingWork: shown.remainingWork ?? [],
+        ...(shown.checks ? { checks: shown.checks } : {}),
         ...rest,
-        ...workspace,
+        ...(shown.workspace ? { workspace: shown.workspace } : {}),
+        ...nestedWriters,
       },
       ...truncation,
     };
@@ -1853,22 +1863,7 @@ export class TaskService {
   /** The nested writers an execution started, as task_status and cancel_task show them. */
   private nestedWriterReports(executionId: string) {
     const rows = this.nestedWriterRows(executionId);
-    return rows.length > 0 ? { nestedWriters: rows.map(nestedWriterReport) } : {};
-  }
-
-  /** Where each nested writer's work is, kept with the execution's result. */
-  private nestedWriterReferences(executionId: string) {
-    const rows = this.nestedWriterRows(executionId);
-    if (rows.length === 0) return {};
-    return {
-      nestedWriters: rows.map((row) => ({
-        writerId: row.id,
-        status: row.status,
-        branch: row.branch,
-        baseline: row.baseline,
-        path: row.path,
-      })),
-    };
+    return rows.length > 0 ? { nestedWriters: rows.map(nestedWriterState) } : {};
   }
 
   /** The configured limit of running executions, or undefined while config.json is invalid. */
@@ -2241,7 +2236,6 @@ export class TaskService {
         ? {
             checks: checks.map((check) => redactStrings(check, clean)),
             ...retained,
-            ...this.nestedWriterReferences(executionId),
           }
         : { workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles } }),
     };
@@ -2265,6 +2259,10 @@ interface ResultPart {
   /** Short values that belong with the part: a check's outcome, a commit's SHA. */
   outcome?: string;
   sha?: string;
+  /** The nested writer whose report the part belongs to. */
+  writerId?: string;
+  /** On the first part of a nested writer's report, whose text is its branch: where its work is and how it ended. */
+  writer?: { status: string; reason?: string; baseline: string; path: string };
   text: string;
 }
 
@@ -2276,7 +2274,12 @@ interface StoredResult {
   failures: string[];
   remainingWork: string[];
   checks?: Check[];
-  workspace?: { commits?: { sha: string; subject: string }[]; changedFiles?: string[] };
+  workspace?: {
+    commits?: { sha: string; subject: string }[];
+    changedFiles?: string[];
+    commitCount?: number;
+    changedFileCount?: number;
+  };
 }
 
 /**
@@ -2285,7 +2288,7 @@ interface StoredResult {
  * file of a writing task's workspace. A failed or cancelled writing execution
  * has only the workspace.
  */
-function resultParts(result: Partial<StoredResult>): ResultPart[] {
+function resultParts(result: Partial<StoredResult>): Omit<ResultPart, "part">[] {
   const fields = [
     ["evidence", result.evidence],
     ["failures", result.failures],
@@ -2314,7 +2317,83 @@ function resultParts(result: Partial<StoredResult>): ResultPart[] {
       text,
     })),
   ];
-  return parts.map((item, part) => ({ part, ...item }));
+  return parts;
+}
+
+/** A nested writer's report as parts: its branch with where its work is, then its result and changes. */
+function writerParts(row: NestedWriterRow, index: number): Omit<ResultPart, "part">[] {
+  const writer = {
+    status: row.status,
+    ...(row.reason ? { reason: row.reason } : {}),
+    baseline: row.baseline,
+    path: row.path,
+  };
+  return [
+    { field: "nestedWriters", index, key: "branch", writerId: row.id, writer, text: row.branch },
+    ...resultParts(writerStored(row)).map((item) => ({ ...item, writerId: row.id })),
+  ];
+}
+
+/** A nested writer's result and changes, stored like an execution's result. */
+function writerStored(row: NestedWriterRow): Partial<StoredResult> {
+  const { result, changes } = (row.outcome ? JSON.parse(row.outcome) : {}) as {
+    result?: StoredResult;
+    changes?: StoredResult["workspace"];
+  };
+  return { ...result, ...(changes ? { workspace: changes } : {}) };
+}
+
+/** A stored result as a page shows it: only the text of the page's parts, in the result's usual shape. */
+function shownResult(stored: Partial<StoredResult>, page: ShownPart[]) {
+  const shown = (field: string) => page.filter((item) => item.field === field);
+  const texts = (field: string) => shown(field).map((item) => item.text);
+  return {
+    ...(stored.summary === undefined
+      ? {}
+      : {
+          summary: texts("summary")[0] ?? "",
+          evidence: texts("evidence"),
+          failures: texts("failures"),
+          remainingWork: texts("remainingWork"),
+        }),
+    ...(stored.checks ? { checks: shownChecks(page, stored.checks) } : {}),
+    ...(stored.workspace
+      ? {
+          workspace: {
+            ...stored.workspace,
+            ...(stored.workspace.commits
+              ? {
+                  commits: shown("commits").map((item) => ({ sha: item.sha, subject: item.text })),
+                }
+              : {}),
+            ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/**
+ * The nested writers whose report starts on a page, each with the part of its
+ * result and changes the page holds; `result` appears once its summary does.
+ */
+function shownWriters(rows: NestedWriterRow[], page: ShownPart[]) {
+  return rows.flatMap((row) => {
+    const own = page.filter((item) => item.writerId === row.id);
+    const header = own.find((item) => item.field === "nestedWriters");
+    if (!header) return [];
+    const { workspace, ...result } = shownResult(writerStored(row), own);
+    return [
+      {
+        writerId: row.id,
+        ...header.writer,
+        branch: header.text,
+        ...(header.complete === false ? { complete: false } : {}),
+        ...(own.some((item) => item.field === "summary") ? { result } : {}),
+        ...(workspace ? { workspace } : {}),
+      },
+    ];
+  });
 }
 
 type ShownPart = ResultPart & { offset?: number; complete?: false };
@@ -2343,7 +2422,7 @@ function shownChecks(page: ShownPart[], stored: Check[]) {
 
 /**
  * Reads parts from a position, returning at most `budget` characters and where
- * to continue. A part's SHA and outcome count against the budget too, so many
+ * to continue. A part's SHA, outcome, and writer count against the budget too, so many
  * short parts, such as commits with one-word subjects, cannot overflow a page.
  * A page always holds at least one character, so reading always advances.
  */
@@ -2354,7 +2433,11 @@ function readParts(parts: ResultPart[], start: number, offset: number, budget: n
     const from = part === start ? offset : 0;
     const whole = parts[part]!;
     const text = whole.text.slice(from);
-    const extra = (whole.sha?.length ?? 0) + (whole.outcome?.length ?? 0);
+    const extra =
+      (whole.sha?.length ?? 0) +
+      (whole.outcome?.length ?? 0) +
+      (whole.writerId?.length ?? 0) +
+      (whole.writer ? JSON.stringify(whole.writer).length : 0);
     if (remaining === 0 || (page.length > 0 && remaining <= extra)) {
       return { parts: page, next: { part, offset: from } };
     }
@@ -2469,7 +2552,7 @@ function nestedWriterReport(row: NestedWriterRow) {
   const outcome = (row.outcome ? JSON.parse(row.outcome) : {}) as {
     result?: object;
     error?: object;
-    changes?: object;
+    changes?: StoredResult["workspace"];
   };
   return {
     writerId: row.id,
@@ -2490,6 +2573,21 @@ function nestedWriterReport(row: NestedWriterRow) {
     ...(row.session_id ? { sessionId: row.session_id } : {}),
     startedAt: row.created_at,
     ...(row.ended_at ? { endedAt: row.ended_at } : {}),
+  };
+}
+
+/**
+ * A nested writer as task_status and cancel_task show it: its report with the
+ * change lists and result left out and a long assignment cut, which keeps the
+ * state small however many writers ran. task_result of the execution pages them.
+ */
+function nestedWriterState(row: NestedWriterRow) {
+  const { workspace, result: _result, assignment, ...report } = nestedWriterReport(row);
+  const { commits: _commits, changedFiles: _changedFiles, ...counts } = workspace;
+  return {
+    ...report,
+    assignment: assignment.length > 200 ? `${assignment.slice(0, 200)}…` : assignment,
+    workspace: counts,
   };
 }
 
