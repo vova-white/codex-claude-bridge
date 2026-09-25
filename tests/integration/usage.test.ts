@@ -129,6 +129,36 @@ describe("execution usage", () => {
     );
   });
 
+  it("reports usage in the waited start and follow-up responses", async () => {
+    const fixture = new BridgeFixture({
+      scenario: {
+        turns: [
+          { match: "Also", steps: [finished("Also reviewed.", reported(2))] },
+          { steps: [finished("Reviewed.", reported(1))] },
+        ],
+      },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const started = await client.call("start_task", {
+      project,
+      requestKey: "usage-waited",
+      assignment: "Review the README.",
+      expectedResult: "Findings.",
+      waitSeconds: 30,
+    });
+    expect(started.data).toMatchObject({ status: "completed", usage: shown(1) });
+    const followed = await client.call("send_followup", {
+      project,
+      taskId: started.data.taskId,
+      requestKey: "usage-waited-2",
+      message: "Also check the docs.",
+      waitSeconds: 30,
+    });
+    expect(followed.data).toMatchObject({ status: "completed", usage: shown(2) });
+  });
+
   it("reports usage of an execution that ended with an error result", async () => {
     const { status, wait } = await setUp({
       turns: [{ steps: [{ result: { isError: true, text: "Failed.", usage: reported(2) } }] }],
