@@ -27,7 +27,7 @@ Delegate a focused investigation or review that Claude can complete from the rep
    - Optionally `model` and `effort`, chosen from the readiness `models`.
 3. The call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes.
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
-5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed.
+5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, read the omitted parts with `read_output` from `truncated.readOutputAfter`, where the summary and each evidence, failure, and remaining-work item are separate events.
 
 ## Reading progress
 

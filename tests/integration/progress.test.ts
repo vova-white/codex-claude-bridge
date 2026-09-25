@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Step } from "../fixtures/fake-claude.ts";
 import {
   BridgeFixture,
+  isAlive,
   waitFor,
   type BridgeClient,
   type BridgeOptions,
@@ -40,9 +41,9 @@ async function startTask(fixture: BridgeFixture, steps: Step[]) {
   return { client, project, ...(started.data as { taskId: string; executionId: string }) };
 }
 
-async function readAll(client: BridgeClient, args: Record<string, unknown>, limit = 2) {
+async function readAll(client: BridgeClient, args: Record<string, unknown>, limit = 2, from = 0) {
   const events: any[] = [];
-  let after = 0;
+  let after = from;
   for (;;) {
     const page = (await client.call("read_output", { ...args, after, limit })).data;
     events.push(...page.events);
@@ -137,8 +138,8 @@ describe("waiting and progress", () => {
     await client.close();
 
     const reconnected = await fixture.connect();
-    const rest = await readAll(reconnected, { project, taskId }, 2);
-    const all = [...first.events, ...rest.filter((event) => event.seq > first.nextCursor)];
+    const rest = await readAll(reconnected, { project, taskId }, 2, first.nextCursor);
+    const all = [...first.events, ...rest];
     const sequence = all.map((event) => event.seq);
     expect(sequence).toEqual([...sequence].toSorted((a, b) => a - b));
     expect(new Set(sequence).size).toBe(sequence.length);
@@ -155,6 +156,105 @@ describe("waiting and progress", () => {
       await reconnected.call("read_output", { project, taskId, after: all.at(-1)!.seq })
     ).data;
     expect(empty).toMatchObject({ events: [], hasMore: false, nextCursor: all.at(-1)!.seq });
+  });
+
+  it("keeps configured secrets out of tool events even when JSON would escape them", async () => {
+    const secret = 'tok"quo\\te-SECRET';
+    const fixture = bridge({
+      config: { mcpServers: { github: { command: "github-mcp", env: { TOKEN: secret } } } },
+    });
+    const { client, project, taskId } = await startTask(fixture, [
+      { toolUse: { name: "Bash", input: { command: `echo ${secret}` } } },
+      finished("Done."),
+    ]);
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+
+    const events = await readAll(client, { project, taskId }, 50);
+    const tool = events.find((event) => event.kind === "tool");
+    expect(tool.text).toBe('Bash {"command":"echo [REDACTED]"}');
+    expect(JSON.stringify(events)).not.toContain("SECRET");
+  });
+
+  it("bounds the result and serves every part through cursor-based reads", async () => {
+    const evidence = Array.from({ length: 30 }, (_, index) => `${index}:${"e".repeat(500)}`);
+    const fixture = bridge();
+    const { client, project, taskId } = await startTask(fixture, [
+      {
+        result: {
+          structured: { summary: "Big.", evidence, failures: ["one failure"], remainingWork: [] },
+        },
+      },
+    ]);
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+
+    const bounded = (await client.call("task_result", { project, taskId, maxChars: 1_200 })).data;
+    expect(bounded.result.summary).toBe("Big.");
+    expect(bounded.result.evidence.join("").length).toBeLessThanOrEqual(1_200);
+    expect(bounded.truncated).toMatchObject({
+      omittedItems: { evidence: expect.any(Number), failures: 1 },
+    });
+    expect(bounded.truncated.cutFields.length).toBeGreaterThan(0);
+
+    const parts = await readAll(
+      client,
+      { project, taskId, maxChars: 16_000 },
+      50,
+      bounded.truncated.readOutputAfter,
+    );
+    expect(parts.map((event) => event.kind)).toEqual([
+      "result",
+      ...evidence.map(() => "evidence"),
+      "failure",
+    ]);
+    expect(parts.filter((event) => event.kind === "evidence").map((event) => event.text)).toEqual(
+      evidence,
+    );
+  });
+
+  it("keeps the task running when the client disconnects during a wait", async () => {
+    const fixture = bridge();
+    const { client, project, taskId } = await startTask(fixture, [
+      { waitFor: "go" },
+      finished("Done after the disconnect."),
+    ]);
+    const pending = client.call("wait_task", { project, taskId, timeoutSeconds: 60 });
+    pending.catch(() => {});
+    await client.close();
+
+    fixture.release("go");
+    const reconnected = await fixture.connect();
+    const waited = await reconnected.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(waited.data.status).toBe("completed");
+    const result = await reconnected.call("task_result", { project, taskId });
+    expect(result.data.result.summary).toBe("Done after the disconnect.");
+  });
+
+  it("keeps progress and cursors after the service restarts", async () => {
+    const fixture = bridge();
+    const { client, project, taskId } = await startTask(fixture, [
+      { assistant: "Before the crash." },
+      { waitFor: "never" },
+    ]);
+    await waitFor(async () => {
+      const page = (await client.call("read_output", { project, taskId })).data;
+      return page.events.some((event: any) => event.text === "Before the crash.")
+        ? page
+        : undefined;
+    });
+    const before = (await client.call("read_output", { project, taskId })).data;
+    const pid = fixture.servicePid()!;
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid) || undefined);
+
+    const reconnected = await fixture.connect();
+    const after = (
+      await reconnected.call("read_output", { project, taskId, after: before.nextCursor })
+    ).data;
+    expect(after.status).toBe("interrupted");
+    expect(after.events.map((event: any) => [event.kind, event.text])).toEqual([
+      ["status", "Interrupted: the bridge service stopped while this execution ran."],
+    ]);
+    expect(after.events[0].seq).toBeGreaterThan(before.nextCursor);
   });
 
   it("marks an event cut to fit the budget and returns it whole on request", async () => {

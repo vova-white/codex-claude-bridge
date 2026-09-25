@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { ServiceConnection } from "../ipc.ts";
 import { connectService } from "../service/launcher.ts";
-import { outputSchema, startSchema, waitSchema } from "../service/tasks.ts";
+import { outputSchema, resultSchema, startSchema, waitSchema } from "../service/tasks.ts";
 import type { StatePaths } from "../state.ts";
 import metadata from "../../package.json" with { type: "json" };
 
@@ -92,15 +92,8 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Read a delegated task's result",
       description:
-        "The durable result of a task's original execution, or of executionId: summary, evidence, failures, remainingWork, and the workspace used. result is null until the execution completes. Reading does not consume the result.",
-      inputSchema: {
-        project,
-        taskId,
-        executionId: z
-          .string()
-          .optional()
-          .describe("A specific execution; defaults to the original."),
-      },
+        "The durable result of a task's original execution, or of executionId: summary, evidence, failures, remainingWork, and the workspace used. result is null until the execution completes. At most maxChars characters of result text are returned; when parts are cut or omitted, truncated lists them and gives readOutputAfter, the read_output cursor from which every part can be read in full. Reading does not consume the result.",
+      inputSchema: resultSchema.shape,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     (args) => call("task_result", args),

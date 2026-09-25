@@ -91,7 +91,23 @@ export const outputSchema = z.object({
     .default(8000)
     .describe("Most characters of event text to return in total."),
 });
-const resultLookup = taskLookup.extend({ executionId: z.string().min(1).optional() });
+/** Arguments of task_result. */
+export const resultSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  executionId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("A specific execution; defaults to the original."),
+  maxChars: z
+    .number()
+    .int()
+    .min(200)
+    .max(maxStoredEventChars)
+    .default(12_000)
+    .describe("Most characters of result text to return."),
+});
 const projectLookup = z.object({ project: z.string().min(1) });
 
 /** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
@@ -334,22 +350,72 @@ export class TaskService {
     };
   }
 
+  /**
+   * The durable result of an execution, bounded by maxChars. Parts that do not
+   * fit are cut or omitted and listed in `truncated`, with the read_output cursor
+   * where every part of the result can be read in full.
+   */
   async result(caller: string, params: unknown) {
-    const { project, taskId, executionId } = parse(resultLookup, params);
+    const { project, taskId, executionId, maxChars } = parse(resultSchema, params);
     const task = await this.task(caller, project, taskId);
     const execution = executionId
-      ? (this.db
-          .prepare("SELECT * FROM executions WHERE task_id = ? AND id = ?")
-          .get(task.id, executionId) as ExecutionRow | undefined)
+      ? this.executionById(task.id, executionId)
       : this.execution(task.id, 1);
-    if (!execution) {
-      throw new ServiceError("not_found", `Task ${taskId} has no execution ${executionId}.`);
+    const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
+    if (!execution.result) return { ...state, result: null };
+    const { summary, evidence, failures, remainingWork, ...rest } = JSON.parse(
+      execution.result,
+    ) as { summary: string; evidence: string[]; failures: string[]; remainingWork: string[] };
+    let budget = maxChars;
+    const cutFields: string[] = [];
+    const take = (text: string, field: string) => {
+      if (text.length <= budget) {
+        budget -= text.length;
+        return text;
+      }
+      cutFields.push(field);
+      const shown = text.slice(0, budget);
+      budget = 0;
+      return shown;
+    };
+    const omitted: Record<string, number> = {};
+    const list = (items: string[], field: string) => {
+      const kept: string[] = [];
+      for (const [index, item] of items.entries()) {
+        if (budget === 0) {
+          omitted[field] = items.length - index;
+          break;
+        }
+        kept.push(take(item, `${field}[${index}]`));
+      }
+      return kept;
+    };
+    const bounded = {
+      summary: take(summary, "summary"),
+      evidence: list(evidence, "evidence"),
+      failures: list(failures, "failures"),
+      remainingWork: list(remainingWork, "remainingWork"),
+      ...rest,
+    };
+    if (cutFields.length === 0 && Object.keys(omitted).length === 0) {
+      return { ...state, result: bounded };
     }
+    const first = this.db
+      .prepare("SELECT MIN(seq) AS seq FROM events WHERE execution_id = ? AND kind = 'result'")
+      .get(execution.id) as { seq: number | null };
     return {
-      taskId: task.id,
-      executionId: execution.id,
-      ...executionState(execution),
-      result: execution.result ? JSON.parse(execution.result) : null,
+      ...state,
+      result: bounded,
+      truncated: {
+        cutFields,
+        omittedItems: omitted,
+        ...(first.seq === null
+          ? {}
+          : {
+              readOutputAfter: first.seq - 1,
+              note: "read_output from this cursor returns the summary and every evidence, failure, and remaining_work item as separate events.",
+            }),
+      },
     };
   }
 
@@ -602,7 +668,14 @@ export class TaskService {
               );
             }
           },
-          output: (kind, text) => this.record(executionId, kind, redactContent(text, secrets)),
+          message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
+          // Strings are redacted before serialization, which would escape them.
+          toolCall: (name, input) =>
+            this.record(
+              executionId,
+              "tool",
+              `${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
+            ),
         },
       );
     }
@@ -647,8 +720,26 @@ export class TaskService {
       result: JSON.stringify(result),
       ended_at: endedAt,
     });
-    if (completed) this.record(executionId, "result", result.summary);
+    if (completed) {
+      // Every part of the result is also readable in bounded, cursor-based pieces.
+      this.record(executionId, "result", result.summary);
+      for (const item of result.evidence) this.record(executionId, "evidence", item);
+      for (const item of result.failures) this.record(executionId, "failure", item);
+      for (const item of result.remainingWork) this.record(executionId, "remaining_work", item);
+    }
   }
+}
+
+/** Applies `clean` to every string inside a JSON-like value. */
+function redactStrings(value: unknown, clean: (text: string) => string): unknown {
+  if (typeof value === "string") return clean(value);
+  if (Array.isArray(value)) return value.map((item) => redactStrings(item, clean));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, redactStrings(item, clean)]),
+    );
+  }
+  return value;
 }
 
 function executionState(execution: ExecutionRow) {
