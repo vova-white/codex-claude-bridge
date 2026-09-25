@@ -20,7 +20,7 @@ import {
 } from "../claude/nested-writers.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { errorOrigin, redact } from "../redact.ts";
+import { errorOrigin } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import {
@@ -1839,11 +1839,16 @@ export class TaskService {
   }
 
   /**
-   * A task or nested writer branch named after its assignment. Configured
-   * secrets are masked first: the name reaches Git's command line.
+   * A task or nested writer branch named after its assignment. The name
+   * reaches Git's command line, so an assignment containing any configured
+   * secret, in any letter case, names the branch by its ID alone.
    */
   private branchName(type: string, assignment: string, id: string): string {
-    return taskBranch(type, redact(assignment, configSecrets(this.config())), id);
+    const text = assignment.toLowerCase();
+    const secret = configSecrets(this.config()).some(
+      (value) => value.length > 0 && text.includes(value.toLowerCase()),
+    );
+    return taskBranch(type, secret ? "" : assignment, id);
   }
 
   /**

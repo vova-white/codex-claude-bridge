@@ -75,7 +75,7 @@ describe("writing tasks", () => {
   it("keep configured secrets out of the task branch name", async () => {
     const fixture = new BridgeFixture({
       config: {
-        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-BRANCHSECRET" } } },
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "abc" } } },
       },
       scenario: { turns: [{ steps: [finished("Done.")] }] },
     });
@@ -84,11 +84,11 @@ describe("writing tasks", () => {
     const client = await fixture.connect();
     const { taskId } = await run(
       client,
-      writeTask(project, { assignment: "tok-BRANCHSECRET rotation: update the README." }),
+      writeTask(project, { assignment: "ABC rotation: update the README." }),
     );
     const { workspace } = (await client.call("task_status", { project, taskId })).data;
-    expect(workspace.branch).toMatch(/^feature\//);
-    expect(workspace.branch.toLowerCase()).not.toContain("branchsecret");
+    // A short secret in another letter case still keeps the assignment out of the name.
+    expect(workspace.branch).toMatch(/^feature\/[0-9a-f]{8}$/);
   });
 
   it("report commits and files, including staged-only changes", async () => {
