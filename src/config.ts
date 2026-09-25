@@ -68,18 +68,22 @@ function urlSecrets(url: string | undefined): string[] {
   const raw = /^[^?#]*\?([^#]*)/.exec(url)?.[1] ?? "";
   const rawValues = raw.split("&").map((pair) => pair.slice(pair.indexOf("=") + 1));
   const rawUserInfo = /^[a-z][\w+.-]*:\/\/([^@/?#]*)@/i.exec(url)?.[1]?.split(":") ?? [];
+  const values: string[] = [];
   try {
     const parsed = new URL(url);
-    const values = [...parsed.searchParams.values()];
-    return [
-      ...rawUserInfo,
-      ...rawValues,
-      ...values,
-      ...values.map((value) => encodeURIComponent(value)),
-      decodeURIComponent(parsed.username),
-      decodeURIComponent(parsed.password),
-    ].filter(Boolean);
+    values.push(...parsed.searchParams.values(), parsed.username, parsed.password);
   } catch {
-    return [url];
+    values.push(url);
+  }
+  return [...rawUserInfo, ...rawValues, ...values, ...values.map(safeDecode)]
+    .flatMap((value) => [value, encodeURIComponent(value)])
+    .filter(Boolean);
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
