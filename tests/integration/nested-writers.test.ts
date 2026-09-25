@@ -169,16 +169,13 @@ describe("nested writers", () => {
           path: alpha.workspace.path,
           branch: alpha.workspace.branch,
           baseline: alpha.workspace.baseline,
-          commits: [{ subject: "docs: alpha title" }],
-          changedFiles: ["README.md"],
-        },
-        result: {
-          summary: "Retitled the README to Alpha.",
-          checks: [{ command: "npm test", outcome: "passed" }],
+          commitCount: 1,
+          changedFileCount: 1,
         },
       },
-      { writerId: beta.writerId, status: "completed", workspace: { changedFiles: ["README.md"] } },
+      { writerId: beta.writerId, status: "completed", workspace: { changedFileCount: 1 } },
     ]);
+    expect(writers[0].result).toBeUndefined();
 
     // The executor assembled one branch and reported the other's conflict.
     expect(readFileSync(join(executor.path, "README.md"), "utf8")).toBe("# Alpha\n");
@@ -190,8 +187,23 @@ describe("nested writers", () => {
       "The beta writer's branch conflicts with the alpha writer's change in README.md.",
     ]);
     expect(result.nestedWriters).toMatchObject([
-      { writerId: alpha.writerId, status: "completed", branch: alpha.workspace.branch },
-      { writerId: beta.writerId, status: "completed", branch: beta.workspace.branch },
+      {
+        writerId: alpha.writerId,
+        status: "completed",
+        branch: alpha.workspace.branch,
+        path: alpha.workspace.path,
+        result: {
+          summary: "Retitled the README to Alpha.",
+          checks: [{ command: "npm test", outcome: "passed" }],
+        },
+        workspace: { commits: [{ subject: "docs: alpha title" }], changedFiles: ["README.md"] },
+      },
+      {
+        writerId: beta.writerId,
+        status: "completed",
+        branch: beta.workspace.branch,
+        workspace: { changedFiles: ["README.md"] },
+      },
     ]);
     expect(git(project, "status", "--porcelain")).toBe("");
     expect(readFileSync(join(project, "README.md"), "utf8")).toBe("# Fixture\n");
@@ -462,20 +474,24 @@ describe("nested writers", () => {
             {
               status: "cancelled",
               reason: "cancelled",
-              workspace: { changedFiles: ["partial.txt"] },
+              workspace: { changedFileCount: 1 },
             },
           ],
         },
       ],
     });
     expect(cancelled.executions[0].nestedWriters[0].processExited).toBeUndefined();
+    const { nestedWriters } = (await client.call("task_result", { project, taskId })).data;
+    expect(nestedWriters).toMatchObject([
+      { status: "cancelled", workspace: { changedFiles: ["partial.txt"] } },
+    ]);
     expect(isAlive(writerPid)).toBe(false);
     expect(existsSync(join(path, "partial.txt"))).toBe(true);
     expect(git(project, "worktree", "list")).toContain(path);
   }, 30_000);
 
   it("keep nested results and workspaces when a writer or the executor fails, and stop writers still running", async () => {
-    const { fixture, project, status, wait, saved } = await setUp({
+    const { fixture, project, client, taskId, status, wait, saved } = await setUp({
       turns: [
         { match: "Alpha writer", steps: retitle("Alpha") },
         {
@@ -511,10 +527,19 @@ describe("nested writers", () => {
 
     const writers = (await status()).executions[0].nestedWriters;
     expect(writers).toMatchObject([
-      { status: "completed", workspace: { commits: [{ subject: "docs: alpha title" }] } },
-      { status: "failed", reason: "provider_error", workspace: { changedFiles: ["partial.txt"] } },
+      { status: "completed", workspace: { commitCount: 1 } },
+      { status: "failed", reason: "provider_error", workspace: { changedFileCount: 1 } },
       { status: "cancelled", reason: "parent_ended" },
     ]);
+    const reported = (await client.call("task_result", { project, taskId })).data;
+    expect(reported).toMatchObject({
+      result: null,
+      nestedWriters: [
+        { status: "completed", workspace: { commits: [{ subject: "docs: alpha title" }] } },
+        { status: "failed", workspace: { changedFiles: ["partial.txt"] } },
+        { status: "cancelled", reason: "parent_ended" },
+      ],
+    });
     expect(existsSync(join(writers[1].workspace.path, "partial.txt"))).toBe(true);
     // A failed writer's error is composed from known fields; its files are only in workspace.
     expect(writers[1].error.message).toMatch(/^Execution failed with provider_error: /);
@@ -525,6 +550,88 @@ describe("nested writers", () => {
     expect(isAlive(gammaPid.pid)).toBe(false);
     expect(git(project, "branch", "--list", writers[0].workspace.branch)).not.toBe("");
   }, 30_000);
+
+  it.each(["completed", "failed"])(
+    "keep the state small and page every nested writer's commits when the execution %s",
+    async (ending) => {
+      const names = ["Alpha", "Beta", "Gamma"];
+      // Subjects near the 1,000-character limit, so listing a few would exceed small pages.
+      const padding = "s".repeat(900);
+      const subject = (name: string, index: number) => `feat: ${name} ${index} ${padding}`;
+      const { project, client, taskId, wait } = await setUp({
+        turns: [
+          ...names.map((name) => ({
+            match: `${name} writer`,
+            steps: [
+              {
+                exec: [
+                  "sh",
+                  "-c",
+                  `for i in 0 1 2 3 4 5; do
+                     git ${identity.join(" ")} commit -q --allow-empty -m "feat: ${name} $i ${padding}"
+                   done`,
+                ],
+              },
+              finished(`${name} committed.`),
+            ],
+          })),
+          {
+            match: "Coordinate",
+            steps: [
+              ...names.map((name) => startWriter(name, `${name} writer: commit a lot.`)),
+              waitWriters("waited"),
+              ending === "completed"
+                ? finished("Kept the writers' branches.")
+                : { exit: { code: 1 } },
+            ],
+          },
+        ],
+      });
+      expect(await wait()).toMatchObject({ status: ending });
+
+      const status = await client.call("task_status", { project, taskId });
+      // Listing the subjects alone would take over 16,000 characters.
+      expect(status.text.length).toBeLessThan(6_000);
+      const writers = status.data.executions[0].nestedWriters;
+      expect(writers).toHaveLength(3);
+      for (const writer of writers) {
+        expect(writer).toMatchObject({ status: "completed", workspace: { commitCount: 6 } });
+        expect(writer.workspace.branch).toBeTruthy();
+        expect(writer.workspace.path).toBeTruthy();
+      }
+
+      // Every writer's commits come back through bounded pages.
+      const commits = new Map<string, string[]>();
+      const add = (writerId: string, text: string, offset?: number) => {
+        const list = commits.get(writerId) ?? [];
+        if (offset) list[list.length - 1] += text;
+        else list.push(text);
+        commits.set(writerId, list);
+      };
+      const first = await client.call("task_result", { project, taskId, maxChars: 200 });
+      expect(first.text.length).toBeLessThan(2_500);
+      const shown = ending === "completed" ? first.data.result : first.data;
+      for (const writer of shown.nestedWriters ?? []) {
+        for (const commit of writer.workspace?.commits ?? []) add(writer.writerId, commit.subject);
+      }
+      let next = first.data.truncated?.next;
+      while (next) {
+        const page = (await client.call("task_result", { project, taskId, maxChars: 200, ...next }))
+          .data;
+        expect(JSON.stringify(page).length).toBeLessThan(2_500);
+        for (const part of page.parts) {
+          if (part.writerId && part.field === "commits") add(part.writerId, part.text, part.offset);
+        }
+        next = page.truncated?.next;
+      }
+      for (const [index, writer] of writers.entries()) {
+        expect(commits.get(writer.writerId)?.toSorted()).toEqual(
+          [0, 1, 2, 3, 4, 5].map((i) => subject(names[index]!, i)),
+        );
+      }
+    },
+    30_000,
+  );
 
   it("report nested writers of an interrupted execution as interrupted", async () => {
     const { fixture, project, taskId } = await setUp({
