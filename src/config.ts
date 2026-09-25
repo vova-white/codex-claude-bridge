@@ -34,8 +34,9 @@ export function loadConfig(path: string): BridgeConfig {
   let parsed: z.ZodSafeParseResult<BridgeConfig>;
   try {
     parsed = configSchema.safeParse(JSON.parse(text));
-  } catch (error) {
-    throw new ConfigError(`${path} is not valid JSON: ${(error as Error).message}`);
+  } catch {
+    // The parser's message can quote the file's content, including secrets.
+    throw new ConfigError(`${path} is not valid JSON.`);
   }
   if (!parsed.success) {
     throw new ConfigError(`${path} is invalid: ${z.prettifyError(parsed.error)}`);

@@ -5,7 +5,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-interface Scenario {
+export interface Scenario {
   version?: string;
   startupError?: string;
   account?: Record<string, unknown>;

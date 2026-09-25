@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { BridgeFixture, type BridgeOptions } from "../support/bridge.ts";
@@ -131,6 +131,20 @@ describe("readiness", () => {
 
     const report = await readiness(bridge(), { project: bin });
     expect(problemCodes(report)).toContain("project_not_git");
+  });
+
+  it("rejects an unreadable configuration without quoting its content", async () => {
+    const fixture = bridge();
+    writeFileSync(
+      join(fixture.stateDir, "config.json"),
+      '{"mcpServers": {"github": {"command": "x", "env": {"TOKEN": "ghp_LEAKEDVALUE" oops}}}}',
+    );
+    const result = await (await fixture.connect()).call("readiness");
+
+    expect(result.isError).toBe(true);
+    expect(result.text).toContain("config.json is not valid JSON");
+    expect(result.text).not.toContain("LEAKEDVALUE");
+    expect(fixture.serviceLog()).not.toContain("LEAKEDVALUE");
   });
 
   it("distinguishes configured MCP integrations from Codex tools and redacts their secrets", async () => {

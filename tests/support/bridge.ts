@@ -3,21 +3,15 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { Scenario } from "../fixtures/fake-claude.ts";
 
 export const fakeClaude = resolve("tests/fixtures/fake-claude.ts");
 const cli = resolve("src/cli.ts");
 
-export interface FakeClaudeScenario {
-  version?: string;
-  startupError?: string;
-  account?: Record<string, unknown>;
-  models?: unknown[];
-  mcpStatus?: Record<string, { status: string; error?: string }>;
-  settingsMcpServers?: { name: string; status: string; scope: string }[];
-}
+export type { Scenario as FakeClaudeScenario } from "../fixtures/fake-claude.ts";
 
 export interface BridgeOptions {
-  scenario?: FakeClaudeScenario;
+  scenario?: Scenario;
   config?: Record<string, unknown>;
   env?: Record<string, string>;
   /** How to launch the MCP entry point; defaults to the TypeScript source. */
