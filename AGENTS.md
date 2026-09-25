@@ -31,7 +31,7 @@ The most common defect is a change that works on the path you tested and is miss
 - `src/mcp/`: the stateless stdio MCP entry point that Codex launches.
 - `src/service/`: the background service, its launcher, task lifecycle, and SQLite store.
 - `src/claude/`: readiness checks, version compatibility, and the Agent SDK execution adapter.
-- `src/ipc.ts`, `src/state.ts`, `src/config.ts`, `src/redact.ts`, `src/workspace.ts`: the socket protocol, state directory, `config.json`, credential redaction, and Git workspace shared by both sides.
+- `src/ipc.ts`, `src/state.ts`, `src/config.ts`, `src/redact.ts`, `src/workspace.ts`, `src/publication.ts`: the socket protocol, state directory, `config.json`, credential redaction, Git workspace, and a task branch's remote state (pushed revision and pull request) shared by both sides.
 - `plugins/claude-bridge/`: the Codex plugin manifest, `.mcp.json`, and the delegation skill. Its `dist/` is a build output.
 - `tests/`: unit, integration (real MCP entry point and service with `fixtures/fake-claude.ts`), and Playwright E2E. README describes the boundaries.
 

@@ -104,6 +104,20 @@ const migrations: string[] = [
   );
   CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at);
   ALTER TABLE requests ADD COLUMN writer_id TEXT`,
+  `CREATE TABLE publications (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    remote TEXT NOT NULL,
+    repository TEXT,
+    revision TEXT,
+    uncommitted INTEGER NOT NULL,
+    pushed_revision TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    pr_head TEXT,
+    problems TEXT NOT NULL,
+    checked_at TEXT NOT NULL
+  )`,
 ];
 
 export class StoreLockedError extends Error {}

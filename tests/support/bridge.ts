@@ -49,6 +49,7 @@ export class BridgeFixture {
   readonly stateDir = join(this.root, "state");
   readonly promptLog = join(this.root, "prompts.jsonl");
   readonly launchLog = join(this.root, "launches.jsonl");
+  readonly guidanceLog = join(this.root, "guidance.jsonl");
   private readonly clients = new Set<Client>();
   private readonly servicePids = new Set<number>();
 
@@ -71,6 +72,7 @@ export class BridgeFixture {
       FAKE_CLAUDE_SCENARIO: scenario,
       FAKE_CLAUDE_PROMPT_LOG: this.promptLog,
       FAKE_CLAUDE_LAUNCH_LOG: this.launchLog,
+      FAKE_CLAUDE_GUIDANCE_LOG: this.guidanceLog,
       ...options.env,
     };
   }
@@ -138,6 +140,13 @@ export class BridgeFixture {
         ? content
         : content.map((part: { text?: string }) => part.text ?? "").join("\n");
     });
+  }
+
+  /** The guidance appended to Claude Code's system prompt, per task session started. */
+  guidance(): string[] {
+    return readLines(this.guidanceLog)
+      .map((line) => JSON.parse(line) as string)
+      .filter(Boolean);
   }
 
   /** Arguments and working directory of each scripted Claude Code process. */
