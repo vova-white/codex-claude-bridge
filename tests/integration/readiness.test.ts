@@ -158,13 +158,19 @@ describe("readiness", () => {
           },
           tracker: {
             type: "http",
-            url: "https://tracker.invalid/mcp",
+            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
             headers: { Authorization: "Bearer hdr-secret-123" },
           },
         },
       },
       scenario: {
-        mcpStatus: { tracker: { status: "failed", error: "401 for Bearer hdr-secret-123" } },
+        mcpStatus: {
+          tracker: {
+            status: "failed",
+            error:
+              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
+          },
+        },
         settingsMcpServers: [{ name: "docs", status: "connected", scope: "user" }],
       },
     });
@@ -179,7 +185,12 @@ describe("readiness", () => {
     ]);
     expect(report.integrations.codexTools).toMatchObject({ inherited: false });
     expect(problemCodes(report)).toContain("integration_unavailable");
-    for (const secret of ["ghp_TOPSECRETVALUE", "hdr-secret-123"]) {
+    for (const secret of [
+      "ghp_TOPSECRETVALUE",
+      "hdr-secret-123",
+      "url-password-1",
+      "url-token-456",
+    ]) {
       expect(JSON.stringify(report)).not.toContain(secret);
       expect(fixture.serviceLog()).not.toContain(secret);
     }

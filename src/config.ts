@@ -49,10 +49,31 @@ export function loadConfig(path: string): BridgeConfig {
   return parsed.data;
 }
 
-/** Values that must never appear in results or diagnostics. */
+/**
+ * Values that must never appear in results or diagnostics: everything an MCP
+ * server entry may carry credentials in except its command.
+ */
 export function configSecrets(config: BridgeConfig): string[] {
   return Object.values(config.mcpServers).flatMap((server) => [
     ...Object.values(server.env ?? {}),
     ...Object.values(server.headers ?? {}),
+    ...(server.args ?? []),
+    ...urlSecrets(server.url),
   ]);
+}
+
+function urlSecrets(url: string | undefined): string[] {
+  if (!url) return [];
+  try {
+    const parsed = new URL(url);
+    return [
+      parsed.username,
+      parsed.password,
+      decodeURIComponent(parsed.password),
+      ...parsed.searchParams.values(),
+      ...[...parsed.searchParams.values()].map((value) => encodeURIComponent(value)),
+    ].filter(Boolean);
+  } catch {
+    return [url];
+  }
 }

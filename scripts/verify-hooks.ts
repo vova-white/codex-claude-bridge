@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 const root = process.cwd();
 const fixture = mkdtempSync(join(tmpdir(), "bridge-hooks-"));
@@ -170,7 +171,11 @@ try {
   const sourceCommit = commit();
   assert.equal(sourceCommit.status, 0, sourceCommit.stdout + sourceCommit.stderr);
   assert.match(sourceCommit.stdout + sourceCommit.stderr, /test related --run/);
-  assert.match(sourceCommit.stdout + sourceCommit.stderr, /Test Files +1 passed/);
+  // CI forces colored output, which puts escape codes between the words.
+  assert.match(
+    stripVTControlCharacters(sourceCommit.stdout + sourceCommit.stderr),
+    /Test Files +1 passed/,
+  );
   assert.match(sourceCommit.stdout + sourceCommit.stderr, /tsc --noEmit/);
   assert.doesNotMatch(
     sourceCommit.stdout + sourceCommit.stderr,
