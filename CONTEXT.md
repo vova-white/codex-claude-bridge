@@ -35,6 +35,9 @@ A child agent assigned to change project files as part of its delegated task.
 **Nested agent**:
 An agent engaged by a child agent to carry out part of its delegated task. The child agent remains accountable for incorporating that agent's work into its task result.
 
+**Pending request**:
+A question or a request for permission that a child agent is waiting on the parent agent to answer during an execution. It can be answered only while that execution runs; afterwards it is expired.
+
 **Bridge service**:
 The local background process that owns delegated work, its persisted state, and the Claude Code processes. MCP entry points connect to it and may come and go without affecting it.
 _Avoid_: Daemon, server

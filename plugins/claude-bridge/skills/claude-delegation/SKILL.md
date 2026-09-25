@@ -9,7 +9,7 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude cannot edit files, publish changes, receive answers to questions mid-task, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, answer Claude's questions and permission requests while it waits, send follow-ups to Claude's session, and cancel work. Claude cannot edit files, publish changes, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
@@ -39,6 +39,24 @@ If the follow-up fails with `reason: session_unavailable`, Claude Code can no lo
 
 `cancel_task` stops obsolete work: queued follow-ups are cancelled at once, and the running execution is stopped by ending Claude Code. `cancellation: confirmed` means Claude Code has exited; `requested` means termination is not confirmed yet, so check again with `task_status`. An execution that finished before the cancellation took effect keeps its result. Repeating the call is harmless. Cancellation stops Claude; it does not undo changes Claude already made. You can send a new follow-up to the session after cancelling.
 
+## Questions and permission requests
+
+Claude works autonomously with the tools the task profile grants; using them needs no approval from you. It stops to wait only for two things:
+
+- a **question** (`kind: question`), when it needs a decision it cannot reasonably make itself;
+- a **permission request** (`kind: permission`) before calling a tool of an MCP server configured in the bridge's `config.json`, unless that server sets `autoApprove: true`.
+
+While Claude waits, the execution stays `running` with `reason: needs_input` and `detail.requestId`, and `wait_task` returns. `task_status` lists the task's `requests`: the `question` (questions with their options) or the `action` (the tool, its MCP server, and its input), the `state` (`pending`, `answered`, `expired`), `live`, and for a live request the `responseShape` to use. Answer with `respond_to_request`:
+
+- a question: `{ "answers": { "<question text>": "<option label or your own answer>" } }`, one answer per question, several labels comma-separated for a multi-select question;
+- a permission request: `{ "decision": "allow" }`, or `{ "decision": "deny", "message": "why" }`.
+
+Claude continues as soon as the response arrives; wait for the same execution again. A lost response is safe to retry: repeating the same response returns the recorded outcome (`repeated: true`) and never applies it twice. A different response to an answered request fails.
+
+A tool being available to Claude is not authority to use it. Answer or approve on your own only what the user's instructions already cover: a question about the assignment you can settle from its brief and context, or an action the user asked for. When a request needs a decision the user has not made, such as a tool call with effects outside the assignment, ask the user and relay their answer. Deny with a `message` rather than leaving Claude waiting when the action is not wanted; Claude then continues without it.
+
+A request is answerable only while `live` is true. When the Claude session that asked ends (completion, failure, cancellation, or a bridge service restart), its pending requests become `expired` and cannot be answered. Send a follow-up with the answer instead. Cancelling a task with a pending request stops Claude and expires the request.
+
 ## Reading progress
 
 Read progress only when it helps you decide something, such as whether a long task is on track. `read_output` returns the execution's events after a cursor: status changes, Claude's messages, the tools it called with their inputs, and the final summary. Keep reads small: start with the default `limit` and `maxChars`, pass the returned `nextCursor` as `after` to continue (cursors stay valid after reconnecting), and stop when `hasMore` is false. An event cut to fit `maxChars` is marked `truncated`; read just that event in full with `after` set to its `seq` minus 1, `limit: 1`, and a larger `maxChars`. `lastEventSeq` from `wait_task` tells you whether anything new arrived. Only the newest events of long executions are kept (`retention` says how many were dropped); results are never affected.
@@ -47,7 +65,7 @@ Claude runs with the edit tools disabled and without nested agents, but shell co
 
 ## Reading status and results
 
-- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own.
+- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own. `reason: needs_input` means Claude waits for your response to `detail.requestId` (see above); the task does not continue until you answer, deny, or cancel.
 - `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
 - `failed`: `reason` is `authentication` (not a verified subscription login, detected before the brief is sent, or an authentication error from Claude Code), `subscription_limit`, `invalid_request` (for example an unavailable model), `session_unavailable` (a follow-up whose session cannot be resumed), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
 - `cancelled`: stopped by `cancel_task`; `detail.processExited` confirms Claude Code exited.
@@ -79,6 +97,6 @@ When readiness fails, report the problems and their actions to the user instead 
 
 - `claudeExecutable`: absolute path to Claude Code when `claude` is not on the service `PATH`.
 - `claudeConfigDir`: a separate Claude Code configuration directory (sets `CLAUDE_CONFIG_DIR`).
-- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. Readiness reports each configured server by name and status only, never its configuration or its error text; the user can see a connection error by running `claude` in a terminal and inspecting `/mcp`.
+- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. Readiness reports each configured server by name and status only, never its configuration or its error text; the user can see a connection error by running `claude` in a terminal and inspecting `/mcp`. Each call to their tools waits for your approval unless the server entry sets `"autoApprove": true`.
 
 The service reads the file on every check, so edits apply without a restart.

@@ -2,7 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
+import {
+  reportedResult,
+  runExecution,
+  type ExecutionOutcome,
+  type PendingRequest,
+  type RequestResponse,
+} from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { errorOrigin, redactContent } from "../redact.ts";
@@ -134,6 +140,30 @@ export const resultSchema = z.object({
 });
 const projectLookup = z.object({ project: z.string().min(1) });
 
+/** Arguments of respond_to_request. */
+export const respondSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  requestId: z.string().min(1).describe("Request identifier from task_status."),
+  response: z
+    .union([
+      z.strictObject({
+        decision: z.enum(["allow", "deny"]),
+        message: z.string().min(1).optional().describe("Why; Claude sees it with a denial."),
+      }),
+      z.strictObject({
+        answers: z
+          .record(z.string(), z.string().min(1))
+          .describe("An answer for each question, keyed by the question text."),
+      }),
+    ])
+    .describe(
+      "For a permission request { decision, message? }; for a question { answers }. The request's responseShape shows the expected form.",
+    ),
+});
+
+const expiredNote = "The Claude session that asked is no longer running; send a follow-up instead.";
+
 /** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
 const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit", "Agent"];
 
@@ -147,6 +177,21 @@ interface TaskRow {
   request: string;
   session_id: string | null;
   created_at: string;
+}
+
+interface RequestRow {
+  id: string;
+  task_id: string;
+  execution_id: string;
+  session_id: string | null;
+  tool_name: string;
+  kind: "question" | "permission";
+  payload: string;
+  response_shape: string;
+  state: "pending" | "answered" | "expired";
+  response: string | null;
+  created_at: string;
+  resolved_at: string | null;
 }
 
 interface ExecutionRow {
@@ -173,7 +218,7 @@ interface ExecutionRow {
 const cancelConfirmationMs = 20_000;
 const terminalStatuses = ["completed", "failed", "cancelled", "interrupted"];
 /** Reasons a running execution cannot progress on its own; entering one ends a wait. */
-const blockedReasons = new Set(["waiting_for_capacity"]);
+const blockedReasons = new Set(["waiting_for_capacity", "needs_input"]);
 
 function parse<T>(schema: z.ZodType<T>, params: unknown): T {
   const parsed = schema.safeParse(params ?? {});
@@ -200,7 +245,7 @@ This task uses the read-only profile on a shared checkout at ${root}. Do not cre
 
 Nested agents are not available in this task: do all of the work yourself.
 
-No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+Work without asking whenever you can: make reasonable assumptions, state them, and list anything unresolved as remaining work. When a decision genuinely needs the user or the parent, ask with AskUserQuestion; the parent answers while you wait. Some MCP tools need the parent's approval before each call; if a call is denied, continue without it and report what you could not do.
 
 Finish with the structured result: summary (the answer or outcome), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), and remainingWork (what is left for the parent).`;
 }
@@ -224,6 +269,8 @@ export class TaskService {
   >();
   /** Tasks whose next queued execution is about to start. */
   private readonly launching = new Set<string>();
+  /** Requests Claude is waiting on in this process, with the means to answer them. */
+  private readonly live = new Map<string, (response: RequestResponse | undefined) => void>();
 
   constructor(
     db: DatabaseSync,
@@ -262,6 +309,10 @@ export class TaskService {
     if (unfinished.length > 0) {
       this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
     }
+    const pending = this.db.prepare("SELECT id FROM requests WHERE state = 'pending'").all() as {
+      id: string;
+    }[];
+    for (const { id } of pending) this.expire(id);
   }
 
   async start(caller: string, params: unknown) {
@@ -359,6 +410,9 @@ export class TaskService {
       .all(task.id) as unknown as ExecutionRow[];
     const latest = executions.at(-1)!;
     const intent = JSON.parse(task.request) as Omit<StartRequest, "project" | "requestKey">;
+    const requests = this.db
+      .prepare("SELECT * FROM requests WHERE task_id = ? ORDER BY created_at, rowid")
+      .all(task.id) as unknown as RequestRow[];
     return {
       taskId: task.id,
       project: task.project,
@@ -374,7 +428,56 @@ export class TaskService {
         ...(execution.started_at ? { startedAt: execution.started_at } : {}),
         ...(execution.ended_at ? { endedAt: execution.ended_at } : {}),
       })),
+      requests: requests.map((request) => this.requestView(request)),
     };
+  }
+
+  /**
+   * Answers a request Claude is waiting on. The response reaches Claude once:
+   * repeating it returns the recorded outcome, and a different response to an
+   * answered request fails. A request whose execution has ended cannot be answered.
+   */
+  async respond(caller: string, params: unknown) {
+    const { project, taskId, requestId, response } = parse(respondSchema, params);
+    const task = await this.task(caller, project, taskId);
+    const request = this.db
+      .prepare("SELECT * FROM requests WHERE id = ? AND task_id = ?")
+      .get(requestId, task.id) as RequestRow | undefined;
+    if (!request) {
+      throw new ServiceError("not_found", `Task ${task.id} has no request ${requestId}.`);
+    }
+    if (request.state === "answered") {
+      if (request.response !== JSON.stringify(this.checkResponse(request, response))) {
+        throw new ServiceError(
+          "request_already_answered",
+          `Request ${requestId} was already answered with ${request.response}; a different response cannot replace it.`,
+        );
+      }
+      return { taskId: task.id, ...this.requestView(request), repeated: true };
+    }
+    const resolve = this.live.get(requestId);
+    if (!resolve) {
+      this.expire(requestId);
+      throw new ServiceError("request_expired", `Request ${requestId} has expired: ${expiredNote}`);
+    }
+    const answer = this.checkResponse(request, response);
+    this.db
+      .prepare(
+        "UPDATE requests SET state = 'answered', response = ?, resolved_at = ? WHERE id = ? AND state = 'pending'",
+      )
+      .run(JSON.stringify(answer), now(), requestId);
+    this.live.delete(requestId);
+    this.record(
+      request.execution_id,
+      "status",
+      `Request ${requestId} answered${"decision" in answer ? ` (${answer.decision})` : ""}.`,
+    );
+    this.showPendingRequest(request.execution_id);
+    resolve(answer);
+    const answered = this.db
+      .prepare("SELECT * FROM requests WHERE id = ?")
+      .get(requestId) as unknown as RequestRow;
+    return { taskId: task.id, ...this.requestView(answered), repeated: false };
   }
 
   /**
@@ -557,7 +660,11 @@ export class TaskService {
     const deadline = Date.now() + timeoutSeconds * 1000;
     for (;;) {
       const current = this.executionById(task.id, pinned.id);
-      const blocked = current.reason !== initialReason && blockedReasons.has(current.reason ?? "");
+      // A pending request needs the caller's answer, so it ends a wait at once;
+      // a capacity wait ends a wait only when it begins.
+      const blocked =
+        current.reason === "needs_input" ||
+        (current.reason !== initialReason && blockedReasons.has(current.reason ?? ""));
       const remaining = deadline - Date.now();
       if (terminalStatuses.includes(current.status) || blocked || remaining <= 0) {
         return {
@@ -632,6 +739,160 @@ export class TaskService {
           }
         : {}),
     };
+  }
+
+  /** Checks that a response fits the request and returns it in the form it is recorded in. */
+  private checkResponse(request: RequestRow, response: z.infer<typeof respondSchema>["response"]) {
+    if (request.kind === "permission") {
+      if (!("decision" in response)) {
+        throw new ServiceError(
+          "invalid_arguments",
+          `Request ${request.id} asks for permission; respond with { decision: "allow" | "deny", message? }.`,
+        );
+      }
+      return {
+        decision: response.decision,
+        ...(response.message ? { message: response.message } : {}),
+      };
+    }
+    const asked = Object.keys(
+      (JSON.parse(request.response_shape) as { answers: Record<string, string> }).answers,
+    );
+    if (
+      !("answers" in response) ||
+      Object.keys(response.answers).length !== asked.length ||
+      !asked.every((question) => question in response.answers)
+    ) {
+      throw new ServiceError(
+        "invalid_arguments",
+        `Request ${request.id} asks questions; respond with { answers } holding one answer for each of: ${asked.map((question) => JSON.stringify(question)).join(", ")}.`,
+      );
+    }
+    return {
+      answers: Object.fromEntries(asked.map((question) => [question, response.answers[question]!])),
+    };
+  }
+
+  /** A request as status shows it; only a live request can be answered. */
+  private requestView(request: RequestRow) {
+    const live = request.state === "pending" && this.live.has(request.id);
+    return {
+      requestId: request.id,
+      executionId: request.execution_id,
+      ...(request.session_id ? { sessionId: request.session_id } : {}),
+      kind: request.kind,
+      toolName: request.tool_name,
+      state: request.state,
+      live,
+      [request.kind === "question" ? "question" : "action"]: JSON.parse(request.payload),
+      ...(live ? { responseShape: JSON.parse(request.response_shape) } : {}),
+      ...(request.response ? { response: JSON.parse(request.response) } : {}),
+      createdAt: request.created_at,
+      ...(request.resolved_at ? { resolvedAt: request.resolved_at } : {}),
+      ...(request.state === "expired" ? { note: expiredNote } : {}),
+    };
+  }
+
+  /**
+   * Records what Claude asks the parent and waits for the answer. The request
+   * stays live until it is answered or `signal` ends it, which expires it.
+   */
+  private raise(
+    executionId: string,
+    request: PendingRequest,
+    signal: AbortSignal,
+    secrets: readonly string[],
+  ): Promise<RequestResponse | undefined> {
+    const clean = (value: unknown) => redactStrings(value, (text) => redactContent(text, secrets));
+    const { kind, toolName, sessionId, ...content } = request;
+    const payload = clean(kind === "question" ? content : { toolName, ...content });
+    const questions =
+      kind === "question"
+        ? ((payload as { questions?: { question?: unknown }[] }).questions ?? [])
+            .map((item) => item.question)
+            .filter((text) => typeof text === "string")
+        : [];
+    const responseShape =
+      kind === "question"
+        ? {
+            answers: Object.fromEntries(
+              questions.map((text) => [
+                text,
+                "an option label (several comma-separated when multiSelect) or your own answer",
+              ]),
+            ),
+          }
+        : { decision: "allow | deny", message: "optional: why, shown to Claude" };
+    const id = `req_${randomUUID()}`;
+    this.db
+      .prepare(
+        `INSERT INTO requests (id, task_id, execution_id, session_id, tool_name, kind, payload, response_shape, state, created_at)
+         VALUES (?, (SELECT task_id FROM executions WHERE id = ?), ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        id,
+        executionId,
+        executionId,
+        sessionId ?? null,
+        toolName,
+        kind,
+        JSON.stringify(payload),
+        JSON.stringify(responseShape),
+        now(),
+      );
+    return new Promise((resolve) => {
+      this.live.set(id, resolve);
+      this.record(
+        executionId,
+        "status",
+        kind === "question"
+          ? `Needs input: request ${id} asks ${questions.join(" ")}`
+          : `Needs input: request ${id} asks to call ${toolName}.`,
+      );
+      this.showPendingRequest(executionId);
+      if (signal.aborted) this.expire(id);
+      else signal.addEventListener("abort", () => this.expire(id), { once: true });
+    });
+  }
+
+  /** Ends an unanswered request; Claude, if still waiting, is told no one answered. */
+  private expire(requestId: string): void {
+    const request = this.db
+      .prepare("SELECT execution_id FROM requests WHERE id = ?")
+      .get(requestId) as { execution_id: string } | undefined;
+    const expired =
+      this.db
+        .prepare(
+          "UPDATE requests SET state = 'expired', resolved_at = ? WHERE id = ? AND state = 'pending'",
+        )
+        .run(now(), requestId).changes > 0;
+    const resolve = this.live.get(requestId);
+    this.live.delete(requestId);
+    if (expired && request) {
+      this.record(request.execution_id, "status", `Request ${requestId} expired unanswered.`);
+      this.showPendingRequest(request.execution_id);
+    }
+    resolve?.(undefined);
+  }
+
+  /** Keeps a running execution's needs_input state in line with its oldest pending request. */
+  private showPendingRequest(executionId: string): void {
+    const oldest = this.db
+      .prepare(
+        "SELECT id FROM requests WHERE execution_id = ? AND state = 'pending' ORDER BY created_at, rowid LIMIT 1",
+      )
+      .get(executionId) as { id: string } | undefined;
+    const current = this.db
+      .prepare("SELECT reason, detail FROM executions WHERE id = ?")
+      .get(executionId) as { reason: string | null; detail: string | null };
+    if (oldest) {
+      const detail = JSON.stringify({ requestId: oldest.id });
+      if (current.reason !== "needs_input" || current.detail !== detail) {
+        this.update(executionId, { reason: "needs_input", detail });
+      }
+    } else if (current.reason === "needs_input") {
+      this.update(executionId, { reason: null, detail: null });
+    }
   }
 
   private async projectRoot(path: string): Promise<string> {
@@ -818,6 +1079,9 @@ export class TaskService {
           signal,
           guidance: readOnlyGuidance(root),
           disallowedTools: readOnlyDisallowedTools,
+          approvalServers: Object.entries(config.mcpServers)
+            .filter(([, server]) => !server.autoApprove)
+            .map(([name]) => name),
           ...(request.model ? { model: request.model } : {}),
           ...(request.effort ? { effort: request.effort } : {}),
           secrets,
@@ -862,6 +1126,8 @@ export class TaskService {
               "tool",
               `${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
             ),
+          request: (pending, requestSignal) =>
+            this.raise(executionId, pending, requestSignal, secrets),
         },
       );
     }

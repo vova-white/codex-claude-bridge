@@ -45,6 +45,22 @@ const migrations: string[] = [
   ALTER TABLE executions ADD COLUMN request_hash TEXT;
   CREATE UNIQUE INDEX executions_by_request_key ON executions (task_id, request_key)
     WHERE request_key IS NOT NULL`,
+  `CREATE TABLE requests (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks (id),
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    session_id TEXT,
+    tool_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    response_shape TEXT NOT NULL,
+    state TEXT NOT NULL,
+    response TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+  );
+  CREATE INDEX requests_by_task ON requests (task_id, created_at);
+  CREATE INDEX requests_by_execution ON requests (execution_id, state)`,
 ];
 
 export class StoreLockedError extends Error {}

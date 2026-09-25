@@ -1,5 +1,7 @@
 import {
   query,
+  type CanUseTool,
+  type PermissionResult,
   type SDKAssistantMessageError,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -27,6 +29,11 @@ export interface ExecutionRequest {
   /** Appended to Claude Code's system prompt: the task profile and reporting contract. */
   guidance: string;
   disallowedTools: string[];
+  /**
+   * MCP servers whose tool calls need the parent agent's approval. Every other
+   * tool the task allows runs without asking.
+   */
+  approvalServers: readonly string[];
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** Session to continue; the prompt is sent only if Claude Code can resume it. */
@@ -44,7 +51,30 @@ export interface ExecutionObserver {
   message(text: string): void;
   /** A tool Claude calls, with its input as Claude sent it. */
   toolCall(name: string, input: unknown): void;
+  /**
+   * Claude waits for the parent agent: an answer to its question or a decision
+   * on a tool call. Resolves with the parent's response, or with undefined if
+   * the request ended unanswered. `signal` aborts once no response can reach
+   * Claude any more: Claude Code withdrew the request or the execution ended.
+   */
+  request(request: PendingRequest, signal: AbortSignal): Promise<RequestResponse | undefined>;
 }
+
+/** What Claude asks the parent agent for, with Claude's own request content. */
+export type PendingRequest = { toolName: string; sessionId?: string } & (
+  | { kind: "question"; questions: unknown }
+  | {
+      kind: "permission";
+      mcpServer: string;
+      input: Record<string, unknown>;
+      title?: string;
+      description?: string;
+    }
+);
+
+export type RequestResponse =
+  | { answers: Record<string, string> }
+  | { decision: "allow" | "deny"; message?: string };
 
 type TurnOutcome =
   | { status: "completed"; text: string; structured?: unknown }
@@ -119,6 +149,36 @@ class Input implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+/**
+ * The MCP server of a tool call. Claude Code names the server when it asks;
+ * older versions only encode it in the tool name as `mcp__<server>__<tool>`,
+ * with characters outside [A-Za-z0-9_-] replaced by underscores.
+ */
+function mcpServerOf(
+  tool: string,
+  options: { mcpServer?: { name: string } },
+  servers: readonly string[],
+): string | undefined {
+  if (options.mcpServer) return options.mcpServer.name;
+  return servers.find((name) => tool.startsWith(`mcp__${name.replace(/[^A-Za-z0-9_-]/g, "_")}__`));
+}
+
+/** Turns the parent agent's response into Claude Code's permission decision. */
+function permissionResult(
+  input: Record<string, unknown>,
+  response: RequestResponse | undefined,
+): PermissionResult {
+  if (!response) {
+    return { behavior: "deny", message: "No one answered this request before the task ended." };
+  }
+  if ("answers" in response) {
+    return { behavior: "allow", updatedInput: { ...input, answers: response.answers } };
+  }
+  return response.decision === "allow"
+    ? { behavior: "allow", updatedInput: input }
+    : { behavior: "deny", message: response.message ?? "The parent agent denied this tool call." };
+}
+
 /** Whether `event` settles within `ms`. */
 function within(event: Promise<void>, ms: number): Promise<boolean> {
   return Promise.race([
@@ -153,6 +213,33 @@ export async function runExecution(
   request.signal.addEventListener("abort", cancel, { once: true });
   let child: ChildProcess | undefined;
   let exited: Promise<void> = Promise.resolve();
+  let sessionId = request.resume;
+  // Ends the parent's open requests once the execution is over.
+  const ended = new AbortController();
+  const canUseTool: CanUseTool = async (tool, toolInput, options) => {
+    const server = mcpServerOf(tool, options, request.approvalServers);
+    const identity = { toolName: tool, ...(sessionId ? { sessionId } : {}) };
+    let pending: PendingRequest;
+    if (tool === "AskUserQuestion") {
+      pending = { ...identity, kind: "question", questions: toolInput.questions };
+    } else if (server !== undefined && request.approvalServers.includes(server)) {
+      pending = {
+        ...identity,
+        kind: "permission",
+        mcpServer: server,
+        input: toolInput,
+        ...(options.title ? { title: options.title } : {}),
+        ...(options.description ? { description: options.description } : {}),
+      };
+    } else {
+      return { behavior: "allow", updatedInput: toolInput };
+    }
+    const response = await observer.request(
+      pending,
+      AbortSignal.any([options.signal, ended.signal]),
+    );
+    return permissionResult(toolInput, response);
+  };
   const failed = (reason: FailureReason, message: string, extra: object = {}): TurnOutcome => ({
     status: "failed",
     reason,
@@ -195,14 +282,7 @@ export async function runExecution(
       ...(request.resume ? { resume: request.resume } : {}),
       permissionMode: "default",
       disallowedTools: request.disallowedTools,
-      canUseTool: async (tool, toolInput) =>
-        tool === "AskUserQuestion"
-          ? {
-              behavior: "deny",
-              message:
-                "No one can answer questions during this task. Make a reasonable assumption, state it, and list open questions as remaining work.",
-            }
-          : { behavior: "allow", updatedInput: toolInput },
+      canUseTool,
       outputFormat: { type: "json_schema", schema: resultSchema },
       systemPrompt: { type: "preset", preset: "claude_code", append: request.guidance },
     },
@@ -252,6 +332,7 @@ export async function runExecution(
       let resetsAt: number | undefined;
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init") {
+          sessionId = message.session_id;
           observer.session(message.session_id);
         } else if (message.type === "rate_limit_event") {
           const info = message.rate_limit_info;
@@ -309,6 +390,7 @@ export async function runExecution(
     }
   };
   const outcome = await turn();
+  ended.abort();
   const processExited = await shutdown();
   abort.abort();
   return { ...outcome, processExited };
