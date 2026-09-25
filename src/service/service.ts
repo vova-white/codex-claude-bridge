@@ -23,6 +23,7 @@ export const operations = [
   "read_output",
   "send_followup",
   "cancel_task",
+  "respond_to_request",
   "cleanup_task",
 ];
 
@@ -106,6 +107,7 @@ async function start(
       read_output: (params, { caller }) => tasks.readOutput(caller, params),
       send_followup: (params, { caller }) => tasks.followUp(caller, params),
       cancel_task: (params, { caller }) => tasks.cancel(caller, params),
+      respond_to_request: (params, { caller }) => tasks.respond(caller, params),
       cleanup_task: (params, { caller }) => tasks.cleanup(caller, params),
     },
     (error) => log(`request failed: ${errorOrigin(error)}`),
