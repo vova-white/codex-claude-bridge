@@ -124,7 +124,10 @@ export function openStore(path: string): DatabaseSync {
     }
     throw error;
   }
-  db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  // NORMAL syncs at WAL checkpoints rather than on every commit: a crash of the
+  // service loses nothing, and an OS crash or power loss can drop only the last
+  // commits, when the Claude Code processes they describe end too.
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
   const version = (db.prepare("PRAGMA user_version").get() as { user_version: number })
     .user_version;
   for (const [index, migration] of migrations.entries()) {
