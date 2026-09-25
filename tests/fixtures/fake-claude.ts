@@ -2,6 +2,7 @@
 // Deterministic stand-in for the Claude Code executable. It speaks the
 // stream-json control protocol used by the Claude Agent SDK and follows the
 // scenario file named by FAKE_CLAUDE_SCENARIO. It never contacts a model.
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -17,6 +18,8 @@ export type Step =
   | { waitFor: string }
   /** Writes a file relative to the working directory, as a shell command could. */
   | { writeFile: { path: string; content: string } }
+  /** Runs a command in the working directory, as the Bash tool could. */
+  | { exec: string[] }
   | {
       result: {
         text?: string;
@@ -178,6 +181,9 @@ async function answer(prompt: string): Promise<void> {
       await waitForFile(resolve(scenarioDir, step.waitFor));
     } else if ("writeFile" in step) {
       writeFileSync(resolve(process.cwd(), step.writeFile.path), step.writeFile.content);
+    } else if ("exec" in step) {
+      const [command = "true", ...commandArgs] = step.exec;
+      execFileSync(command, commandArgs, { cwd: process.cwd() });
     } else if ("result" in step) {
       const { text = "", structured, isError = false, subtype = "success", errors } = step.result;
       send({

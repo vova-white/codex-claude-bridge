@@ -29,7 +29,7 @@ Delegate a focused investigation or review that Claude can complete from the rep
 4. Check progress with `task_status` or `list_tasks` when you need the result, not in a tight loop. `list_tasks` also finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed.
 
-Claude runs with the edit tools disabled and without nested agents, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`.
+Claude runs with the edit tools disabled and without nested agents, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`.
 
 ## Reading status and results
 

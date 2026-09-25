@@ -1,3 +1,6 @@
+import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Step } from "../fixtures/fake-claude.ts";
 import {
@@ -198,7 +201,10 @@ describe("read-only delegated tasks", () => {
   it("keeps configured credentials out of task results", async () => {
     const fixture = bridge({
       config: {
-        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-RESULTSECRET" } } },
+        mcpServers: {
+          github: { command: "github-mcp", env: { TOKEN: "tok-RESULTSECRET" } },
+          tracker: { type: "http", url: "https://tracker.invalid/mcp?key=url%2fRESULT%20KEY" },
+        },
       },
       scenario: {
         turns: [
@@ -208,7 +214,10 @@ describe("read-only delegated tasks", () => {
                 result: {
                   structured: {
                     summary: "The token is tok-RESULTSECRET; see https://docs.invalid/a?page=2.",
-                    evidence: ["env TOKEN=tok-RESULTSECRET"],
+                    evidence: [
+                      "env TOKEN=tok-RESULTSECRET",
+                      "called https://tracker.invalid/mcp?key=url%2FRESULT+KEY&page=2",
+                    ],
                     failures: [],
                     remainingWork: [],
                   },
@@ -228,7 +237,38 @@ describe("read-only delegated tasks", () => {
     expect(result.data.result.summary).toBe(
       "The token is [REDACTED]; see https://docs.invalid/a?page=2.",
     );
-    expect(result.text).not.toContain("RESULTSECRET");
+    expect(result.data.result.evidence[1]).toBe(
+      "called https://tracker.invalid/mcp?key=[REDACTED]&page=2",
+    );
+    expect(result.text).not.toMatch(/RESULTSECRET|RESULT\+KEY/);
+  });
+
+  it("reports a staged change even when the working file is restored", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { writeFile: { path: "README.md", content: "staged by the task\n" } },
+              { exec: ["git", "add", "README.md"] },
+              { writeFile: { path: "README.md", content: "working copy\n" } },
+              finished("Done."),
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    // The parent already has a staged and a different unstaged version.
+    writeFileSync(join(project, "README.md"), "staged by the parent\n");
+    execFileSync("git", ["add", "README.md"], { cwd: project });
+    writeFileSync(join(project, "README.md"), "working copy\n");
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+    await statusWhen(client, project, taskId, terminal);
+
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    expect(result.workspace.modifiedFiles).toEqual(["README.md"]);
   });
 
   it("reports checkout changes when the execution fails", async () => {

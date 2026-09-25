@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import { safeDecode } from "./redact.ts";
 
 const mcpServer = z.looseObject({
   type: z.enum(["stdio", "http", "sse"]).optional(),
@@ -84,12 +85,4 @@ function urlSecrets(url: string | undefined): string[] {
   ]
     .flatMap((value) => [value, encodeURIComponent(value)])
     .filter(Boolean);
-}
-
-function safeDecode(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
 }

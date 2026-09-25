@@ -11,15 +11,30 @@ import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
 
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Arguments of start_task, shared by the MCP tool definition and the service. */
 export const startSchema = z.object({
-  project: z.string().min(1),
-  requestKey: z.string().min(1).max(200),
-  assignment: z.string().min(1),
-  context: z.string().optional(),
-  expectedResult: z.string().min(1),
-  model: z.string().min(1).optional(),
-  effort: z.enum(effortLevels).optional(),
-  mode: z.enum(["read-only"]).default("read-only"),
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  requestKey: z
+    .string()
+    .min(1)
+    .max(200)
+    .describe("Caller-chosen key that identifies this request; reuse it to retry safely."),
+  assignment: z.string().min(1).describe("The focused brief for Claude."),
+  context: z
+    .string()
+    .optional()
+    .describe("Relevant material Claude needs; nothing else is shared."),
+  expectedResult: z.string().min(1).describe("What Claude should deliver."),
+  model: z
+    .string()
+    .min(1)
+    .optional()
+    .describe("A model value from readiness; defaults to Claude Code's default model."),
+  effort: z.enum(effortLevels).optional().describe("Reasoning effort the model supports."),
+  mode: z
+    .enum(["read-only"])
+    .default("read-only")
+    .describe("Task profile. Only read-only work on the shared checkout is supported."),
 });
 export type StartRequest = z.infer<typeof startSchema>;
 

@@ -36,10 +36,54 @@ export function redact(text: string, secrets: readonly string[] = []): string {
   return replace(text, secrets, diagnosticPatterns);
 }
 
+export function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Decodes a URL query component the way form parsers do. */
+function queryDecode(value: string): string {
+  return safeDecode(value.replaceAll("+", " "));
+}
+
+/**
+ * Masks the credential parts of one URL: user info with a password or a known
+ * secret, and query values equal to a known secret in any encoding. Other
+ * parameters and the rest of the link stay readable.
+ */
+function maskUrlCredentials(url: string, secrets: Set<string>): string {
+  const masked = url.replace(
+    /^([a-z][\w+.-]*:\/\/)([^/?#]*)@/i,
+    (whole, scheme: string, info: string) =>
+      info.includes(":") || secrets.has(queryDecode(info)) ? `${scheme}[REDACTED]@` : whole,
+  );
+  const question = masked.indexOf("?");
+  if (question < 0) return masked;
+  const fragment = masked.indexOf("#", question);
+  const end = fragment < 0 ? masked.length : fragment;
+  const query = masked
+    .slice(question + 1, end)
+    .split("&")
+    .map((pair) => {
+      const equals = pair.indexOf("=");
+      if (equals < 0 || !secrets.has(queryDecode(pair.slice(equals + 1)))) return pair;
+      return `${pair.slice(0, equals + 1)}[REDACTED]`;
+    })
+    .join("&");
+  return `${masked.slice(0, question + 1)}${query}${masked.slice(end)}`;
+}
+
 /**
  * Removes known secret values and credential tokens from content meant for the
- * parent agent, such as task results, while keeping URLs and prose intact.
+ * parent agent, such as task results, while keeping URLs and prose readable.
  */
 export function redactContent(text: string, secrets: readonly string[] = []): string {
-  return replace(text, secrets, credentialPatterns);
+  const decoded = new Set(secrets.filter((secret) => secret.length >= 4).map(queryDecode));
+  const withUrls = text.replace(/\b[a-z][\w+.-]*:\/\/[^\s"'<>]+/gi, (url) =>
+    maskUrlCredentials(url, decoded),
+  );
+  return replace(withUrls, secrets, credentialPatterns);
 }

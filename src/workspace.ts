@@ -8,7 +8,9 @@ const run = promisify(execFile);
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const { stdout } = await run("git", ["-C", cwd, ...args], {
     timeout: 30_000,
-    maxBuffer: 16 * 1024 * 1024,
+    maxBuffer: 64 * 1024 * 1024,
+    // Inspection must not rewrite the index as a side effect.
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
   });
   return stdout;
 }
@@ -26,18 +28,23 @@ export async function repositoryRoot(path: string): Promise<string | undefined> 
 export async function checkoutState(root: string): Promise<Map<string, string>> {
   const state = new Map<string, string>();
   state.set("HEAD", (await git(root, "rev-parse", "HEAD").catch(() => "")).trim());
+  // Every staged blob, so a staged edit counts even when the working file is restored.
+  for (const entry of (await git(root, "ls-files", "--stage", "-z")).split("\0")) {
+    const tab = entry.indexOf("\t");
+    if (tab > 0) state.set(`index:${entry.slice(tab + 1)}`, entry.slice(0, tab));
+  }
   const status = await git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all");
   const entries = status.split("\0").filter(Boolean);
+  const changed: string[] = [];
   for (let index = 0; index < entries.length; index++) {
     const entry = entries[index]!;
     const code = entry.slice(0, 2);
-    state.set(entry.slice(3), code);
+    const path = entry.slice(3);
+    state.set(`worktree:${path}`, code);
+    if (existsSync(join(root, path))) changed.push(path);
     // Renames and copies are followed by their source path.
     if (code.includes("R") || code.includes("C")) index++;
   }
-  const changed = [...state.keys()].filter(
-    (path) => path !== "HEAD" && existsSync(join(root, path)),
-  );
   if (changed.length > 0) {
     // Content hashes catch further edits to files that were already modified.
     const hashes = await git(root, "hash-object", "--", ...changed).catch(() => "");
@@ -46,14 +53,17 @@ export async function checkoutState(root: string): Promise<Map<string, string>> 
       .split("\n")
       .forEach((hash, index) => {
         const path = changed[index];
-        if (path) state.set(path, `${state.get(path)} ${hash}`);
+        if (path) state.set(`worktree:${path}`, `${state.get(`worktree:${path}`)} ${hash}`);
       });
   }
   return state;
 }
 
-/** Paths whose state differs between two snapshots, including a moved HEAD. */
+/** Paths whose index or working state differs between two snapshots, and HEAD if it moved. */
 export function changedPaths(before: Map<string, string>, after: Map<string, string>): string[] {
-  const paths = new Set([...before.keys(), ...after.keys()]);
-  return [...paths].filter((path) => before.get(path) !== after.get(path)).toSorted();
+  const keys = new Set([...before.keys(), ...after.keys()]);
+  const paths = [...keys]
+    .filter((key) => before.get(key) !== after.get(key))
+    .map((key) => key.replace(/^(index|worktree):/, ""));
+  return [...new Set(paths)].toSorted();
 }

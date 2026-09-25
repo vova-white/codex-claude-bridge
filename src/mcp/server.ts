@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { ServiceConnection } from "../ipc.ts";
 import { connectService } from "../service/launcher.ts";
-import { effortLevels } from "../service/tasks.ts";
+import { startSchema } from "../service/tasks.ts";
 import type { StatePaths } from "../state.ts";
 import metadata from "../../package.json" with { type: "json" };
 
@@ -61,27 +61,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
       title: "Delegate a task to Claude",
       description:
         "Start a read-only delegated task: Claude Code inspects the project's shared checkout and returns a structured result (summary, evidence, failures, remaining work). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here.",
-      inputSchema: {
-        project,
-        requestKey: z
-          .string()
-          .describe("Caller-chosen key that identifies this request; reuse it to retry safely."),
-        assignment: z.string().describe("The focused brief for Claude."),
-        context: z
-          .string()
-          .optional()
-          .describe("Relevant material Claude needs; nothing else is shared."),
-        expectedResult: z.string().describe("What Claude should deliver."),
-        model: z
-          .string()
-          .optional()
-          .describe("A model value from readiness; defaults to Claude Code's default model."),
-        effort: z.enum(effortLevels).optional().describe("Reasoning effort the model supports."),
-        mode: z
-          .enum(["read-only"])
-          .optional()
-          .describe("Task profile. Only read-only work on the shared checkout is supported."),
-      },
+      inputSchema: startSchema.shape,
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
     (args) => call("start_task", args),
