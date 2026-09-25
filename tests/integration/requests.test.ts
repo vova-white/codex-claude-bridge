@@ -175,6 +175,50 @@ describe("child questions", () => {
     expect(status.text).not.toContain(secret);
   });
 
+  it("give questions that look alike after redaction distinct answer keys", async () => {
+    const secrets = { ALPHA: "token-alpha-123", BETA: "token-beta-456" };
+    const { client, project, taskId } = await startTask(
+      [
+        {
+          canUseTool: {
+            name: "AskUserQuestion",
+            input: {
+              questions: [
+                { ...question.questions[0], question: "Revoke token-alpha-123?" },
+                { ...question.questions[0], question: "Revoke token-beta-456?" },
+                // Collides with the key the second question gets.
+                { ...question.questions[0], question: "Revoke [REDACTED]? (question 2)" },
+              ],
+            },
+          },
+        },
+        finished("Done."),
+      ],
+      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: secrets } } } },
+    );
+    const request = await pendingRequest(client, project, taskId);
+    const keys = Object.keys(request.responseShape.answers);
+    expect(keys).toEqual([
+      "Revoke [REDACTED]?",
+      "Revoke [REDACTED]? (question 2)",
+      "Revoke [REDACTED]? (question 2) (question 3)",
+    ]);
+
+    const answered = await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId: request.requestId,
+      response: {
+        answers: Object.fromEntries(keys.map((key, index) => [key, `answer ${index + 1}`])),
+      },
+    });
+    expect(answered.isError, answered.text).toBe(false);
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(await events(client, project, taskId)).toContain(
+      'AskUserQuestion answered ["answer 1","answer 2","answer 3"]',
+    );
+  });
+
   it("can be answered by a new MCP client after the first disconnects", async () => {
     const { fixture, client, project, taskId } = await startTask([
       { canUseTool: { name: "AskUserQuestion", input: question } },

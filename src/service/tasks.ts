@@ -1265,13 +1265,22 @@ function readParts(parts: ResultPart[], start: number, offset: number, budget: n
   return { parts: page };
 }
 
-/** The texts of a question request's questions, as the parent sees them, in the order asked. */
+/**
+ * The keys the parent answers a question request's questions by, in the order
+ * asked: each question's displayed text, with " (question N)" appended while
+ * it equals the key of an earlier question.
+ */
 function questionTexts(payload: unknown): string[] {
   const questions = (payload as { questions?: unknown }).questions;
   if (!Array.isArray(questions)) return [];
-  return questions.map((item: { question?: unknown }, index) =>
-    typeof item.question === "string" ? item.question : `Question ${index + 1}`,
-  );
+  const keys = new Set<string>();
+  return questions.map((item: { question?: unknown }, index) => {
+    // Redaction can make questions look alike; later ones are told apart by position.
+    let key = typeof item.question === "string" ? item.question : `Question ${index + 1}`;
+    while (keys.has(key)) key = `${key} (question ${index + 1})`;
+    keys.add(key);
+    return key;
+  });
 }
 
 function responseHash(response: object): string {
