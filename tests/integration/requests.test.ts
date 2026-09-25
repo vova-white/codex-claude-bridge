@@ -124,17 +124,78 @@ describe("child questions", () => {
     expect(answered.isError, answered.text).toBe(false);
     const done = await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
     expect(done.data.status).toBe("completed");
-    const allowed = (await events(client, project, taskId)).find((text: string) =>
-      text.startsWith("AskUserQuestion allowed"),
-    );
-    expect(JSON.parse(allowed.slice("AskUserQuestion allowed ".length))).toMatchObject({
-      ...question,
-      answers: { "Which branch should I review?": "develop" },
-    });
+    expect(await events(client, project, taskId)).toContain('AskUserQuestion answered ["develop"]');
     const after = (await client.call("task_status", { project, taskId })).data;
     expect(after.requests).toMatchObject([
       { requestId: request.requestId, state: "answered", live: false },
     ]);
+  });
+  it("apply answers to questions whose displayed text is redacted", async () => {
+    const secret = "s3cr3t-token-value";
+    const asked = `Should I send ${secret} to the tracker?`;
+    const { client, project, taskId } = await startTask(
+      [
+        {
+          canUseTool: {
+            name: "AskUserQuestion",
+            input: {
+              questions: [
+                { ...question.questions[0], question: asked },
+                { ...question.questions[0] },
+              ],
+            },
+          },
+        },
+        finished("Done."),
+      ],
+      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: { TOKEN: secret } } } } },
+    );
+    const request = await pendingRequest(client, project, taskId);
+    const shown = "Should I send [REDACTED] to the tracker?";
+    expect(request.question.questions[0].question).toBe(shown);
+    expect(Object.keys(request.responseShape.answers)).toEqual([
+      shown,
+      "Which branch should I review?",
+    ]);
+
+    const answered = await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId: request.requestId,
+      response: {
+        answers: { [shown]: `No, keep ${secret} private`, "Which branch should I review?": "main" },
+      },
+    });
+    expect(answered.data.response.answers[shown]).toBe("No, keep [REDACTED] private");
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(await events(client, project, taskId)).toContain(
+      'AskUserQuestion answered ["No, keep [REDACTED] private","main"]',
+    );
+    const status = await client.call("task_status", { project, taskId });
+    expect(status.text).not.toContain(secret);
+  });
+
+  it("can be answered by a new MCP client after the first disconnects", async () => {
+    const { fixture, client, project, taskId } = await startTask([
+      { canUseTool: { name: "AskUserQuestion", input: question } },
+      finished("Done."),
+    ]);
+    const { requestId } = await pendingRequest(client, project, taskId);
+    await client.close();
+
+    const reconnected = await fixture.connect();
+    const answered = await reconnected.call("respond_to_request", {
+      project,
+      taskId,
+      requestId,
+      response: { answers: { "Which branch should I review?": "main" } },
+    });
+    expect(answered.isError, answered.text).toBe(false);
+    const done = await reconnected.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(done.data.status).toBe("completed");
+    expect(await events(reconnected, project, taskId)).toContain(
+      'AskUserQuestion answered ["main"]',
+    );
   });
 });
 
@@ -237,6 +298,7 @@ describe("responses", () => {
     const conflict = await respond({ decision: "deny" });
     expect(conflict.isError).toBe(true);
     expect(conflict.text).toContain("already answered");
+    expect(conflict.text).not.toContain("allow");
     const wrongShape = await respond({ answers: { "Which?": "main" } });
     expect(wrongShape.isError).toBe(true);
 

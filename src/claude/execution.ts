@@ -73,8 +73,8 @@ export type PendingRequest = { toolName: string; sessionId?: string } & (
 );
 
 export type RequestResponse =
-  | { answers: Record<string, string> }
-  | { decision: "allow" | "deny"; message?: string };
+  /** One answer per question, in the order Claude asked them. */
+  { answers: string[] } | { decision: "allow" | "deny"; message?: string };
 
 type TurnOutcome =
   | { status: "completed"; text: string; structured?: unknown }
@@ -172,7 +172,15 @@ function permissionResult(
     return { behavior: "deny", message: "No one answered this request before the task ended." };
   }
   if ("answers" in response) {
-    return { behavior: "allow", updatedInput: { ...input, answers: response.answers } };
+    // Claude Code looks answers up by its original question text, which the parent may only see redacted.
+    const questions = Array.isArray(input.questions) ? (input.questions as unknown[]) : [];
+    const answers = Object.fromEntries(
+      questions.map((item, index) => [
+        String((item as { question?: unknown }).question),
+        response.answers[index] ?? "",
+      ]),
+    );
+    return { behavior: "allow", updatedInput: { ...input, answers } };
   }
   return response.decision === "allow"
     ? { behavior: "allow", updatedInput: input }

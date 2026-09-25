@@ -48,7 +48,7 @@ Claude works autonomously with the tools the task profile grants; using them nee
 
 While Claude waits, the execution stays `running` with `reason: needs_input` and `detail.requestId`, and `wait_task` returns. `task_status` lists the task's `requests`: the `question` (questions with their options) or the `action` (the tool, its MCP server, and its input), the `state` (`pending`, `answered`, `expired`), `live`, and for a live request the `responseShape` to use. Answer with `respond_to_request`:
 
-- a question: `{ "answers": { "<question text>": "<option label or your own answer>" } }`, one answer per question, several labels comma-separated for a multi-select question;
+- a question: `{ "answers": { "<question text>": "<option label or your own answer>" } }`, one answer per question keyed by its text exactly as `responseShape` shows it (credentials in it appear as `[REDACTED]`; keep that), several labels comma-separated for a multi-select question;
 - a permission request: `{ "decision": "allow" }`, or `{ "decision": "deny", "message": "why" }`.
 
 Claude continues as soon as the response arrives; wait for the same execution again. A lost response is safe to retry: repeating the same response returns the recorded outcome (`repeated: true`) and never applies it twice. A different response to an answered request fails.

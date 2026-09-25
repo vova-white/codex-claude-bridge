@@ -160,7 +160,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Answer a delegated task's request",
       description:
-        'Answer a request Claude is waiting on, listed under requests in task_status while the execution is running with reason needs_input. A question takes { answers } with one answer per question text; a permission request for an MCP tool call takes { decision: "allow" | "deny", message? }. Claude continues as soon as the response arrives. Repeating the same response returns the recorded outcome (repeated: true) without applying it again; a different response to an answered request fails. A request whose Claude session is no longer running (live: false, state expired) cannot be answered; send a follow-up instead.',
+        'Answer a request Claude is waiting on, listed under requests in task_status while the execution is running with reason needs_input. A question takes { answers } with one answer per question, keyed by the question text exactly as responseShape shows it; a permission request for an MCP tool call takes { decision: "allow" | "deny", message? }. Claude continues as soon as the response arrives. Repeating the same response returns the recorded outcome (repeated: true) without applying it again; a different response to an answered request fails. A request whose Claude session is no longer running (live: false, state expired) cannot be answered; send a follow-up instead.',
       inputSchema: respondSchema.shape,
       annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: true },
     },

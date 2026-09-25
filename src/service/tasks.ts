@@ -189,7 +189,10 @@ interface RequestRow {
   payload: string;
   response_shape: string;
   state: "pending" | "answered" | "expired";
+  /** The response as the parent sees it, redacted. */
   response: string | null;
+  /** Identifies the response as given, so a repeat can be recognized. */
+  response_hash: string | null;
   created_at: string;
   resolved_at: string | null;
 }
@@ -270,7 +273,10 @@ export class TaskService {
   /** Tasks whose next queued execution is about to start. */
   private readonly launching = new Set<string>();
   /** Requests Claude is waiting on in this process, with the means to answer them. */
-  private readonly live = new Map<string, (response: RequestResponse | undefined) => void>();
+  private readonly live = new Map<
+    string,
+    { resolve: (response: RequestResponse | undefined) => void; secrets: readonly string[] }
+  >();
 
   constructor(
     db: DatabaseSync,
@@ -447,25 +453,26 @@ export class TaskService {
       throw new ServiceError("not_found", `Task ${task.id} has no request ${requestId}.`);
     }
     if (request.state === "answered") {
-      if (request.response !== JSON.stringify(this.checkResponse(request, response))) {
+      if (request.response_hash !== responseHash(this.checkResponse(request, response).given)) {
         throw new ServiceError(
           "request_already_answered",
-          `Request ${requestId} was already answered with ${request.response}; a different response cannot replace it.`,
+          `Request ${requestId} was already answered with a different response, which cannot be replaced.`,
         );
       }
       return { taskId: task.id, ...this.requestView(request), repeated: true };
     }
-    const resolve = this.live.get(requestId);
-    if (!resolve) {
+    const live = this.live.get(requestId);
+    if (!live) {
       this.expire(requestId);
       throw new ServiceError("request_expired", `Request ${requestId} has expired: ${expiredNote}`);
     }
-    const answer = this.checkResponse(request, response);
+    const { given, answer } = this.checkResponse(request, response);
+    const shown = redactStrings(given, (text) => redactContent(text, live.secrets));
     this.db
       .prepare(
-        "UPDATE requests SET state = 'answered', response = ?, resolved_at = ? WHERE id = ? AND state = 'pending'",
+        "UPDATE requests SET state = 'answered', response = ?, response_hash = ?, resolved_at = ? WHERE id = ? AND state = 'pending'",
       )
-      .run(JSON.stringify(answer), now(), requestId);
+      .run(JSON.stringify(shown), responseHash(given), now(), requestId);
     this.live.delete(requestId);
     this.record(
       request.execution_id,
@@ -473,7 +480,7 @@ export class TaskService {
       `Request ${requestId} answered${"decision" in answer ? ` (${answer.decision})` : ""}.`,
     );
     this.showPendingRequest(request.execution_id);
-    resolve(answer);
+    live.resolve(answer);
     const answered = this.db
       .prepare("SELECT * FROM requests WHERE id = ?")
       .get(requestId) as unknown as RequestRow;
@@ -741,8 +748,15 @@ export class TaskService {
     };
   }
 
-  /** Checks that a response fits the request and returns it in the form it is recorded in. */
-  private checkResponse(request: RequestRow, response: z.infer<typeof respondSchema>["response"]) {
+  /**
+   * Checks that a response fits the request. Returns it as given, in a stable
+   * form, and as Claude receives it: answers go by question position, because
+   * the parent answers the question texts as displayed, possibly redacted.
+   */
+  private checkResponse(
+    request: RequestRow,
+    response: z.infer<typeof respondSchema>["response"],
+  ): { given: object; answer: RequestResponse } {
     if (request.kind === "permission") {
       if (!("decision" in response)) {
         throw new ServiceError(
@@ -750,14 +764,13 @@ export class TaskService {
           `Request ${request.id} asks for permission; respond with { decision: "allow" | "deny", message? }.`,
         );
       }
-      return {
+      const decision = {
         decision: response.decision,
         ...(response.message ? { message: response.message } : {}),
       };
+      return { given: decision, answer: decision };
     }
-    const asked = Object.keys(
-      (JSON.parse(request.response_shape) as { answers: Record<string, string> }).answers,
-    );
+    const asked = questionTexts(JSON.parse(request.payload));
     if (
       !("answers" in response) ||
       Object.keys(response.answers).length !== asked.length ||
@@ -768,8 +781,12 @@ export class TaskService {
         `Request ${request.id} asks questions; respond with { answers } holding one answer for each of: ${asked.map((question) => JSON.stringify(question)).join(", ")}.`,
       );
     }
+    const answers = asked.map((question) => response.answers[question]!);
     return {
-      answers: Object.fromEntries(asked.map((question) => [question, response.answers[question]!])),
+      given: {
+        answers: Object.fromEntries(asked.map((question, index) => [question, answers[index]])),
+      },
+      answer: { answers },
     };
   }
 
@@ -806,12 +823,7 @@ export class TaskService {
     const clean = (value: unknown) => redactStrings(value, (text) => redactContent(text, secrets));
     const { kind, toolName, sessionId, ...content } = request;
     const payload = clean(kind === "question" ? content : { toolName, ...content });
-    const questions =
-      kind === "question"
-        ? ((payload as { questions?: { question?: unknown }[] }).questions ?? [])
-            .map((item) => item.question)
-            .filter((text) => typeof text === "string")
-        : [];
+    const questions = kind === "question" ? questionTexts(payload) : [];
     const responseShape =
       kind === "question"
         ? {
@@ -841,7 +853,7 @@ export class TaskService {
         now(),
       );
     return new Promise((resolve) => {
-      this.live.set(id, resolve);
+      this.live.set(id, { resolve, secrets });
       this.record(
         executionId,
         "status",
@@ -866,13 +878,13 @@ export class TaskService {
           "UPDATE requests SET state = 'expired', resolved_at = ? WHERE id = ? AND state = 'pending'",
         )
         .run(now(), requestId).changes > 0;
-    const resolve = this.live.get(requestId);
+    const live = this.live.get(requestId);
     this.live.delete(requestId);
     if (expired && request) {
       this.record(request.execution_id, "status", `Request ${requestId} expired unanswered.`);
       this.showPendingRequest(request.execution_id);
     }
-    resolve?.(undefined);
+    live?.resolve(undefined);
   }
 
   /** Keeps a running execution's needs_input state in line with its oldest pending request. */
@@ -1251,6 +1263,19 @@ function readParts(parts: ResultPart[], start: number, offset: number, budget: n
     }
   }
   return { parts: page };
+}
+
+/** The texts of a question request's questions, as the parent sees them, in the order asked. */
+function questionTexts(payload: unknown): string[] {
+  const questions = (payload as { questions?: unknown }).questions;
+  if (!Array.isArray(questions)) return [];
+  return questions.map((item: { question?: unknown }, index) =>
+    typeof item.question === "string" ? item.question : `Question ${index + 1}`,
+  );
+}
+
+function responseHash(response: object): string {
+  return createHash("sha256").update(JSON.stringify(response)).digest("hex");
 }
 
 /** Applies `clean` to every string inside a JSON-like value. */

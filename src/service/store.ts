@@ -56,6 +56,7 @@ const migrations: string[] = [
     response_shape TEXT NOT NULL,
     state TEXT NOT NULL,
     response TEXT,
+    response_hash TEXT,
     created_at TEXT NOT NULL,
     resolved_at TEXT
   );
