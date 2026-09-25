@@ -98,9 +98,10 @@ describe("read-only delegated tasks", () => {
     expect(prompt).toContain("A one-line summary.");
     const [launch] = fixture.launches();
     expect(launch?.cwd).toBe(project);
-    const args = launch!.args.join(" ");
-    expect(args).toContain("--model sonnet");
-    for (const tool of ["Edit", "Write", "NotebookEdit", "Agent"]) expect(args).toContain(tool);
+    expect(launch!.args.join(" ")).toContain("--model sonnet");
+    // Nested agents inherit these session deny rules, so the Agent tool stays available.
+    const args = launch!.args;
+    expect(args[args.indexOf("--disallowedTools") + 1]).toBe("Edit,Write,NotebookEdit");
   });
 
   it("returns the same task when a start response is lost, and rejects conflicting reuse", async () => {

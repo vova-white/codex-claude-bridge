@@ -66,7 +66,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Delegate a task to Claude",
       description:
-        "Start a read-only delegated task: Claude Code inspects the project's shared checkout and returns a structured result (summary, evidence, failures, remaining work). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here.",
+        "Start a delegated task. mode read-only (default): Claude Code inspects the project's shared checkout. mode write: Claude changes files and commits in a new Git worktree on its own task branch from a committed baseline (refused with dirty_parent when the checkout has uncommitted changes and no baseline is given). Both return a structured result (summary, evidence, failures, remaining work; writing tasks add checks and the workspace). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here. In read-only tasks Claude may engage nested read-only agents for independent subtasks and incorporates their work into its result.",
       inputSchema: startSchema.shape,
       annotations: { readOnlyHint: false, openWorldHint: true },
     },
@@ -87,7 +87,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Check a delegated task",
       description:
-        "Current status of a task and its executions: queued, running (reason waiting_for_capacity while Claude waits for subscription capacity), completed, failed (reason authentication, subscription_limit, invalid_request, or provider_error, with an error message and action), or interrupted (the service stopped while it ran).",
+        "Current status of a task and its executions: queued, running (reason waiting_for_capacity while Claude waits for subscription capacity, or waiting_for_children while nested agents Claude started still run after its turn), completed, failed (reason authentication, subscription_limit, invalid_request, or provider_error, with an error message and action), or interrupted (the service stopped while it ran). Each execution lists the nested agents Claude Code reported (nested), with their status, summary, and how their end is known (termination).",
       inputSchema: { project, taskId },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -110,7 +110,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Wait for a delegated task",
       description:
-        "Wait up to timeoutSeconds for one execution to finish or become blocked (for example waiting for subscription capacity). The execution is the one given, or the task's latest at call time, and the response names it. Returns at once for finished executions. A timeout returns the current state with timedOut: true and never stops the task. lastEventSeq tells whether new output exists for read_output.",
+        "Wait up to timeoutSeconds for one execution to finish or become blocked (for example waiting for subscription capacity); waiting for nested agents is still progress, so the wait continues. The execution is the one given, or the task's latest at call time, and the response names it. Returns at once for finished executions. A timeout returns the current state with timedOut: true and never stops the task. lastEventSeq tells whether new output exists for read_output.",
       inputSchema: waitSchema.shape,
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -144,7 +144,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Cancel a delegated task",
       description:
-        "Cancel the task's unfinished executions: queued follow-ups at once, the running execution by stopping Claude Code. Returns cancellation: confirmed once Claude Code has exited, requested if termination could not be confirmed yet, or none_active when nothing was running; each execution's final status is listed (an execution that finished first keeps its result). Safe to repeat.",
+        "Cancel the task's unfinished executions: queued follow-ups at once, the running execution by asking Claude Code to stop its nested agents and then stopping Claude Code. Returns cancellation: confirmed once Claude Code has exited, requested if termination could not be confirmed yet, or none_active when nothing was running; each execution's final status and nested agents are listed (an execution that finished first keeps its result). controlGap discloses nested agents Claude Code did not report stopping. Safe to repeat.",
       inputSchema: {
         project: z.string().describe("Absolute path of the Git checkout the task belongs to."),
         taskId: z.string().describe("Task identifier returned by start_task."),

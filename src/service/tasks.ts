@@ -1,14 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
+import {
+  reportedResult,
+  runExecution,
+  writingResult,
+  type ExecutionOutcome,
+} from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { errorOrigin, redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
-import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
+import {
+  addWorktree,
+  branchTypes,
+  changedPaths,
+  checkoutState,
+  hasUncommittedChanges,
+  repositoryRoot,
+  resolveCommit,
+  taskBranch,
+  worktreeChanges,
+} from "../workspace.ts";
 
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -33,9 +50,22 @@ export const startSchema = z.object({
     .describe("A model value from readiness; defaults to Claude Code's default model."),
   effort: z.enum(effortLevels).optional().describe("Reasoning effort the model supports."),
   mode: z
-    .enum(["read-only"])
+    .enum(["read-only", "write"])
     .default("read-only")
-    .describe("Task profile. Only read-only work on the shared checkout is supported."),
+    .describe(
+      "Task profile: read-only inspects the shared checkout; write changes files in a new Git worktree on its own task branch.",
+    ),
+  baseline: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Write mode: the committed revision to start from. Defaults to HEAD, but is required when the checkout has uncommitted changes, which the child would not see.",
+    ),
+  branchType: z
+    .enum(branchTypes)
+    .optional()
+    .describe("Write mode: GitFlow prefix of the task branch (default feature)."),
 });
 export type StartRequest = z.infer<typeof startSchema>;
 
@@ -134,8 +164,26 @@ export const resultSchema = z.object({
 });
 const projectLookup = z.object({ project: z.string().min(1) });
 
-/** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
-const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit", "Agent"];
+/**
+ * Tools a read-only task never gets. Claude Code applies these session deny
+ * rules to nested agents too, whatever tools their definitions list.
+ */
+const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit"];
+/** Most commits and changed files a result lists, and the longest commit subject kept. */
+const maxListedChanges = 500;
+const maxSubjectChars = 1_000;
+/** Writing tasks get every tool except nested agents, which could not be held to the worktree. */
+const writingDisallowedTools = ["Agent"];
+
+interface WorkspaceRow {
+  task_id: string;
+  path: string;
+  branch: string;
+  baseline: string;
+  parent_dirty: number;
+  state: string;
+  created_at: string;
+}
 
 interface TaskRow {
   id: string;
@@ -147,6 +195,21 @@ interface TaskRow {
   request: string;
   session_id: string | null;
   created_at: string;
+}
+
+interface NestedRow {
+  task_id: string;
+  tool_use_id: string | null;
+  parent_tool_use_id: string | null;
+  description: string;
+  agent_type: string | null;
+  background: number;
+  depth: number | null;
+  status: string;
+  summary: string | null;
+  termination: string | null;
+  started_at: string;
+  ended_at: string | null;
 }
 
 interface ExecutionRow {
@@ -198,11 +261,25 @@ function readOnlyGuidance(root: string): string {
 
 This task uses the read-only profile on a shared checkout at ${root}. Do not create, modify, or delete files, change Git state, or install anything; the Edit, Write, and NotebookEdit tools are unavailable, and shell commands are for inspection only. The bridge compares the checkout before and after the task and reports any change to the parent.
 
-Nested agents are not available in this task: do all of the work yourself.
+You may start nested agents with the Agent tool for independent research or review subtasks that can run in parallel, but only when the expected gain in quality or elapsed time outweighs the cost of briefing them, the extra usage, and reconciling their findings. Keep small, sequential, or tightly coupled work yourself. Nested agents have the same read-only restrictions. Wait for every nested agent you start, including background ones, and incorporate their findings into your result: you remain accountable for it, and the parent sees the task as waiting while nested agents run.
 
 No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
 
 Finish with the structured result: summary (the answer or outcome), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), and remainingWork (what is left for the parent).`;
+}
+
+function writingGuidance(workspace: WorkspaceRow, parent: string): string {
+  return `You are the child agent carrying out a task delegated by Codex, the parent agent. Work autonomously on the assignment in the user message; the parent reviews your result.
+
+This task uses the writing profile in its own Git worktree at ${workspace.path}, on branch ${workspace.branch}, starting from commit ${workspace.baseline}. Work only inside this worktree: other checkouts, including the parent's at ${parent}, belong to other agents. The worktree isolates Git changes; it is not a sandbox.
+
+Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. Do not push or open pull requests: publication is not enabled for this task.
+
+Nested agents are not available in this task: do all of the work yourself.
+
+No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+
+Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the parent), and checks (each check you ran and whether it passed).`;
 }
 
 /**
@@ -259,6 +336,11 @@ export class TaskService {
         "Interrupted: the bridge service stopped while this execution ran.",
       );
     }
+    this.db
+      .prepare(
+        "UPDATE nested_tasks SET status = 'unknown', termination = 'unconfirmed', ended_at = ? WHERE status = 'running'",
+      )
+      .run(now());
     if (unfinished.length > 0) {
       this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
     }
@@ -271,23 +353,51 @@ export class TaskService {
     const { requestKey, project: _path, ...intent } = request;
     const hash = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
 
-    const existing = this.db
-      .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
-      .get(project, caller, requestKey) as TaskRow | undefined;
-    if (existing) {
-      if (existing.request_hash !== hash) {
+    const existing = () => {
+      const task = this.db
+        .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
+        .get(project, caller, requestKey) as TaskRow | undefined;
+      if (!task) return undefined;
+      if (task.request_hash !== hash) {
         throw new ServiceError(
           "request_key_conflict",
-          `Request key "${requestKey}" already started task ${existing.id} with different arguments. Use a new request key for different work.`,
+          `Request key "${requestKey}" already started task ${task.id} with different arguments. Use a new request key for different work.`,
         );
       }
-      const execution = this.execution(existing.id, 1);
+      const execution = this.execution(task.id, 1);
       return {
-        taskId: existing.id,
+        taskId: task.id,
         executionId: execution.id,
         status: execution.status,
         created: false,
       };
+    };
+    const earlier = existing();
+    if (earlier) return earlier;
+
+    let workspace: { baseline: string; parentDirty: boolean } | undefined;
+    if (request.mode === "write") {
+      const parentDirty = await hasUncommittedChanges(project);
+      if (parentDirty && !request.baseline) {
+        throw new ServiceError(
+          "dirty_parent",
+          `${project} has uncommitted changes, which a writing task would not see: its worktree starts from a commit. Commit the changes the child needs, or pass baseline (for example "HEAD") to start from that commit without them.`,
+        );
+      }
+      const baseline = await resolveCommit(project, request.baseline ?? "HEAD");
+      if (!baseline) {
+        throw new ServiceError(
+          "invalid_baseline",
+          `${request.baseline ?? "HEAD"} does not name a commit in ${project}.`,
+        );
+      }
+      workspace = { baseline, parentDirty };
+    } else if (request.baseline || request.branchType) {
+      // Absent options also keep the request identity of read-only tasks as it was.
+      throw new ServiceError(
+        "invalid_arguments",
+        "baseline and branchType apply only to writing tasks; read-only tasks inspect the shared checkout as it is.",
+      );
     }
 
     const taskId = `task_${randomUUID()}`;
@@ -295,6 +405,13 @@ export class TaskService {
     const createdAt = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // A concurrent request with the same key may have been accepted while this
+      // one checked the checkout.
+      const accepted = existing();
+      if (accepted) {
+        this.db.exec("ROLLBACK");
+        return accepted;
+      }
       this.db
         .prepare(
           `INSERT INTO tasks (id, project, caller, request_key, request_hash, mode, request, created_at)
@@ -315,6 +432,22 @@ export class TaskService {
           `INSERT INTO executions (id, task_id, ordinal, status, created_at) VALUES (?, ?, 1, 'queued', ?)`,
         )
         .run(executionId, taskId, createdAt);
+      if (workspace) {
+        // The worktree is bound to the task before any execution can edit.
+        this.db
+          .prepare(
+            `INSERT INTO workspaces (task_id, path, branch, baseline, parent_dirty, state, created_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          )
+          .run(
+            taskId,
+            join(this.paths.worktrees, taskId),
+            taskBranch(request.branchType ?? "feature", request.assignment, taskId),
+            workspace.baseline,
+            workspace.parentDirty ? 1 : 0,
+            createdAt,
+          );
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -359,18 +492,21 @@ export class TaskService {
       .all(task.id) as unknown as ExecutionRow[];
     const latest = executions.at(-1)!;
     const intent = JSON.parse(task.request) as Omit<StartRequest, "project" | "requestKey">;
+    const workspace = this.workspace(task.id);
     return {
       taskId: task.id,
       project: task.project,
       mode: task.mode,
       ...executionState(latest),
       ...(task.session_id ? { sessionId: task.session_id } : {}),
+      ...(workspace ? { workspace: workspaceReport(workspace) } : {}),
       createdAt: task.created_at,
       request: intent,
       executions: executions.map((execution) => ({
         executionId: execution.id,
         ordinal: execution.ordinal,
         ...executionState(execution),
+        ...this.nested(execution.id),
         ...(execution.started_at ? { startedAt: execution.started_at } : {}),
         ...(execution.ended_at ? { endedAt: execution.ended_at } : {}),
       })),
@@ -391,12 +527,7 @@ export class TaskService {
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
     if (!execution.result) return { ...state, result: null };
-    const stored = JSON.parse(execution.result) as Record<string, unknown> & {
-      summary: string;
-      evidence: string[];
-      failures: string[];
-      remainingWork: string[];
-    };
+    const stored = JSON.parse(execution.result) as Record<string, unknown> & StoredResult;
     const parts = resultParts(stored);
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
     const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
@@ -414,19 +545,39 @@ export class TaskService {
     }
     const rest = Object.fromEntries(
       Object.entries(stored).filter(
-        ([key]) => !["summary", "evidence", "failures", "remainingWork"].includes(key),
+        ([key]) =>
+          !["summary", "evidence", "failures", "remainingWork", "checks", "workspace"].includes(
+            key,
+          ),
       ),
     );
-    const shown = (field: string) =>
-      page.parts.filter((item) => item.field === field).map((item) => item.text);
+    const shown = (field: string) => page.parts.filter((item) => item.field === field);
+    const texts = (field: string) => shown(field).map((item) => item.text);
     return {
       ...state,
       result: {
-        summary: shown("summary")[0] ?? "",
-        evidence: shown("evidence"),
-        failures: shown("failures"),
-        remainingWork: shown("remainingWork"),
+        summary: texts("summary")[0] ?? "",
+        evidence: texts("evidence"),
+        failures: texts("failures"),
+        remainingWork: texts("remainingWork"),
+        ...(stored.checks ? { checks: shownChecks(page.parts, stored.checks) } : {}),
         ...rest,
+        ...(stored.workspace
+          ? {
+              workspace: {
+                ...stored.workspace,
+                ...(stored.workspace.commits
+                  ? {
+                      commits: shown("commits").map((item) => ({
+                        sha: item.sha,
+                        subject: item.text,
+                      })),
+                    }
+                  : {}),
+                ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
+              },
+            }
+          : {}),
       },
       ...truncation,
     };
@@ -532,13 +683,23 @@ export class TaskService {
         (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
           false,
     );
+    const views = executions.map((execution) => ({
+      executionId: execution.id,
+      ...executionState(execution),
+      ...this.nested(execution.id),
+    }));
+    const unreported = views
+      .flatMap((view) => view.nested ?? [])
+      .filter((nested) => nested.termination !== undefined && nested.termination !== "reported");
     return {
       taskId: task.id,
       cancellation: active.length === 0 ? "none_active" : confirmed ? "confirmed" : "requested",
-      executions: executions.map((execution) => ({
-        executionId: execution.id,
-        ...executionState(execution),
-      })),
+      executions: views,
+      ...(unreported.length > 0
+        ? {
+            controlGap: `Claude Code did not report stopping ${unreported.length} nested agent(s). Those with termination process_exit ended with its process; unconfirmed ones may still run. The bridge does not control work nested agents started outside Claude Code, such as background commands.`,
+          }
+        : {}),
     };
   }
 
@@ -699,6 +860,30 @@ export class TaskService {
     }
   }
 
+  /** The nested agents Claude Code reported for an execution, as task_status shows them. */
+  private nested(executionId: string) {
+    const rows = this.db
+      .prepare("SELECT * FROM nested_tasks WHERE execution_id = ? ORDER BY started_at, rowid")
+      .all(executionId) as unknown as NestedRow[];
+    if (rows.length === 0) return {};
+    return {
+      nested: rows.map((row) => ({
+        taskId: row.task_id,
+        ...(row.tool_use_id ? { toolUseId: row.tool_use_id } : {}),
+        ...(row.parent_tool_use_id ? { parentToolUseId: row.parent_tool_use_id } : {}),
+        description: row.description,
+        ...(row.agent_type ? { agentType: row.agent_type } : {}),
+        background: row.background === 1,
+        ...(row.depth === null ? {} : { depth: row.depth }),
+        status: row.status,
+        ...(row.summary ? { summary: row.summary } : {}),
+        ...(row.termination ? { termination: row.termination } : {}),
+        startedAt: row.started_at,
+        ...(row.ended_at ? { endedAt: row.ended_at } : {}),
+      })),
+    };
+  }
+
   private executionById(taskId: string, executionId: string): ExecutionRow {
     const execution = this.db
       .prepare("SELECT * FROM executions WHERE task_id = ? AND id = ?")
@@ -729,6 +914,38 @@ export class TaskService {
       const timer = setTimeout(done, ms);
       this.changes.on("change", listener);
     });
+  }
+
+  private workspace(taskId: string): WorkspaceRow | undefined {
+    return this.db.prepare("SELECT * FROM workspaces WHERE task_id = ?").get(taskId) as
+      | WorkspaceRow
+      | undefined;
+  }
+
+  /** Creates the task's worktree once; later executions reuse it. */
+  private async prepareWorkspace(workspace: WorkspaceRow): Promise<boolean> {
+    if (workspace.state === "ready") return true;
+    const task = this.db
+      .prepare("SELECT project FROM tasks WHERE id = ?")
+      .get(workspace.task_id) as {
+      project: string;
+    };
+    try {
+      mkdirSync(this.paths.worktrees, { recursive: true, mode: 0o700 });
+      await addWorktree(task.project, workspace.path, workspace.branch, workspace.baseline);
+    } catch (error) {
+      this.log(
+        `worktree for ${workspace.task_id} could not be created (${(error as NodeJS.ErrnoException).code ?? "git worktree add failed"})`,
+      );
+      this.db
+        .prepare("UPDATE workspaces SET state = 'failed' WHERE task_id = ?")
+        .run(workspace.task_id);
+      return false;
+    }
+    this.db
+      .prepare("UPDATE workspaces SET state = 'ready' WHERE task_id = ?")
+      .run(workspace.task_id);
+    return true;
   }
 
   /** Starts the task's next queued execution unless one of its executions is running. */
@@ -787,6 +1004,7 @@ export class TaskService {
     const root = task.project;
     const request = JSON.parse(task.request) as StartRequest;
     const followUp = execution.kind === "follow-up";
+    const workspace = this.workspace(task.id);
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
@@ -811,19 +1029,29 @@ export class TaskService {
           "Start a new task with the context the follow-up needs; the earlier results stay available.",
         processExited: true,
       };
+    } else if (workspace && !(await this.prepareWorkspace(workspace))) {
+      outcome = {
+        status: "failed",
+        reason: "workspace_error",
+        message: `Execution failed with workspace_error: could not create the task worktree at ${workspace.path} on branch ${workspace.branch}; no execution was started.`,
+        action:
+          "Check that the repository accepts new worktrees and branches (for example with `git worktree add`), then start a new task.",
+        processExited: true,
+      };
     } else {
-      before = await checkoutState(root);
+      if (!workspace) before = await checkoutState(root);
       outcome = await runExecution(
         {
           executable,
           env: claudeEnvironment(config),
           extraArgs: mcpConfigArgs(this.paths, config),
-          cwd: root,
+          cwd: workspace?.path ?? root,
           prompt: followUp ? `<follow-up>\n${execution.input}\n</follow-up>` : prompt(request),
           ...(followUp && task.session_id ? { resume: task.session_id } : {}),
           signal,
-          guidance: readOnlyGuidance(root),
-          disallowedTools: readOnlyDisallowedTools,
+          guidance: workspace ? writingGuidance(workspace, root) : readOnlyGuidance(root),
+          disallowedTools: workspace ? writingDisallowedTools : readOnlyDisallowedTools,
+          resultSchema: workspace ? writingResult : reportedResult,
           ...(request.model ? { model: request.model } : {}),
           ...(request.effort ? { effort: request.effort } : {}),
           secrets,
@@ -862,12 +1090,77 @@ export class TaskService {
           },
           message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
           // Strings are redacted before serialization, which would escape them.
-          toolCall: (name, input) =>
+          toolCall: (name, input, nestedTaskId) =>
             this.record(
               executionId,
-              "tool",
-              `${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
+              nestedTaskId ? "nested" : "tool",
+              `${nestedTaskId ? `${nestedTaskId}: ` : ""}${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
             ),
+          nestedStarted: (nested) => {
+            const description = redactContent(nested.description, secrets);
+            this.db
+              .prepare(
+                `INSERT OR IGNORE INTO nested_tasks (execution_id, task_id, tool_use_id, parent_tool_use_id,
+                   description, agent_type, background, depth, status, started_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+              )
+              .run(
+                executionId,
+                nested.taskId,
+                nested.toolUseId ?? null,
+                nested.parentToolUseId ?? null,
+                description,
+                nested.agentType ?? null,
+                nested.background ? 1 : 0,
+                nested.depth ?? null,
+                now(),
+              );
+            this.record(
+              executionId,
+              "nested",
+              `${nested.taskId} started${nested.background ? " in the background" : ""}: ${description}`,
+            );
+          },
+          nestedProgress: (taskId, summary) =>
+            this.record(executionId, "nested", `${taskId}: ${redactContent(summary, secrets)}`),
+          nestedEnded: (taskId, end) => {
+            const summary = end.summary === undefined ? null : redactContent(end.summary, secrets);
+            this.db
+              .prepare(
+                `UPDATE nested_tasks SET status = ?, summary = ?, termination = ?, ended_at = ?
+                 WHERE execution_id = ? AND task_id = ? AND status = 'running'`,
+              )
+              .run(end.status, summary, end.termination, now(), executionId, taskId);
+            this.record(
+              executionId,
+              "nested",
+              `${taskId} ${end.status}${end.termination === "reported" ? "" : ` (${end.termination})`}${summary ? `: ${summary}` : ""}`,
+            );
+          },
+          waitingForChildren: (count) => {
+            const current = this.db
+              .prepare("SELECT reason FROM executions WHERE id = ?")
+              .get(executionId) as { reason: string | null };
+            if (count === 0 && current.reason !== "waiting_for_children") return;
+            const changed = this.update(
+              executionId,
+              count > 0
+                ? {
+                    reason: "waiting_for_children",
+                    detail: JSON.stringify({ runningNested: count }),
+                  }
+                : { reason: null, detail: null },
+            );
+            if (changed && current.reason !== "waiting_for_children") {
+              this.record(
+                executionId,
+                "status",
+                `Claude finished its turn; waiting for ${count} nested agent(s).`,
+              );
+            } else if (changed && count === 0) {
+              this.record(executionId, "status", "Nested agents ended; Claude continues.");
+            }
+          },
         },
       );
     }
@@ -876,6 +1169,27 @@ export class TaskService {
     const modifiedFiles = (before ? changedPaths(before, await checkoutState(root)) : []).map(
       (path) => redactContent(path, secrets),
     );
+    // A writing task's changes stay in its worktree whatever the outcome.
+    const changes =
+      workspace && this.workspace(task.id)?.state === "ready"
+        ? await worktreeChanges(workspace.path, workspace.baseline)
+            .then(({ commits, changedFiles }) => ({
+              // Long lists are cut; the worktree itself holds every change.
+              commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
+                sha,
+                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+              })),
+              changedFiles: changedFiles
+                .slice(0, maxListedChanges)
+                .map((file) => redactContent(file, secrets)),
+              commitCount: commits.length,
+              changedFileCount: changedFiles.length,
+            }))
+            .catch(() => undefined)
+        : undefined;
+    const retained = workspace
+      ? { workspace: { ...workspaceReport(this.workspace(task.id)!), ...changes } }
+      : {};
     const violation =
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
@@ -891,6 +1205,7 @@ export class TaskService {
         detail: JSON.stringify({
           processExited: outcome.processExited,
           ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+          ...retained,
         }),
         ended_at: endedAt,
       });
@@ -909,19 +1224,30 @@ export class TaskService {
       const failed = this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
+        // Claude chooses file names and commit subjects, so they stay out of `error`.
         detail:
-          outcome.detail || !outcome.processExited || modifiedFiles.length > 0
+          outcome.detail || !outcome.processExited || modifiedFiles.length > 0 || workspace
             ? JSON.stringify({
                 ...outcome.detail,
                 ...(outcome.processExited ? {} : { processExited: false }),
                 ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+                ...retained,
               })
             : null,
         error: JSON.stringify({
-          message:
-            modifiedFiles.length > 0
-              ? `${outcome.message} The read-only task changed ${modifiedFiles.length} ${modifiedFiles.length === 1 ? "file" : "files"} in the shared checkout (see detail.modifiedFiles).`
-              : outcome.message,
+          message: [
+            outcome.message,
+            ...(modifiedFiles.length > 0
+              ? [
+                  `The read-only task changed ${plural(modifiedFiles.length, "file")} in the shared checkout (see detail.modifiedFiles).`,
+                ]
+              : []),
+            ...(changes
+              ? [
+                  `The task's worktree holds ${plural(changes.commitCount, "commit")} and ${plural(changes.changedFileCount, "changed file")} (see detail.workspace).`,
+                ]
+              : []),
+          ].join(" "),
           action: outcome.action,
         }),
         ended_at: endedAt,
@@ -929,18 +1255,27 @@ export class TaskService {
       if (failed) this.record(executionId, "status", `Failed (${outcome.reason}).`);
       return;
     }
-    const parsed = reportedResult.safeParse(outcome.structured);
+    const parsed = (workspace ? writingResult : reportedResult).safeParse(outcome.structured);
     const reported = parsed.success
       ? parsed.data
       : { summary: outcome.text, evidence: [], failures: [], remainingWork: [] };
     // Claude can read configured credentials; they must not reach Codex through results.
     const clean = (text: string) => redactContent(text, secrets);
+    const checks =
+      parsed.success && "checks" in parsed.data
+        ? (parsed.data as z.infer<typeof writingResult>).checks
+        : [];
     const result = {
       summary: clean(reported.summary),
       evidence: reported.evidence.map(clean),
       failures: [...reported.failures.map(clean), ...violation],
       remainingWork: reported.remainingWork.map(clean),
-      workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles },
+      ...(workspace
+        ? {
+            checks: checks.map((check) => redactStrings(check, clean)),
+            ...retained,
+          }
+        : { workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles } }),
     };
     const completed = this.update(executionId, {
       status: "completed",
@@ -957,16 +1292,31 @@ interface ResultPart {
   part: number;
   field: string;
   index?: number;
+  /** Which string of a structured item the part holds, such as a check's `command`. */
+  key?: string;
+  /** Short values that belong with the part: a check's outcome, a commit's SHA. */
+  outcome?: string;
+  sha?: string;
   text: string;
 }
 
-/** The text of a result as an ordered list of parts: the summary, then each list item. */
-function resultParts(result: {
+type Check = z.infer<typeof writingResult>["checks"][number];
+
+interface StoredResult {
   summary: string;
   evidence: string[];
   failures: string[];
   remainingWork: string[];
-}): ResultPart[] {
+  checks?: Check[];
+  workspace?: { commits?: { sha: string; subject: string }[]; changedFiles?: string[] };
+}
+
+/**
+ * The text of a result as an ordered list of parts: the summary, each list
+ * item, each check's command and details, and each commit subject and changed
+ * file of a writing task's workspace.
+ */
+function resultParts(result: StoredResult): ResultPart[] {
   const fields = [
     ["evidence", result.evidence],
     ["failures", result.failures],
@@ -975,13 +1325,54 @@ function resultParts(result: {
   const parts: Omit<ResultPart, "part">[] = [
     { field: "summary", text: result.summary },
     ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
+    ...(result.checks ?? []).flatMap((check, index) => [
+      { field: "checks", index, key: "command", outcome: check.outcome, text: check.command },
+      ...(check.details === undefined
+        ? []
+        : [{ field: "checks", index, key: "details", text: check.details }]),
+    ]),
+    ...(result.workspace?.commits ?? []).map(({ sha, subject }, index) => ({
+      field: "commits",
+      index,
+      sha,
+      text: subject,
+    })),
+    ...(result.workspace?.changedFiles ?? []).map((text, index) => ({
+      field: "changedFiles",
+      index,
+      text,
+    })),
   ];
   return parts.map((item, part) => ({ part, ...item }));
 }
 
+type ShownPart = ResultPart & { offset?: number; complete?: false };
+
+/** Checks as shown in a bounded result; a check whose text was cut says complete: false. */
+function shownChecks(page: ShownPart[], stored: Check[]) {
+  const shown = new Map<number, { command: string; details?: string; complete?: false }>();
+  for (const part of page.filter((item) => item.field === "checks")) {
+    const check = shown.get(part.index!) ?? { command: "" };
+    if (part.key === "command") check.command = part.text;
+    else check.details = part.text;
+    if (part.complete === false) check.complete = false;
+    shown.set(part.index!, check);
+  }
+  return [...shown].map(([index, check]) => {
+    const original = stored[index]!;
+    const missingDetails = original.details !== undefined && check.details === undefined;
+    return {
+      command: check.command,
+      outcome: original.outcome,
+      ...(check.details === undefined ? {} : { details: check.details }),
+      ...(check.complete === false || missingDetails ? { complete: false } : {}),
+    };
+  });
+}
+
 /** Reads parts from a position, returning at most `budget` characters and where to continue. */
 function readParts(parts: ResultPart[], start: number, offset: number, budget: number) {
-  const page: (ResultPart & { offset?: number; complete?: false })[] = [];
+  const page: ShownPart[] = [];
   let remaining = budget;
   for (let part = start; part < parts.length; part++) {
     const from = part === start ? offset : 0;
@@ -1013,6 +1404,23 @@ function redactStrings(value: unknown, clean: (text: string) => string): unknown
     );
   }
   return value;
+}
+
+/** A number with its noun, such as "1 file" or "2 files". */
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+function workspaceReport(workspace: WorkspaceRow) {
+  return {
+    kind: "worktree",
+    path: workspace.path,
+    branch: workspace.branch,
+    baseline: workspace.baseline,
+    parentDirty: workspace.parent_dirty === 1,
+    state: workspace.state,
+    isolation: "Git worktree: separate files and branch, not an operating-system sandbox.",
+  };
 }
 
 function executionState(execution: ExecutionRow) {
