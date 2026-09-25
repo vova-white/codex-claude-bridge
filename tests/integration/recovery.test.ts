@@ -1,5 +1,7 @@
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Step } from "../fixtures/fake-claude.ts";
 import {
@@ -193,6 +195,58 @@ describe("recovery after a service crash", () => {
     );
     expect(fixture.prompts().filter((prompt) => prompt.includes("First review."))).toHaveLength(1);
     expect(fixture.launches()).toHaveLength(2);
+  });
+
+  it("keeps work queued before a machine restart uncertain when the service dies during recovery", async () => {
+    const fixture = bridge({
+      config: { maxConcurrentExecutions: 1 },
+      scenario: {
+        turns: [
+          { match: "Second", steps: [finished("Second done.")] },
+          {
+            steps: [
+              { ignoreTermination: true, signalOnTerm: "terminated" },
+              { signal: "first-running" },
+              { waitFor: "never" },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const first = await start(client, { project, assignment: "First review." });
+    await waitFor(() => fixture.signalled("first-running") || undefined);
+    await sessionRecorded(client, project, first.taskId);
+    const second = await start(client, {
+      project,
+      requestKey: "task-2",
+      assignment: "Second review.",
+    });
+    expect(second.reason).toBe("waiting_for_slot");
+    await fixture.killService();
+
+    // A machine restart, as the next service sees it: the database last ran in another boot.
+    // (The first Claude Code survives only so that recovery has a step to die in.)
+    const db = new DatabaseSync(join(fixture.stateDir, "state.db"));
+    db.prepare("UPDATE service_state SET value = 'an-earlier-boot' WHERE key = 'boot_id'").run();
+    db.close();
+    // Started here so its PID is known while it recovers, before it serves anyone.
+    const recovering = spawn(process.execPath, [resolve("src/cli.ts"), "service"], {
+      env: fixture.env,
+      stdio: "ignore",
+    });
+    await waitFor(() => fixture.signalled("terminated") || undefined);
+    process.kill(recovering.pid!, "SIGKILL");
+    await waitFor(() => !isAlive(recovering.pid!) || undefined);
+
+    const reconnected = await fixture.connect();
+    expect(await status(reconnected, project, second.taskId)).toMatchObject({
+      status: "interrupted",
+      reason: "service_restarted",
+      detail: { recovery: { process: "unknown" } },
+    });
+    expect(fixture.launches()).toHaveLength(1);
   });
 
   it("runs a follow-up queued before the crash, telling Claude the previous execution was interrupted", async () => {

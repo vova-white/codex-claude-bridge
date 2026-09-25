@@ -555,11 +555,6 @@ export class TaskService {
       .prepare("SELECT value FROM service_state WHERE key = 'boot_id'")
       .get() as { value: string } | undefined;
     const exact = boot !== undefined && previous?.value === boot;
-    if (boot) {
-      this.db
-        .prepare("INSERT OR REPLACE INTO service_state (key, value) VALUES ('boot_id', ?)")
-        .run(boot);
-    }
     // Without a recorded process, a running execution had not launched Claude Code yet.
     const found = (recorded: string | null) =>
       recorded
@@ -582,7 +577,10 @@ export class TaskService {
       Promise.all(writers.map((writer) => found(writer.process))),
     ]);
     const endedAt = now();
-    const interrupted: string[] = [];
+    let interrupted = 0;
+    // The boot is recorded with the decisions about the queue, so a service that
+    // dies before making them leaves the queue as uncertain as it found it.
+    this.db.exec("BEGIN IMMEDIATE");
     unfinished.forEach((execution, index) => {
       if (execution.status === "queued" && exact) {
         this.record(
@@ -593,12 +591,21 @@ export class TaskService {
         return;
       }
       const recovery = processes[index]!;
+      // What a writing execution left is recorded later; `reconciled` shows whether that is done.
+      const reconciles =
+        execution.status === "running" && this.workspace(execution.task_id)?.state === "ready";
       this.db
         .prepare(
           `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = ?, ended_at = ?
            WHERE id = ?`,
         )
-        .run(JSON.stringify({ recovery: { process: recovery } }), endedAt, execution.id);
+        .run(
+          JSON.stringify({
+            recovery: { process: recovery, ...(reconciles ? { reconciled: false } : {}) },
+          }),
+          endedAt,
+          execution.id,
+        );
       this.record(
         execution.id,
         "status",
@@ -616,7 +623,7 @@ export class TaskService {
           endedAt,
           execution.id,
         );
-      if (execution.status === "running") interrupted.push(execution.id);
+      if (execution.status === "running") interrupted++;
     });
     writers.forEach((writer, index) => {
       const recovery = writerProcesses[index]!;
@@ -628,16 +635,29 @@ export class TaskService {
         recovery !== "unknown",
       );
     });
-    const requeued = unfinished.length - interrupted.length;
+    if (boot) {
+      this.db
+        .prepare("INSERT OR REPLACE INTO service_state (key, value) VALUES ('boot_id', ?)")
+        .run(boot);
+    }
+    this.db.exec("COMMIT");
+    const requeued = unfinished.length - interrupted;
     if (unfinished.length > 0) {
-      this.log(`recovered ${interrupted.length} interrupted and ${requeued} queued execution(s)`);
+      this.log(`recovered ${interrupted} interrupted and ${requeued} queued execution(s)`);
     }
     const pending = this.db.prepare("SELECT id FROM requests WHERE state = 'pending'").all() as {
       id: string;
     }[];
     for (const { id } of pending) this.expire(id);
     this.schedule();
-    void this.reconcile(interrupted).catch((error: unknown) =>
+    // Including those a previous service interrupted but died before reconciling.
+    const unreconciled = this.db
+      .prepare(
+        `SELECT id FROM executions WHERE status = 'interrupted'
+           AND json_extract(detail, '$.recovery.reconciled') = 0 ORDER BY created_at, rowid`,
+      )
+      .all() as { id: string }[];
+    void this.reconcile(unreconciled.map(({ id }) => id)).catch((error: unknown) =>
       this.log(`reconciling interrupted executions failed: ${errorOrigin(error)}`),
     );
   }
@@ -655,8 +675,14 @@ export class TaskService {
       const { task_id: taskId, detail } = this.db
         .prepare("SELECT task_id, detail FROM executions WHERE id = ?")
         .get(id) as { task_id: string; detail: string | null };
+      const recorded = JSON.parse(detail ?? "{}") as { recovery?: object };
+      const done = { ...recorded, recovery: { ...recorded.recovery, reconciled: true } };
       const workspace = this.workspace(taskId);
-      if (workspace?.state !== "ready") continue;
+      // cleanup_task removed the worktree meanwhile, so nothing is left to reconcile.
+      if (workspace?.state !== "ready") {
+        this.update(id, { detail: JSON.stringify(done) }, "interrupted");
+        continue;
+      }
       const { request } = this.db.prepare("SELECT request FROM tasks WHERE id = ?").get(taskId) as {
         request: string;
       };
@@ -669,7 +695,7 @@ export class TaskService {
         id,
         {
           detail: JSON.stringify({
-            ...(JSON.parse(detail ?? "{}") as object),
+            ...done,
             workspace: { ...workspaceReport(workspace), ...changes },
             ...(publication ? { publication } : {}),
           }),
