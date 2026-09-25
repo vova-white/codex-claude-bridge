@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { createConnection } from "node:net";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import { BridgeFixture, isAlive, waitFor } from "../support/bridge.ts";
 
@@ -25,6 +27,42 @@ describe("background service", () => {
     expect(new Set(pids).size).toBe(1);
     expect(pids[0]).not.toBe(process.pid);
     expect(fixture.servicePid()).toBe(pids[0]);
+  });
+
+  it("starts while a concurrently starting service briefly reads the state store", async () => {
+    fixture = new BridgeFixture();
+    const database = join(fixture.stateDir, "state.db");
+    // Another process holds the read lock a losing service takes for a moment before it gives up.
+    const contender = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const db = new (require("node:sqlite").DatabaseSync)(process.argv[1], { timeout: 0 });
+         db.exec("BEGIN; SELECT count(*) FROM sqlite_master;");
+         process.stdout.write("held");
+         process.stdin.on("data", () => {}).on("end", () => db.exec("COMMIT"));`,
+        database,
+      ],
+      { stdio: ["pipe", "pipe", "inherit"] },
+    );
+    const exited = new Promise((resolve) => contender.once("exit", resolve));
+    await new Promise((resolve) => contender.stdout.once("data", resolve));
+    const client = await fixture.connect();
+    // New readers are refused once the starting service has claimed the lock and waits for the contender.
+    const probe = new DatabaseSync(database, { timeout: 0 });
+    await waitFor(() => {
+      try {
+        probe.exec("BEGIN; SELECT count(*) FROM sqlite_master; COMMIT;");
+        return undefined;
+      } catch {
+        return true;
+      }
+    });
+    probe.close();
+    contender.stdin.end();
+    await exited;
+
+    expect(await servicePidFrom(client)).toBe(fixture.servicePid());
   });
 
   it("keeps running after the MCP client exits and serves the next client", async () => {
