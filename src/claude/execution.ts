@@ -1,5 +1,7 @@
 import {
   query,
+  type CanUseTool,
+  type PermissionResult,
   type SDKAssistantMessageError,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -35,6 +37,11 @@ export interface ExecutionRequest {
   /** Appended to Claude Code's system prompt: the task profile and reporting contract. */
   guidance: string;
   disallowedTools: string[];
+  /**
+   * MCP servers whose tool calls need the parent agent's approval. Every other
+   * tool the task allows runs without asking.
+   */
+  approvalServers: readonly string[];
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** The shape Claude must report its final answer in. */
@@ -88,7 +95,31 @@ export interface ExecutionObserver {
    * execution then continues until the executor's next result.
    */
   waitingForChildren(count: number): void;
+  /**
+   * Claude waits for the parent agent: an answer to its question or a decision
+   * on a tool call. Resolves with the parent's response, or with undefined if
+   * the request ended unanswered. `signal` aborts once no response may reach
+   * Claude any more: Claude Code withdrew the request, cancellation began, or
+   * the execution ended.
+   */
+  request(request: PendingRequest, signal: AbortSignal): Promise<RequestResponse | undefined>;
 }
+
+/** What Claude asks the parent agent for, with Claude's own request content. */
+export type PendingRequest = { toolName: string; sessionId?: string } & (
+  | { kind: "question"; questions: unknown }
+  | {
+      kind: "permission";
+      mcpServer: string;
+      input: Record<string, unknown>;
+      title?: string;
+      description?: string;
+    }
+);
+
+export type RequestResponse =
+  /** One answer per question, in the order Claude asked them. */
+  { answers: string[] } | { decision: "allow" | "deny"; message?: string };
 
 type TurnOutcome =
   | { status: "completed"; text: string; structured?: unknown }
@@ -210,6 +241,44 @@ class Input implements AsyncIterable<SDKUserMessage> {
 }
 
 /**
+ * The MCP server of a tool call. Claude Code names the server when it asks;
+ * older versions only encode it in the tool name as `mcp__<server>__<tool>`,
+ * with characters outside [A-Za-z0-9_-] replaced by underscores.
+ */
+function mcpServerOf(
+  tool: string,
+  options: { mcpServer?: { name: string } },
+  servers: readonly string[],
+): string | undefined {
+  if (options.mcpServer) return options.mcpServer.name;
+  return servers.find((name) => tool.startsWith(`mcp__${name.replace(/[^A-Za-z0-9_-]/g, "_")}__`));
+}
+
+/** Turns the parent agent's response into Claude Code's permission decision. */
+function permissionResult(
+  input: Record<string, unknown>,
+  response: RequestResponse | undefined,
+): PermissionResult {
+  if (!response) {
+    return { behavior: "deny", message: "No one answered this request before the task ended." };
+  }
+  if ("answers" in response) {
+    // Claude Code looks answers up by its original question text, which the parent may only see redacted.
+    const questions = Array.isArray(input.questions) ? (input.questions as unknown[]) : [];
+    const answers = Object.fromEntries(
+      questions.map((item, index) => [
+        String((item as { question?: unknown }).question),
+        response.answers[index] ?? "",
+      ]),
+    );
+    return { behavior: "allow", updatedInput: { ...input, answers } };
+  }
+  return response.decision === "allow"
+    ? { behavior: "allow", updatedInput: input }
+    : { behavior: "deny", message: response.message ?? "The parent agent denied this tool call." };
+}
+
+/**
  * Runs one prompt through Claude Code. The session's credential source and the
  * requested model are checked before the prompt is sent, so a rejected
  * execution never reaches a model. A failure is described only by values the
@@ -273,6 +342,33 @@ export async function runExecution(
   /** Whether Claude Code reported a session; its ID is kept only in the known UUID form. */
   let sessionStarted = false;
   let sessionId: string | undefined;
+  // Ends the parent's open requests once the execution is over.
+  const ended = new AbortController();
+  const canUseTool: CanUseTool = async (tool, toolInput, options) => {
+    const server = mcpServerOf(tool, options, request.approvalServers);
+    const identity = { toolName: tool, ...(sessionId ? { sessionId } : {}) };
+    let pending: PendingRequest;
+    if (tool === "AskUserQuestion") {
+      pending = { ...identity, kind: "question", questions: toolInput.questions };
+    } else if (server !== undefined && request.approvalServers.includes(server)) {
+      pending = {
+        ...identity,
+        kind: "permission",
+        mcpServer: server,
+        input: toolInput,
+        ...(options.title ? { title: options.title } : {}),
+        ...(options.description ? { description: options.description } : {}),
+      };
+    } else {
+      return { behavior: "allow", updatedInput: toolInput };
+    }
+    // Cancellation ends the request at once, before nested agents are given time to stop.
+    const response = await observer.request(
+      pending,
+      AbortSignal.any([options.signal, request.signal, ended.signal]),
+    );
+    return permissionResult(toolInput, response);
+  };
   const failed = (
     reason: FailureReason,
     description: string,
@@ -314,14 +410,7 @@ export async function runExecution(
       ...(request.resume ? { resume: request.resume } : {}),
       permissionMode: "default",
       disallowedTools: request.disallowedTools,
-      canUseTool: async (tool, toolInput) =>
-        tool === "AskUserQuestion"
-          ? {
-              behavior: "deny",
-              message:
-                "No one can answer questions during this task. Make a reasonable assumption, state it, and list open questions as remaining work.",
-            }
-          : { behavior: "allow", updatedInput: toolInput },
+      canUseTool,
       // Claude Code validates --json-schema with a draft-07 validator.
       outputFormat: {
         type: "json_schema",
@@ -487,6 +576,7 @@ export async function runExecution(
     }
   };
   const settled = await turn();
+  ended.abort();
   input.close();
   session.close();
   const processExited = await claude.stop();

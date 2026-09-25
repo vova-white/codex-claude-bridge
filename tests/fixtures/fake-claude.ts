@@ -49,7 +49,22 @@ export type Step =
         errors?: string[];
       };
     }
-  | { exit: { code: number; stderr?: string } };
+  | { exit: { code: number; stderr?: string } }
+  /**
+   * Asks the SDK's canUseTool callback about a tool call, as Claude Code does
+   * before running a tool that needs permission, then reports the decision as
+   * assistant text: `<tool> allowed <updated input JSON>`, `<tool> denied <message>`,
+   * or for AskUserQuestion `AskUserQuestion answered <answer per question JSON>`.
+   * With `await: false` it continues without waiting for the decision.
+   */
+  | {
+      canUseTool: {
+        name: string;
+        input: Record<string, unknown>;
+        mcpServer?: { name: string; source: string };
+        await?: false;
+      };
+    };
 
 export interface Turn {
   /** Used for the first prompt containing this text; a turn without it matches any prompt. */
@@ -197,6 +212,51 @@ async function waitForFile(path: string): Promise<void> {
 let initialized = false;
 let ignoreTermination = false;
 let queue = Promise.resolve();
+/** Control requests sent to the SDK, by request ID, waiting for its control_response. */
+const awaiting = new Map<string, (response: Record<string, unknown>) => void>();
+
+async function canUseTool(step: Extract<Step, { canUseTool: unknown }>["canUseTool"]) {
+  const requestId = `req_${randomUUID()}`;
+  const answered = new Promise<Record<string, unknown>>((settle) =>
+    awaiting.set(requestId, settle),
+  );
+  send({
+    type: "control_request",
+    request_id: requestId,
+    request: {
+      subtype: "can_use_tool",
+      tool_name: step.name,
+      input: step.input,
+      tool_use_id: `toolu_${randomUUID()}`,
+      ...(step.mcpServer ? { mcp_server: step.mcpServer } : {}),
+    },
+  });
+  if (step.await === false) return;
+  const response = await answered;
+  const decision = (response.response ?? {}) as {
+    behavior?: string;
+    updatedInput?: unknown;
+    message?: string;
+  };
+  assistant([
+    {
+      type: "text",
+      text:
+        decision.behavior !== "allow"
+          ? `${step.name} denied ${decision.message ?? String(response.error)}`
+          : step.name === "AskUserQuestion"
+            ? `${step.name} answered ${JSON.stringify(answersByQuestion(step.input, decision.updatedInput))}`
+            : `${step.name} allowed ${JSON.stringify(decision.updatedInput)}`,
+    },
+  ]);
+}
+
+/** The answer to each asked question, looked up by its text as Claude Code does. */
+function answersByQuestion(asked: Record<string, unknown>, updated: unknown): (string | null)[] {
+  const answers = (updated as { answers?: Record<string, string> } | undefined)?.answers ?? {};
+  const questions = (asked.questions ?? []) as { question: string }[];
+  return questions.map((item) => answers[item.question] ?? null);
+}
 
 async function answer(prompt: string): Promise<void> {
   if (!initialized) {
@@ -318,6 +378,8 @@ async function answer(prompt: string): Promise<void> {
         uuid: randomUUID(),
         session_id: sessionId,
       });
+    } else if ("canUseTool" in step) {
+      await canUseTool(step.canUseTool);
     } else if ("exit" in step) {
       if (step.exit.stderr) process.stderr.write(`${step.exit.stderr}\n`);
       process.exit(step.exit.code);
@@ -335,6 +397,11 @@ lines.on("line", (line) => {
     }
     const prompt = promptText(message);
     queue = queue.then(() => answer(prompt));
+    return;
+  }
+  if (message.type === "control_response") {
+    awaiting.get(message.response.request_id)?.(message.response);
+    awaiting.delete(message.response.request_id);
     return;
   }
   if (message.type !== "control_request") return;

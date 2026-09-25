@@ -1,6 +1,6 @@
 # Codex to Claude bridge
 
-A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout (optionally with nested read-only agents) and writing tasks in isolated Git worktrees, with bounded waits, cursor-based progress reads, follow-ups to the same Claude session, and cancellation; publishing task pull requests is not implemented yet.
+A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout (optionally with nested read-only agents) and writing tasks in isolated Git worktrees, with bounded waits, cursor-based progress reads, answers to Claude's questions and permission requests, follow-ups to the same Claude session, and cancellation; publishing task pull requests is not implemented yet.
 
 ## Setup
 
@@ -36,11 +36,11 @@ Codex launches `node dist/cli.mjs mcp` from the plugin. That MCP entry point kee
 
 The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (bridge-composed diagnostics, rotated at 1 MB), and the optional `config.json`:
 
-| Key                | Meaning                                                                     |
-| ------------------ | --------------------------------------------------------------------------- |
-| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`     |
-| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR` |
-| `mcpServers`       | MCP servers Claude may use, in Claude Code's format                         |
+| Key                | Meaning                                                                                                                                |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`                                                                |
+| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`                                                            |
+| `mcpServers`       | MCP servers Claude may use, in Claude Code's format. `"autoApprove": true` on an entry lets Claude call its tools without asking Codex |
 
 The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
 
@@ -51,6 +51,8 @@ A writing task (`mode: write`) gets its own worktree under `worktrees/<task>` in
 Delegated tasks are stored in `state.db` with their executions, provider session references, and results. Each task belongs to a project (the Git root realpath) and a logical caller: `$CODEX_CLAUDE_BRIDGE_CALLER`, default `codex`, which the plugin forwards from Codex's environment. A request key identifies a start request within that scope, so retries return the existing task. A task runs in the service, not the MCP connection, and continues when Codex disconnects. Before sending the brief, the service checks that the Claude Code session uses a verified subscription login and offers the requested model. When a new service starts, executions left running by its predecessor are reported as `interrupted`.
 
 A task's executions run one at a time: a follow-up is a new execution that resumes the task's Claude session (`--resume`) after the active execution ends, and fails as `session_unavailable` rather than starting a new conversation when Claude Code cannot resume it. Cancellation stops the running Claude Code process, which the service spawns itself so it can confirm the process exited (escalating to `SIGKILL` after a grace period), and cancels queued follow-ups.
+
+Claude runs the tools its task profile grants without asking. It waits for Codex only when it asks a question (`AskUserQuestion`) or calls a tool of a server configured in `mcpServers` without `autoApprove`: the service records a pending request with its task, execution, and Claude session, reports the execution as `needs_input`, and answers Claude Code's permission callback once `respond_to_request` arrives. A request is answerable only while the Claude Code process that asked is running in the current service; when that execution ends, or the service restarts, the request expires and a follow-up has to carry the answer.
 
 Claude may start nested agents through Claude Code's Agent tool. The read-only profile disables the edit tools with session deny rules, which Claude Code (verified in 2.1.282) applies to every nested agent's tools and permission checks, whatever its definition lists. The adapter records the nested agents Claude Code reports (`task_started`, `task_progress`, `task_notification`) per execution. A successful result that arrives while some of them still run leaves the execution `running` with `reason: waiting_for_children`: Claude Code runs another turn when a nested agent finishes, and the execution completes with the first result after all have ended. If Claude Code exits first, the execution fails. Nothing bounds a nested agent that never ends except cancellation, which asks Claude Code to stop each running nested agent (`stop_task`), waits briefly for it to report them stopped, and then ends the process. In-process agents end with the process; work they started outside it is not controlled, and the cancel response discloses nested agents whose stop was not reported.
 

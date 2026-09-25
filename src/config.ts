@@ -9,6 +9,8 @@ const mcpServer = z.looseObject({
   env: z.record(z.string(), z.string()).optional(),
   url: z.string().optional(),
   headers: z.record(z.string(), z.string()).optional(),
+  /** Lets Claude call the server's tools without asking the parent agent first. */
+  autoApprove: z.boolean().optional(),
 });
 
 const configSchema = z.strictObject({
