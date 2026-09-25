@@ -47,6 +47,7 @@ The most common defect is a change that works on the path you tested and is miss
 - Add `Co-authored-by: Codex <codex@users.noreply.github.com>` after a blank line in commit messages for changes made by Codex. Preserve this trailer when squashing commits.
 - Make a PR only when the developer asks for one.
 - Conventional Commits titles in plain language: `fix(service): report interrupted executions after restart`.
+- Commit types drive releases: release-please turns `feat` and `fix` commits on `main` into `CHANGELOG.md` entries and the next version, and `!` after the type marks a breaking change as README defines it. Do not edit `CHANGELOG.md` or the version fields by hand.
 - Body: the problem in a sentence or two, then how you fixed it.
 - One concern per PR. If the description says "also", split it.
 - When babysitting a PR: read checks and comments newer than the last push, verify each bot finding against the source, fix real ones, and dismiss false positives with a written reason. Stop when checks are green on the latest commit.
