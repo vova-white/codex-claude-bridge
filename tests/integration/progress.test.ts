@@ -110,6 +110,33 @@ describe("waiting and progress", () => {
     });
   });
 
+  it("reports the latest reset time when a capacity wait is renewed", async () => {
+    const fixture = bridge();
+    const { client, project, taskId } = await startTask(fixture, [
+      { rateLimit: { status: "rejected", resetsAt: 1_900_000_000 } },
+      { rateLimit: { status: "rejected", resetsAt: 1_900_000_000 } },
+      { waitFor: "renew" },
+      { rateLimit: { status: "rejected", resetsAt: 2_000_000_000 } },
+      { waitFor: "never" },
+    ]);
+    await waitFor(async () => {
+      const status = (await client.call("task_status", { project, taskId })).data;
+      return status.reason === "waiting_for_capacity" || undefined;
+    });
+    fixture.release("renew");
+
+    const renewed = await waitFor(async () => {
+      const status = (await client.call("task_status", { project, taskId })).data;
+      return status.detail?.resetsAt === 2_000_000_000 ? status : undefined;
+    });
+    expect(renewed).toMatchObject({ status: "running", reason: "waiting_for_capacity" });
+    const waited = (await client.call("wait_task", { project, taskId, timeoutSeconds: 0 })).data;
+    expect(waited.detail).toEqual({ resetsAt: 2_000_000_000 });
+    const events = (await client.call("read_output", { project, taskId })).data.events;
+    const waits = events.filter((event: { text: string }) => event.text.startsWith("Waiting"));
+    expect(waits).toHaveLength(2);
+  });
+
   it("rejects waiting for an execution the task does not have", async () => {
     const fixture = bridge();
     const { client, project, taskId } = await startTask(fixture, [finished("Done.")]);

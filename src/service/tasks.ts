@@ -5,7 +5,7 @@ import { z } from "zod";
 import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { redactContent } from "../redact.ts";
+import { errorOrigin, redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
@@ -299,7 +299,7 @@ export class TaskService {
     // Accepted intent is durable before any Claude Code process starts.
     setImmediate(() => {
       this.execute(executionId, project, request).catch((error: unknown) => {
-        this.log(`execution ${executionId} failed unexpectedly: ${(error as Error).stack}`);
+        this.log(`execution ${executionId} failed unexpectedly: ${errorOrigin(error)}`);
         this.update(executionId, {
           status: "failed",
           reason: "provider_error",
@@ -647,14 +647,16 @@ export class TaskService {
           },
           capacity: (waiting) => {
             const current = this.db
-              .prepare("SELECT reason FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null };
-            if ((current.reason === "waiting_for_capacity") === Boolean(waiting)) return;
+              .prepare("SELECT reason, detail FROM executions WHERE id = ?")
+              .get(executionId) as { reason: string | null; detail: string | null };
+            const detail = waiting ? JSON.stringify(waiting) : null;
+            const unchanged = waiting
+              ? current.reason === "waiting_for_capacity" && current.detail === detail
+              : current.reason !== "waiting_for_capacity";
+            if (unchanged) return;
             const changed = this.update(
               executionId,
-              waiting
-                ? { reason: "waiting_for_capacity", detail: JSON.stringify(waiting) }
-                : { reason: null, detail: null },
+              waiting ? { reason: "waiting_for_capacity", detail } : { reason: null, detail: null },
             );
             if (changed) {
               this.record(

@@ -1,3 +1,5 @@
+import { constants } from "node:os";
+
 /** Shapes that are credentials wherever they appear. */
 const credentialPatterns: [RegExp, string][] = [
   [/sk-ant-[\w-]+/g, "sk-ant-[REDACTED]"],
@@ -86,4 +88,28 @@ export function redactContent(text: string, secrets: readonly string[] = []): st
     maskUrlCredentials(url, decoded),
   );
   return replace(withUrls, secrets, credentialPatterns);
+}
+
+const errorNames = new Set([
+  "Error",
+  "TypeError",
+  "RangeError",
+  "SyntaxError",
+  "ReferenceError",
+  "AbortError",
+  "TimeoutError",
+  "SqliteError",
+]);
+const errnoCodes = new Set(Object.keys(constants.errno));
+
+/**
+ * An error's type and code, for the service log, drawn only from values Node
+ * defines: an error's own fields can carry text from Claude Code, the SDK, or
+ * an MCP server.
+ */
+export function errorOrigin(error: unknown): string {
+  if (!(error instanceof Error)) return `non-error value (${typeof error})`;
+  const name = errorNames.has(error.name) ? error.name : "Error";
+  const code = (error as NodeJS.ErrnoException).code;
+  return typeof code === "string" && errnoCodes.has(code) ? `${name} (${code})` : name;
 }
