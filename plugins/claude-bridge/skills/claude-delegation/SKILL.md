@@ -1,6 +1,6 @@
 ---
 name: claude-delegation
-description: Check whether Claude Code is ready to take delegated work through the claude_bridge MCP tools, and interpret the readiness report. Use before planning to hand work to Claude, or when the user asks whether the Codex-Claude bridge is set up.
+description: Delegate read-only research and review assignments to Claude Code through the claude_bridge MCP tools, check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
 ---
 
 # Claude delegation
@@ -9,7 +9,36 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports one operation: `readiness`. It does not start, wait for, continue, or cancel delegated tasks yet. Do not claim that work was delegated to Claude; do the work yourself or tell the user that delegation is not available in this release. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. It cannot edit files, publish changes, wait with a timeout, take follow-ups, answer questions mid-task, be cancelled, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+
+## When to delegate
+
+Delegate a focused investigation or review that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
+
+## Delegating a read-only task
+
+1. Check `readiness` once per session for the project. Do not delegate unless `ready` is true.
+2. Call `start_task` with:
+   - `project`: absolute path of the Git checkout.
+   - `requestKey`: a key you choose for this request, such as `review-auth-2`. If the call fails or its response is lost, call `start_task` again with the same key and arguments: you get the same task back, never a second one. Use a new key for different work; reusing a key with different arguments fails.
+   - `assignment`: a self-contained brief. Claude sees nothing of this conversation except `assignment`, `context`, and `expectedResult`.
+   - `context`: file paths, findings, constraints, and decisions Claude needs.
+   - `expectedResult`: what a complete answer contains.
+   - Optionally `model` and `effort`, chosen from the readiness `models`.
+3. The call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes.
+4. Check progress with `task_status` or `list_tasks` when you need the result, not in a tight loop. `list_tasks` also finds tasks started before a reconnect.
+5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed.
+
+Claude runs with the edit tools disabled and without nested agents, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`.
+
+## Reading status and results
+
+- `queued`, `running`: in progress. `reason: waiting_for_capacity` means Claude Code is waiting for subscription capacity (`detail.resetsAt` is a Unix time when known); the task continues on its own.
+- `completed`: `task_result` has `summary`, `evidence`, `failures`, `remainingWork`, and `workspace`.
+- `failed`: `reason` is `authentication` (not a verified subscription login; the brief was not sent), `subscription_limit`, `invalid_request` (for example an unavailable model), or `provider_error`. Relay `error.message` and `error.action`. Do not resubmit in a loop.
+- `interrupted`: the bridge service stopped while the task ran. The result may be incomplete; decide whether to start a new task with a new request key.
+
+Review the result in proportion to its risk: check the evidence behind claims you will act on, rather than repeating the whole investigation.
 
 ## Checking readiness
 

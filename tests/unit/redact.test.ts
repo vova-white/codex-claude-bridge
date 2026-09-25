@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { configSecrets, type BridgeConfig } from "../../src/config.ts";
-import { redact } from "../../src/redact.ts";
+import { redact, redactContent } from "../../src/redact.ts";
 
 function redactFor(url: string, message: string): string {
   const config: BridgeConfig = { mcpServers: { tracker: { type: "http", url } } };
@@ -38,5 +38,30 @@ describe("MCP URL credential redaction", () => {
       "SDK error: pw-secret token-secret",
     );
     expect(message).not.toMatch(/pw-secret|token-secret/);
+  });
+});
+
+describe("task result redaction", () => {
+  const secrets = configSecrets({
+    mcpServers: {
+      tracker: { type: "http", url: "https://tracker.invalid/mcp?token=a%2fb%20c-key" },
+    },
+  });
+
+  it("masks configured query credentials in any encoding and keeps the rest of the link", () => {
+    expect(
+      redactContent("See https://tracker.invalid/mcp?token=a%2Fb+c-key&page=2#top.", secrets),
+    ).toBe("See https://tracker.invalid/mcp?token=[REDACTED]&page=2#top.");
+  });
+
+  it("keeps ordinary links and prose readable", () => {
+    const text = "Docs: https://docs.invalid/search?q=password%3A+required and ssh://git@host/repo";
+    expect(redactContent(text, secrets)).toBe(text);
+  });
+
+  it("masks user info that carries a password", () => {
+    expect(redactContent("Clone https://me:pw-123@host.invalid/repo", secrets)).toBe(
+      "Clone https://[REDACTED]@host.invalid/repo",
+    );
   });
 });

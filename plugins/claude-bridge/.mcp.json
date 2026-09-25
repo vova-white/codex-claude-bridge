@@ -4,7 +4,7 @@
       "command": "node",
       "args": ["./dist/cli.mjs", "mcp"],
       "cwd": ".",
-      "env_vars": ["CODEX_CLAUDE_BRIDGE_HOME", "XDG_STATE_HOME"],
+      "env_vars": ["CODEX_CLAUDE_BRIDGE_HOME", "CODEX_CLAUDE_BRIDGE_CALLER", "XDG_STATE_HOME"],
       "startup_timeout_sec": 30,
       "tool_timeout_sec": 120
     }

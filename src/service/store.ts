@@ -1,7 +1,35 @@
 import { DatabaseSync } from "node:sqlite";
 
 /** Schema changes, applied in order and recorded in PRAGMA user_version. */
-const migrations: string[] = [];
+const migrations: string[] = [
+  `CREATE TABLE tasks (
+    id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    caller TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    assignment TEXT NOT NULL,
+    session_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (project, caller, request_key)
+  );
+  CREATE TABLE executions (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks (id),
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    detail TEXT,
+    error TEXT,
+    session_id TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    UNIQUE (task_id, ordinal)
+  )`,
+];
 
 export class StoreLockedError extends Error {}
 

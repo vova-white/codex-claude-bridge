@@ -1,7 +1,7 @@
 {
   "name": "claude-bridge",
   "version": "0.1.0",
-  "description": "Check whether Claude Code is ready to take work from Codex through a local background service that uses your Claude subscription.",
+  "description": "Delegate read-only research and review tasks from Codex to Claude Code through a local background service that uses your Claude subscription.",
   "author": {
     "name": "vova-white"
   },
@@ -10,7 +10,7 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Claude Bridge",
-    "shortDescription": "Check Claude Code readiness",
+    "shortDescription": "Delegate read-only tasks to Claude Code",
     "developerName": "vova-white",
     "category": "Coding",
     "capabilities": ["Read"]

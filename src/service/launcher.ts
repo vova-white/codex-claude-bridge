@@ -30,6 +30,7 @@ function logTail(paths: StatePaths): string {
 export async function connectService(
   paths: StatePaths,
   cliPath: string,
+  caller: string,
 ): Promise<ServiceConnection> {
   secureStateDir(paths);
   const deadline = Date.now() + startTimeoutMs;
@@ -39,7 +40,7 @@ export async function connectService(
     const token = readToken(paths);
     if (token) {
       try {
-        return await ServiceConnection.open(paths.socket, token);
+        return await ServiceConnection.open(paths.socket, token, caller);
       } catch (error) {
         lastError = error;
         if (error instanceof ServiceError && error.code === "protocol_mismatch") throw error;

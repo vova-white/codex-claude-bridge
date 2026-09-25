@@ -63,7 +63,7 @@ describe("background service", () => {
       socket.on("close", () => resolve(received));
       socket.on("error", reject);
       socket.write(
-        `${JSON.stringify({ id: 1, method: "hello", params: { token: "guess", protocol: 1 } })}\n`,
+        `${JSON.stringify({ id: 1, method: "hello", params: { token: "guess", protocol: 2, caller: "codex" } })}\n`,
       );
       socket.write(`${JSON.stringify({ id: 2, method: "readiness", params: {} })}\n`);
     });
