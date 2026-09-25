@@ -4,7 +4,7 @@ import { z } from "zod";
 import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { redact } from "../redact.ts";
+import { redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
@@ -383,7 +383,7 @@ export class TaskService {
       ? parsed.data
       : { summary: outcome.text, evidence: [], failures: [], remainingWork: [] };
     // Claude can read configured credentials; they must not reach Codex through results.
-    const clean = (text: string) => redact(text, secrets);
+    const clean = (text: string) => redactContent(text, secrets);
     const result = {
       summary: clean(reported.summary),
       evidence: reported.evidence.map(clean),

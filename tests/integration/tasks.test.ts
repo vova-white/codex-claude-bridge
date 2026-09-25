@@ -207,7 +207,7 @@ describe("read-only delegated tasks", () => {
               {
                 result: {
                   structured: {
-                    summary: "The token is tok-RESULTSECRET.",
+                    summary: "The token is tok-RESULTSECRET; see https://docs.invalid/a?page=2.",
                     evidence: ["env TOKEN=tok-RESULTSECRET"],
                     failures: [],
                     remainingWork: [],
@@ -225,7 +225,9 @@ describe("read-only delegated tasks", () => {
     await statusWhen(client, project, taskId, terminal);
 
     const result = await client.call("task_result", { project, taskId });
-    expect(result.data.result.summary).toContain("[REDACTED]");
+    expect(result.data.result.summary).toBe(
+      "The token is [REDACTED]; see https://docs.invalid/a?page=2.",
+    );
     expect(result.text).not.toContain("RESULTSECRET");
   });
 
