@@ -105,7 +105,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     problems,
   };
 
-  const executable = config.claudeExecutable ?? findOnPath("claude");
+  const executable = claudeExecutable(config);
   if (!executable) {
     problem(
       "claude_missing",
@@ -265,7 +265,7 @@ export function classifyCredentials(account: AccountInfo): ReadinessReport["cred
   return { source: "unknown", verified: false, ...details };
 }
 
-function credentialAction(credentials: ReadinessReport["credentials"]): string | undefined {
+export function credentialAction(credentials: ReadinessReport["credentials"]): string | undefined {
   const login = "run `claude`, then `/login` with your Claude subscription account";
   switch (credentials.source) {
     case "subscription":
@@ -356,6 +356,11 @@ async function checkGit(
   return git;
 }
 
+/** The configured Claude Code executable, or `claude` from the service PATH. */
+export function claudeExecutable(config: BridgeConfig): string | undefined {
+  return config.claudeExecutable ?? findOnPath("claude");
+}
+
 function findOnPath(command: string): string | undefined {
   for (const directory of (process.env.PATH ?? "").split(delimiter)) {
     if (!directory) continue;
@@ -370,7 +375,7 @@ function findOnPath(command: string): string | undefined {
   return undefined;
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   return Promise.race([
     promise,

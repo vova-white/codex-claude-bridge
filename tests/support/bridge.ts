@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -39,6 +40,7 @@ export class BridgeFixture {
   readonly root = mkdtempSync(join(tmpdir(), "bridge-test-"));
   readonly stateDir = join(this.root, "state");
   readonly promptLog = join(this.root, "prompts.jsonl");
+  readonly launchLog = join(this.root, "launches.jsonl");
   private readonly clients = new Set<Client>();
   private readonly servicePids = new Set<number>();
 
@@ -60,14 +62,19 @@ export class BridgeFixture {
       CODEX_CLAUDE_BRIDGE_HOME: this.stateDir,
       FAKE_CLAUDE_SCENARIO: scenario,
       FAKE_CLAUDE_PROMPT_LOG: this.promptLog,
+      FAKE_CLAUDE_LAUNCH_LOG: this.launchLog,
       ...options.env,
     };
   }
 
   readonly env: Record<string, string>;
 
-  async connect(): Promise<BridgeClient> {
-    const transport = new StdioClientTransport({ ...this.entry, env: this.env, stderr: "pipe" });
+  /** Connects a new MCP client; `caller` sets its logical caller identity. */
+  async connect(options: { caller?: string } = {}): Promise<BridgeClient> {
+    const env = options.caller
+      ? { ...this.env, CODEX_CLAUDE_BRIDGE_CALLER: options.caller }
+      : this.env;
+    const transport = new StdioClientTransport({ ...this.entry, env, stderr: "pipe" });
     const client = new Client({ name: "bridge-test", version: "0.0.0" });
     await client.connect(transport);
     this.clients.add(client);
@@ -100,6 +107,41 @@ export class BridgeFixture {
     }
   }
 
+  /** Lets a scripted `waitFor` step with this name continue. */
+  release(name: string): void {
+    writeFileSync(join(this.root, name), "");
+  }
+
+  /** Prompts the scripted Claude Code received, in order. */
+  prompts(): string[] {
+    return readLines(this.promptLog).map((line) => {
+      const content = JSON.parse(line).message.content;
+      return typeof content === "string"
+        ? content
+        : content.map((part: { text?: string }) => part.text ?? "").join("\n");
+    });
+  }
+
+  /** Arguments and working directory of each scripted Claude Code process. */
+  launches(): { args: string[]; cwd: string }[] {
+    return readLines(this.launchLog)
+      .map((line) => JSON.parse(line))
+      .filter((launch) => !launch.args.includes("--version"));
+  }
+
+  /** Creates a Git repository with one commit and returns its path. */
+  createRepository(name = "repo"): string {
+    const path = join(this.root, name);
+    mkdirSync(path);
+    const git = (...args: string[]) =>
+      execFileSync("git", args, { cwd: path, env: { ...process.env, ...gitIdentity } });
+    git("init", "--quiet", "--initial-branch=main");
+    writeFileSync(join(path, "README.md"), "# Fixture\n");
+    git("add", ".");
+    git("commit", "--quiet", "-m", "Initial commit");
+    return realpathSync(path);
+  }
+
   serviceLog(): string {
     try {
       return readFileSync(join(this.stateDir, "service.log"), "utf8");
@@ -113,6 +155,23 @@ export class BridgeFixture {
     this.servicePid();
     await Promise.all([...this.servicePids].map((pid) => stopProcess(pid)));
     rmSync(this.root, { recursive: true, force: true });
+  }
+}
+
+const gitIdentity = {
+  GIT_AUTHOR_NAME: "Bridge Test",
+  GIT_AUTHOR_EMAIL: "bridge@example.invalid",
+  GIT_COMMITTER_NAME: "Bridge Test",
+  GIT_COMMITTER_EMAIL: "bridge@example.invalid",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+};
+
+function readLines(path: string): string[] {
+  try {
+    return readFileSync(path, "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
   }
 }
 

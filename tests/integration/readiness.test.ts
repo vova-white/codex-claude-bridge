@@ -53,7 +53,13 @@ describe("readiness", () => {
     expect(report.models).toEqual([
       expect.objectContaining({ value: "sonnet", supportedEffortLevels: ["low", "high"] }),
     ]);
-    expect(report.operations).toEqual(["readiness"]);
+    expect(report.operations).toEqual([
+      "readiness",
+      "start_task",
+      "list_tasks",
+      "task_status",
+      "task_result",
+    ]);
     expect(report.git.project.root).toBe(process.cwd());
     expect(existsSync(fixture.promptLog)).toBe(false);
   });

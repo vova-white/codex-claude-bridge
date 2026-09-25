@@ -14,6 +14,18 @@ _Avoid_: Native Codex subagent
 **Delegated task**:
 A bounded assignment from the parent agent to a child agent, with an expected result.
 
+**Execution**:
+One run of Claude Code for a delegated task, with its own identity, status, and result. The first execution carries the original assignment.
+
+**Request key**:
+A caller-chosen key that identifies one start request within a project and logical caller, so a retried request returns the existing task instead of creating another.
+
+**Logical caller**:
+The identity that owns delegated tasks across MCP connections, such as one Codex installation. A reconnecting parent agent finds the tasks it started as the same logical caller.
+
+**Task profile**:
+The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox.
+
 **Task result**:
 The outcome of delegated work, including findings or code changes, verification evidence, and any associated pull request.
 

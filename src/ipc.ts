@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 
 /** Incremented whenever the MCP entry point and the service stop understanding each other. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 interface Request {
   id: number;
@@ -49,7 +49,12 @@ function write(socket: Socket, message: Response | Request): void {
   if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`);
 }
 
-export type Handler = (params: unknown) => Promise<unknown>;
+/** Who is calling: the logical caller identity presented when the connection was opened. */
+export interface CallContext {
+  caller: string;
+}
+
+export type Handler = (params: unknown, context: CallContext) => Promise<unknown>;
 
 /**
  * Serves newline-delimited JSON requests on a local socket. Each connection must
@@ -64,12 +69,16 @@ export function serve(
 ): Promise<Server> {
   const expected = Buffer.from(token);
   const server = createServer((socket) => {
-    let authenticated = false;
+    let context: CallContext | undefined;
     socket.on("error", () => socket.destroy());
     readLines(socket, (value) => {
       const request = value as Request;
-      if (!authenticated) {
-        const params = (request.params ?? {}) as { token?: unknown; protocol?: unknown };
+      if (!context) {
+        const params = (request.params ?? {}) as {
+          token?: unknown;
+          protocol?: unknown;
+          caller?: unknown;
+        };
         const presented = Buffer.from(typeof params.token === "string" ? params.token : "");
         if (
           request.method !== "hello" ||
@@ -94,7 +103,18 @@ export function serve(
           socket.end();
           return;
         }
-        authenticated = true;
+        if (typeof params.caller !== "string" || !params.caller || params.caller.length > 200) {
+          write(socket, {
+            id: request.id,
+            error: {
+              code: "invalid_caller",
+              message: "A caller identity of 1-200 characters is required.",
+            },
+          });
+          socket.end();
+          return;
+        }
+        context = { caller: params.caller };
         write(socket, { id: request.id, result: welcome });
         return;
       }
@@ -106,7 +126,7 @@ export function serve(
         });
         return;
       }
-      handler(request.params).then(
+      handler(request.params, context).then(
         (result) => write(socket, { id: request.id, result: result ?? null }),
         (error: unknown) => {
           if (!(error instanceof ServiceError)) onError(error);
@@ -161,14 +181,14 @@ export class ServiceConnection {
     socket.on("error", fail);
   }
 
-  static open(socketPath: string, token: string): Promise<ServiceConnection> {
+  static open(socketPath: string, token: string, caller: string): Promise<ServiceConnection> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(socketPath);
       socket.once("error", reject);
       socket.once("connect", () => {
         socket.off("error", reject);
         const connection = new ServiceConnection(socket);
-        connection.request("hello", { token, protocol: PROTOCOL_VERSION }).then(
+        connection.request("hello", { token, protocol: PROTOCOL_VERSION, caller }).then(
           () => resolve(connection),
           (error: unknown) => {
             socket.destroy();

@@ -33,7 +33,10 @@ test("the plugin copied into a Codex cache reaches the service through its MCP e
     const client = await fixture.connect();
     const result = await client.call("readiness");
     expect(result.isError).toBe(false);
-    expect(result.data).toMatchObject({ ready: true, operations: ["readiness"] });
+    expect(result.data).toMatchObject({
+      ready: true,
+      operations: ["readiness", "start_task", "list_tasks", "task_status", "task_result"],
+    });
   } finally {
     await fixture.cleanup();
   }
