@@ -61,6 +61,15 @@ const migrations: string[] = [
     ended_at TEXT,
     PRIMARY KEY (execution_id, task_id)
   )`,
+  `CREATE TABLE workspaces (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    parent_dirty INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
 ];
 
 export class StoreLockedError extends Error {}

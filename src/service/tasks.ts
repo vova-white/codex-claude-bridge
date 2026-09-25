@@ -1,14 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
+import {
+  reportedResult,
+  runExecution,
+  writingResult,
+  type ExecutionOutcome,
+} from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { errorOrigin, redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
-import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
+import {
+  addWorktree,
+  branchTypes,
+  changedPaths,
+  checkoutState,
+  hasUncommittedChanges,
+  repositoryRoot,
+  resolveCommit,
+  taskBranch,
+  worktreeChanges,
+} from "../workspace.ts";
 
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 
@@ -33,9 +50,22 @@ export const startSchema = z.object({
     .describe("A model value from readiness; defaults to Claude Code's default model."),
   effort: z.enum(effortLevels).optional().describe("Reasoning effort the model supports."),
   mode: z
-    .enum(["read-only"])
+    .enum(["read-only", "write"])
     .default("read-only")
-    .describe("Task profile. Only read-only work on the shared checkout is supported."),
+    .describe(
+      "Task profile: read-only inspects the shared checkout; write changes files in a new Git worktree on its own task branch.",
+    ),
+  baseline: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Write mode: the committed revision to start from. Defaults to HEAD, but is required when the checkout has uncommitted changes, which the child would not see.",
+    ),
+  branchType: z
+    .enum(branchTypes)
+    .optional()
+    .describe("Write mode: GitFlow prefix of the task branch (default feature)."),
 });
 export type StartRequest = z.infer<typeof startSchema>;
 
@@ -139,6 +169,21 @@ const projectLookup = z.object({ project: z.string().min(1) });
  * rules to nested agents too, whatever tools their definitions list.
  */
 const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit"];
+/** Most commits and changed files a result lists, and the longest commit subject kept. */
+const maxListedChanges = 500;
+const maxSubjectChars = 1_000;
+/** Writing tasks get every tool except nested agents, which could not be held to the worktree. */
+const writingDisallowedTools = ["Agent"];
+
+interface WorkspaceRow {
+  task_id: string;
+  path: string;
+  branch: string;
+  baseline: string;
+  parent_dirty: number;
+  state: string;
+  created_at: string;
+}
 
 interface TaskRow {
   id: string;
@@ -223,6 +268,20 @@ No one can answer questions while you work. Make reasonable assumptions, state t
 Finish with the structured result: summary (the answer or outcome), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), and remainingWork (what is left for the parent).`;
 }
 
+function writingGuidance(workspace: WorkspaceRow, parent: string): string {
+  return `You are the child agent carrying out a task delegated by Codex, the parent agent. Work autonomously on the assignment in the user message; the parent reviews your result.
+
+This task uses the writing profile in its own Git worktree at ${workspace.path}, on branch ${workspace.branch}, starting from commit ${workspace.baseline}. Work only inside this worktree: other checkouts, including the parent's at ${parent}, belong to other agents. The worktree isolates Git changes; it is not a sandbox.
+
+Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. Do not push or open pull requests: publication is not enabled for this task.
+
+Nested agents are not available in this task: do all of the work yourself.
+
+No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+
+Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the parent), and checks (each check you ran and whether it passed).`;
+}
+
 /**
  * Owns delegated tasks: their durable identity, their executions, and the
  * Claude Code processes running them. Tasks belong to a project and a logical
@@ -294,23 +353,51 @@ export class TaskService {
     const { requestKey, project: _path, ...intent } = request;
     const hash = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
 
-    const existing = this.db
-      .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
-      .get(project, caller, requestKey) as TaskRow | undefined;
-    if (existing) {
-      if (existing.request_hash !== hash) {
+    const existing = () => {
+      const task = this.db
+        .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
+        .get(project, caller, requestKey) as TaskRow | undefined;
+      if (!task) return undefined;
+      if (task.request_hash !== hash) {
         throw new ServiceError(
           "request_key_conflict",
-          `Request key "${requestKey}" already started task ${existing.id} with different arguments. Use a new request key for different work.`,
+          `Request key "${requestKey}" already started task ${task.id} with different arguments. Use a new request key for different work.`,
         );
       }
-      const execution = this.execution(existing.id, 1);
+      const execution = this.execution(task.id, 1);
       return {
-        taskId: existing.id,
+        taskId: task.id,
         executionId: execution.id,
         status: execution.status,
         created: false,
       };
+    };
+    const earlier = existing();
+    if (earlier) return earlier;
+
+    let workspace: { baseline: string; parentDirty: boolean } | undefined;
+    if (request.mode === "write") {
+      const parentDirty = await hasUncommittedChanges(project);
+      if (parentDirty && !request.baseline) {
+        throw new ServiceError(
+          "dirty_parent",
+          `${project} has uncommitted changes, which a writing task would not see: its worktree starts from a commit. Commit the changes the child needs, or pass baseline (for example "HEAD") to start from that commit without them.`,
+        );
+      }
+      const baseline = await resolveCommit(project, request.baseline ?? "HEAD");
+      if (!baseline) {
+        throw new ServiceError(
+          "invalid_baseline",
+          `${request.baseline ?? "HEAD"} does not name a commit in ${project}.`,
+        );
+      }
+      workspace = { baseline, parentDirty };
+    } else if (request.baseline || request.branchType) {
+      // Absent options also keep the request identity of read-only tasks as it was.
+      throw new ServiceError(
+        "invalid_arguments",
+        "baseline and branchType apply only to writing tasks; read-only tasks inspect the shared checkout as it is.",
+      );
     }
 
     const taskId = `task_${randomUUID()}`;
@@ -318,6 +405,13 @@ export class TaskService {
     const createdAt = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // A concurrent request with the same key may have been accepted while this
+      // one checked the checkout.
+      const accepted = existing();
+      if (accepted) {
+        this.db.exec("ROLLBACK");
+        return accepted;
+      }
       this.db
         .prepare(
           `INSERT INTO tasks (id, project, caller, request_key, request_hash, mode, request, created_at)
@@ -338,6 +432,22 @@ export class TaskService {
           `INSERT INTO executions (id, task_id, ordinal, status, created_at) VALUES (?, ?, 1, 'queued', ?)`,
         )
         .run(executionId, taskId, createdAt);
+      if (workspace) {
+        // The worktree is bound to the task before any execution can edit.
+        this.db
+          .prepare(
+            `INSERT INTO workspaces (task_id, path, branch, baseline, parent_dirty, state, created_at)
+             VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+          )
+          .run(
+            taskId,
+            join(this.paths.worktrees, taskId),
+            taskBranch(request.branchType ?? "feature", request.assignment, taskId),
+            workspace.baseline,
+            workspace.parentDirty ? 1 : 0,
+            createdAt,
+          );
+      }
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -382,12 +492,14 @@ export class TaskService {
       .all(task.id) as unknown as ExecutionRow[];
     const latest = executions.at(-1)!;
     const intent = JSON.parse(task.request) as Omit<StartRequest, "project" | "requestKey">;
+    const workspace = this.workspace(task.id);
     return {
       taskId: task.id,
       project: task.project,
       mode: task.mode,
       ...executionState(latest),
       ...(task.session_id ? { sessionId: task.session_id } : {}),
+      ...(workspace ? { workspace: workspaceReport(workspace) } : {}),
       createdAt: task.created_at,
       request: intent,
       executions: executions.map((execution) => ({
@@ -415,12 +527,7 @@ export class TaskService {
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
     if (!execution.result) return { ...state, result: null };
-    const stored = JSON.parse(execution.result) as Record<string, unknown> & {
-      summary: string;
-      evidence: string[];
-      failures: string[];
-      remainingWork: string[];
-    };
+    const stored = JSON.parse(execution.result) as Record<string, unknown> & StoredResult;
     const parts = resultParts(stored);
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
     const next = page.next ? { part: page.next.part, offset: page.next.offset } : undefined;
@@ -438,19 +545,39 @@ export class TaskService {
     }
     const rest = Object.fromEntries(
       Object.entries(stored).filter(
-        ([key]) => !["summary", "evidence", "failures", "remainingWork"].includes(key),
+        ([key]) =>
+          !["summary", "evidence", "failures", "remainingWork", "checks", "workspace"].includes(
+            key,
+          ),
       ),
     );
-    const shown = (field: string) =>
-      page.parts.filter((item) => item.field === field).map((item) => item.text);
+    const shown = (field: string) => page.parts.filter((item) => item.field === field);
+    const texts = (field: string) => shown(field).map((item) => item.text);
     return {
       ...state,
       result: {
-        summary: shown("summary")[0] ?? "",
-        evidence: shown("evidence"),
-        failures: shown("failures"),
-        remainingWork: shown("remainingWork"),
+        summary: texts("summary")[0] ?? "",
+        evidence: texts("evidence"),
+        failures: texts("failures"),
+        remainingWork: texts("remainingWork"),
+        ...(stored.checks ? { checks: shownChecks(page.parts, stored.checks) } : {}),
         ...rest,
+        ...(stored.workspace
+          ? {
+              workspace: {
+                ...stored.workspace,
+                ...(stored.workspace.commits
+                  ? {
+                      commits: shown("commits").map((item) => ({
+                        sha: item.sha,
+                        subject: item.text,
+                      })),
+                    }
+                  : {}),
+                ...(stored.workspace.changedFiles ? { changedFiles: texts("changedFiles") } : {}),
+              },
+            }
+          : {}),
       },
       ...truncation,
     };
@@ -789,6 +916,38 @@ export class TaskService {
     });
   }
 
+  private workspace(taskId: string): WorkspaceRow | undefined {
+    return this.db.prepare("SELECT * FROM workspaces WHERE task_id = ?").get(taskId) as
+      | WorkspaceRow
+      | undefined;
+  }
+
+  /** Creates the task's worktree once; later executions reuse it. */
+  private async prepareWorkspace(workspace: WorkspaceRow): Promise<boolean> {
+    if (workspace.state === "ready") return true;
+    const task = this.db
+      .prepare("SELECT project FROM tasks WHERE id = ?")
+      .get(workspace.task_id) as {
+      project: string;
+    };
+    try {
+      mkdirSync(this.paths.worktrees, { recursive: true, mode: 0o700 });
+      await addWorktree(task.project, workspace.path, workspace.branch, workspace.baseline);
+    } catch (error) {
+      this.log(
+        `worktree for ${workspace.task_id} could not be created (${(error as NodeJS.ErrnoException).code ?? "git worktree add failed"})`,
+      );
+      this.db
+        .prepare("UPDATE workspaces SET state = 'failed' WHERE task_id = ?")
+        .run(workspace.task_id);
+      return false;
+    }
+    this.db
+      .prepare("UPDATE workspaces SET state = 'ready' WHERE task_id = ?")
+      .run(workspace.task_id);
+    return true;
+  }
+
   /** Starts the task's next queued execution unless one of its executions is running. */
   private schedule(taskId: string): void {
     if (this.launching.has(taskId)) return;
@@ -840,6 +999,7 @@ export class TaskService {
     const root = task.project;
     const request = JSON.parse(task.request) as StartRequest;
     const followUp = execution.kind === "follow-up";
+    const workspace = this.workspace(task.id);
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
@@ -863,19 +1023,29 @@ export class TaskService {
           "Start a new task with the context the follow-up needs; the earlier results stay available.",
         processExited: true,
       };
+    } else if (workspace && !(await this.prepareWorkspace(workspace))) {
+      outcome = {
+        status: "failed",
+        reason: "workspace_error",
+        message: `Could not create the task worktree at ${workspace.path} on branch ${workspace.branch}; no execution was started.`,
+        action:
+          "Check that the repository accepts new worktrees and branches (for example with `git worktree add`), then start a new task.",
+        processExited: true,
+      };
     } else {
-      before = await checkoutState(root);
+      if (!workspace) before = await checkoutState(root);
       outcome = await runExecution(
         {
           executable,
           env: claudeEnvironment(config),
           extraArgs: mcpConfigArgs(this.paths, config),
-          cwd: root,
+          cwd: workspace?.path ?? root,
           prompt: followUp ? `<follow-up>\n${execution.input}\n</follow-up>` : prompt(request),
           ...(followUp && task.session_id ? { resume: task.session_id } : {}),
           signal,
-          guidance: readOnlyGuidance(root),
-          disallowedTools: readOnlyDisallowedTools,
+          guidance: workspace ? writingGuidance(workspace, root) : readOnlyGuidance(root),
+          disallowedTools: workspace ? writingDisallowedTools : readOnlyDisallowedTools,
+          resultSchema: workspace ? writingResult : reportedResult,
           ...(request.model ? { model: request.model } : {}),
           ...(request.effort ? { effort: request.effort } : {}),
           secrets,
@@ -990,6 +1160,27 @@ export class TaskService {
     }
     const endedAt = now();
     const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
+    // A writing task's changes stay in its worktree whatever the outcome.
+    const changes =
+      workspace && this.workspace(task.id)?.state === "ready"
+        ? await worktreeChanges(workspace.path, workspace.baseline)
+            .then(({ commits, changedFiles }) => ({
+              // Long lists are cut; the worktree itself holds every change.
+              commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
+                sha,
+                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+              })),
+              changedFiles: changedFiles
+                .slice(0, maxListedChanges)
+                .map((file) => redactContent(file, secrets)),
+              commitCount: commits.length,
+              changedFileCount: changedFiles.length,
+            }))
+            .catch(() => undefined)
+        : undefined;
+    const retained = workspace
+      ? { workspace: { ...workspaceReport(this.workspace(task.id)!), ...changes } }
+      : {};
     const violation =
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
@@ -1001,6 +1192,7 @@ export class TaskService {
         detail: JSON.stringify({
           processExited: outcome.processExited,
           ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+          ...retained,
         }),
         ended_at: endedAt,
       });
@@ -1030,24 +1222,34 @@ export class TaskService {
           message: [outcome.message, ...violation].join(" "),
           ...(outcome.action ? { action: outcome.action } : {}),
           ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
+          ...retained,
         }),
         ended_at: endedAt,
       });
       if (failed) this.record(executionId, "status", `Failed (${outcome.reason}).`);
       return;
     }
-    const parsed = reportedResult.safeParse(outcome.structured);
+    const parsed = (workspace ? writingResult : reportedResult).safeParse(outcome.structured);
     const reported = parsed.success
       ? parsed.data
       : { summary: outcome.text, evidence: [], failures: [], remainingWork: [] };
     // Claude can read configured credentials; they must not reach Codex through results.
     const clean = (text: string) => redactContent(text, secrets);
+    const checks =
+      parsed.success && "checks" in parsed.data
+        ? (parsed.data as z.infer<typeof writingResult>).checks
+        : [];
     const result = {
       summary: clean(reported.summary),
       evidence: reported.evidence.map(clean),
       failures: [...reported.failures.map(clean), ...violation],
       remainingWork: reported.remainingWork.map(clean),
-      workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles },
+      ...(workspace
+        ? {
+            checks: checks.map((check) => redactStrings(check, clean)),
+            ...retained,
+          }
+        : { workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles } }),
     };
     const completed = this.update(executionId, {
       status: "completed",
@@ -1064,16 +1266,31 @@ interface ResultPart {
   part: number;
   field: string;
   index?: number;
+  /** Which string of a structured item the part holds, such as a check's `command`. */
+  key?: string;
+  /** Short values that belong with the part: a check's outcome, a commit's SHA. */
+  outcome?: string;
+  sha?: string;
   text: string;
 }
 
-/** The text of a result as an ordered list of parts: the summary, then each list item. */
-function resultParts(result: {
+type Check = z.infer<typeof writingResult>["checks"][number];
+
+interface StoredResult {
   summary: string;
   evidence: string[];
   failures: string[];
   remainingWork: string[];
-}): ResultPart[] {
+  checks?: Check[];
+  workspace?: { commits?: { sha: string; subject: string }[]; changedFiles?: string[] };
+}
+
+/**
+ * The text of a result as an ordered list of parts: the summary, each list
+ * item, each check's command and details, and each commit subject and changed
+ * file of a writing task's workspace.
+ */
+function resultParts(result: StoredResult): ResultPart[] {
   const fields = [
     ["evidence", result.evidence],
     ["failures", result.failures],
@@ -1082,13 +1299,54 @@ function resultParts(result: {
   const parts: Omit<ResultPart, "part">[] = [
     { field: "summary", text: result.summary },
     ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
+    ...(result.checks ?? []).flatMap((check, index) => [
+      { field: "checks", index, key: "command", outcome: check.outcome, text: check.command },
+      ...(check.details === undefined
+        ? []
+        : [{ field: "checks", index, key: "details", text: check.details }]),
+    ]),
+    ...(result.workspace?.commits ?? []).map(({ sha, subject }, index) => ({
+      field: "commits",
+      index,
+      sha,
+      text: subject,
+    })),
+    ...(result.workspace?.changedFiles ?? []).map((text, index) => ({
+      field: "changedFiles",
+      index,
+      text,
+    })),
   ];
   return parts.map((item, part) => ({ part, ...item }));
 }
 
+type ShownPart = ResultPart & { offset?: number; complete?: false };
+
+/** Checks as shown in a bounded result; a check whose text was cut says complete: false. */
+function shownChecks(page: ShownPart[], stored: Check[]) {
+  const shown = new Map<number, { command: string; details?: string; complete?: false }>();
+  for (const part of page.filter((item) => item.field === "checks")) {
+    const check = shown.get(part.index!) ?? { command: "" };
+    if (part.key === "command") check.command = part.text;
+    else check.details = part.text;
+    if (part.complete === false) check.complete = false;
+    shown.set(part.index!, check);
+  }
+  return [...shown].map(([index, check]) => {
+    const original = stored[index]!;
+    const missingDetails = original.details !== undefined && check.details === undefined;
+    return {
+      command: check.command,
+      outcome: original.outcome,
+      ...(check.details === undefined ? {} : { details: check.details }),
+      ...(check.complete === false || missingDetails ? { complete: false } : {}),
+    };
+  });
+}
+
 /** Reads parts from a position, returning at most `budget` characters and where to continue. */
 function readParts(parts: ResultPart[], start: number, offset: number, budget: number) {
-  const page: (ResultPart & { offset?: number; complete?: false })[] = [];
+  const page: ShownPart[] = [];
   let remaining = budget;
   for (let part = start; part < parts.length; part++) {
     const from = part === start ? offset : 0;
@@ -1120,6 +1378,18 @@ function redactStrings(value: unknown, clean: (text: string) => string): unknown
     );
   }
   return value;
+}
+
+function workspaceReport(workspace: WorkspaceRow) {
+  return {
+    kind: "worktree",
+    path: workspace.path,
+    branch: workspace.branch,
+    baseline: workspace.baseline,
+    parentDirty: workspace.parent_dirty === 1,
+    state: workspace.state,
+    isolation: "Git worktree: separate files and branch, not an operating-system sandbox.",
+  };
 }
 
 function executionState(execution: ExecutionRow) {

@@ -1,6 +1,6 @@
 ---
 name: claude-delegation
-description: Delegate read-only research and review assignments to Claude Code through the claude_bridge MCP tools, check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
+description: Delegate research, review, and code-change assignments to Claude Code through the claude_bridge MCP tools (read-only on the shared checkout, or writing in an isolated Git worktree), check readiness, and retrieve results. Use when a focused investigation or review could run in parallel with your own work, or when the user asks whether the Codex-Claude bridge is set up.
 ---
 
 # Claude delegation
@@ -9,11 +9,11 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude may engage nested read-only agents for parts of the task (see "Nested agents"). Claude cannot edit files, publish changes, or receive answers to questions mid-task yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back, and may engage nested read-only agents; see "Nested agents"), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch, without nested agents). You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude cannot push, open pull requests, or receive answers to questions mid-task yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
-Delegate a focused investigation or review that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
+Delegate a focused investigation, review, or implementation that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
 
 ## Delegating a read-only task
 
@@ -28,6 +28,14 @@ Delegate a focused investigation or review that Claude can complete from the rep
 3. The call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes.
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, call `task_result` again with `part` and `offset` from `truncated.next` to read the rest, repeating until no `truncated` remains. Read further only if you need the omitted detail.
+
+## Delegating a writing task
+
+Pass `mode: "write"` to `start_task` for a code change. The service creates a new Git worktree on its own GitFlow task branch (`branchType`: `feature` by default, or `bugfix`, `hotfix`, `release`, `support`) before Claude starts, and Claude edits, installs dependencies, runs checks, and commits only there. Your checkout and other tasks' worktrees are not touched. A worktree isolates Git changes; it is not a sandbox.
+
+The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
+
+The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure (`error.workspace`), and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the changes in proportion to their risk — `git -C <path> log <baseline>..HEAD`, `git -C <path> diff <baseline>` (working files), and `git -C <path> status` (staged and untracked files) — and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
 
 ## Follow-ups and cancellation
 
@@ -51,7 +59,7 @@ When Claude finishes its turn while nested agents it started still run, the exec
 
 Read progress only when it helps you decide something, such as whether a long task is on track. `read_output` returns the execution's events after a cursor: status changes, Claude's messages, the tools it called with their inputs, and the final summary. Keep reads small: start with the default `limit` and `maxChars`, pass the returned `nextCursor` as `after` to continue (cursors stay valid after reconnecting), and stop when `hasMore` is false. An event cut to fit `maxChars` is marked `truncated`; read just that event in full with `after` set to its `seq` minus 1, `limit: 1`, and a larger `maxChars`. `lastEventSeq` from `wait_task` tells you whether anything new arrived. Only the newest events of long executions are kept (`retention` says how many were dropped); results are never affected.
 
-Claude and its nested agents run with the edit tools disabled, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`.
+In read-only tasks, Claude and its nested agents run with the edit tools disabled, but shell commands remain available for inspection. This is a tool policy, not a sandbox: the bridge compares the checkout (HEAD, staged, and working files) before and after the task and lists any change in `result.workspace.modifiedFiles` and `result.failures`, or, when the execution failed and `result` is `null`, in `error.modifiedFiles`. Writing tasks report their changes in `workspace.changedFiles` and `workspace.commits` instead.
 
 ## Reading status and results
 
