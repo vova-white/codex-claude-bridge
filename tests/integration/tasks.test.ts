@@ -296,11 +296,19 @@ describe("read-only delegated tasks", () => {
     expect(result.workspace.modifiedFiles).toEqual(["README.md"]);
   });
 
-  it("reports checkout changes when the execution fails", async () => {
+  it("reports checkout changes when the execution fails, without file names in the message", async () => {
     const fixture = bridge({
+      config: {
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-FILESECRET" } } },
+      },
       scenario: {
         turns: [
-          { steps: [{ writeFile: { path: "notes.txt", content: "x" } }, { exit: { code: 1 } }] },
+          {
+            steps: [
+              { writeFile: { path: "notes-tok-FILESECRET.txt", content: "x" } },
+              { exit: { code: 1 } },
+            ],
+          },
         ],
       },
     });
@@ -309,8 +317,28 @@ describe("read-only delegated tasks", () => {
     const { taskId } = await start(client, assignment(project));
 
     const status = await statusWhen(client, project, taskId, terminal);
-    expect(status).toMatchObject({ status: "failed", error: { modifiedFiles: ["notes.txt"] } });
-    expect(status.error.message).toContain("notes.txt");
+    expect(status).toMatchObject({
+      status: "failed",
+      error: { modifiedFiles: ["notes-[REDACTED].txt"] },
+    });
+    expect(status.error.message).toContain("changed 1 file");
+    expect(status.error.message).not.toContain("notes-");
+    expect(JSON.stringify(status)).not.toContain("FILESECRET");
+  });
+
+  it("never reports a session ID Claude Code sends in an unrecognized form", async () => {
+    const fixture = bridge({
+      scenario: { sessionId: "LEAK-MARKER-session", turns: [{ steps: [{ exit: { code: 3 } }] }] },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+
+    const status = await statusWhen(client, project, taskId, terminal);
+    expect(status).toMatchObject({ status: "failed", reason: "provider_error" });
+    expect(status.sessionId).toBeUndefined();
+    expect(status.error.action).toContain("the task's session");
+    expect(JSON.stringify(status)).not.toContain("LEAK-MARKER");
   });
 
   it("reports files a read-only task changed in the shared checkout", async () => {

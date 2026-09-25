@@ -387,7 +387,8 @@ export function claudeProcess() {
   const exit: ProcessExit = {};
   let child: ChildProcess | undefined;
   let exited = Promise.resolve();
-  const within = (ms: number) =>
+  /** Whether the process exits within `ms`. */
+  const exitsWithin = (ms: number) =>
     Promise.race([
       exited.then(() => true),
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
@@ -414,15 +415,15 @@ export function claudeProcess() {
     },
     /** How the process ended; the SDK can report a failure before the exit event arrives. */
     exit: async (): Promise<ProcessExit> => {
-      await within(2_000);
+      await exitsWithin(2_000);
       return exit;
     },
     /** Waits for the process to exit, killing it after a grace period; reports whether it exited. */
     stop: async (): Promise<boolean> => {
       if (!child) return true;
-      if (await within(10_000)) return true;
+      if (await exitsWithin(10_000)) return true;
       child.kill("SIGKILL");
-      return within(5_000);
+      return exitsWithin(5_000);
     },
   };
 }

@@ -54,6 +54,8 @@ export interface Scenario {
   initializeWaitFor?: string;
   /** Makes `--resume` fail the way Claude Code does for a session it cannot find. */
   lostSessions?: boolean;
+  /** Session ID to report instead of a random UUID. */
+  sessionId?: string;
 }
 
 const scenarioPath = process.env.FAKE_CLAUDE_SCENARIO;
@@ -65,7 +67,7 @@ const resumed =
   resumeIndex >= 0
     ? args[resumeIndex + 1]
     : args.find((arg) => arg.startsWith("--resume="))?.slice("--resume=".length);
-const sessionId = resumed ?? randomUUID();
+const sessionId = resumed ?? scenario.sessionId ?? randomUUID();
 
 if (args.includes("--version")) {
   console.log(`${scenario.version ?? "2.1.282"} (Claude Code)`);

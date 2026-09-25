@@ -193,6 +193,7 @@ describe("follow-ups", () => {
     const sent = await followUp(client, project, taskId, "more-1", "Continue.");
     const outcome = await finish(client, project, taskId, sent.executionId);
     expect(outcome).toMatchObject({ status: "failed", reason: "session_unavailable" });
+    expect(outcome.error.message).toMatch(/^Execution failed with session_unavailable: /);
     expect(fixture.launches()).toHaveLength(1);
   });
 });

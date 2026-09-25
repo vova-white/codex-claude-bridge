@@ -796,7 +796,7 @@ export class TaskService {
       outcome = {
         status: "failed",
         reason: "provider_error",
-        message: "Claude Code was not found.",
+        message: "Execution failed with provider_error: Claude Code was not found.",
         action: `Install Claude Code, or set "claudeExecutable" in ${this.paths.config}.`,
         processExited: true,
       };
@@ -805,7 +805,8 @@ export class TaskService {
       outcome = {
         status: "failed",
         reason: "session_unavailable",
-        message: "The task has no Claude session to continue; the follow-up was not sent.",
+        message:
+          "Execution failed with session_unavailable: the task has no Claude session to continue; the follow-up was not sent.",
         action:
           "Start a new task with the context the follow-up needs; the earlier results stay available.",
         processExited: true,
@@ -871,7 +872,10 @@ export class TaskService {
       );
     }
     const endedAt = now();
-    const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
+    // Claude chooses file names; redaction is a backstop for credentials in them.
+    const modifiedFiles = (before ? changedPaths(before, await checkoutState(root)) : []).map(
+      (path) => redactContent(path, secrets),
+    );
     const violation =
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
@@ -909,7 +913,10 @@ export class TaskService {
               })
             : null,
         error: JSON.stringify({
-          message: [outcome.message, ...violation].join(" "),
+          message:
+            modifiedFiles.length > 0
+              ? `${outcome.message} The read-only task changed ${modifiedFiles.length} ${modifiedFiles.length === 1 ? "file" : "files"} in the shared checkout (see error.modifiedFiles).`
+              : outcome.message,
           action: outcome.action,
           ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
         }),

@@ -180,6 +180,8 @@ export async function runExecution(
   const claude = claudeProcess();
   const cancel = () => abort.abort();
   request.signal.addEventListener("abort", cancel, { once: true });
+  /** Whether Claude Code reported a session; its ID is kept only in the known UUID form. */
+  let sessionStarted = false;
   let sessionId: string | undefined;
   const failed = (
     reason: FailureReason,
@@ -196,10 +198,10 @@ export async function runExecution(
     action,
     ...(detail ? { detail } : {}),
   });
-  // Claude Code's full output stays on the user's screen instead of in the bridge.
+  // The bridge keeps none of Claude Code's output; the user can read it in Claude Code itself.
   const inspect = () =>
-    sessionId
-      ? `Run \`claude\` in ${request.cwd} and enter \`/resume ${sessionId}\` to see Claude Code's full output, then start a new task with a new request key once the problem is fixed.`
+    sessionStarted
+      ? `Run \`claude\` in ${request.cwd} and enter ${sessionId ? `\`/resume ${sessionId}\`` : "`/resume` and pick the task's session"} to see Claude Code's full output, then start a new task with a new request key once the problem is fixed.`
       : `Run \`claude\` in ${request.cwd} to see whether Claude Code starts and is signed in, then start a new task with a new request key.`;
   const session = query({
     prompt: input,
@@ -238,7 +240,7 @@ export async function runExecution(
         if (request.resume && /no conversation found/i.test((error as Error).message)) {
           return failed(
             "session_unavailable",
-            `Claude Code cannot resume session ${request.resume}; the message was not sent`,
+            `Claude Code cannot resume ${sessionIdentifier.test(request.resume) ? `session ${request.resume}` : "the task's session"}; the message was not sent`,
             "Start a new task with the context the follow-up needs; the earlier results stay available.",
           );
         }
@@ -274,8 +276,11 @@ export async function runExecution(
       let resetsAt: number | undefined;
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init") {
-          if (sessionIdentifier.test(message.session_id)) sessionId = message.session_id;
-          observer.session(message.session_id);
+          sessionStarted = true;
+          if (sessionIdentifier.test(message.session_id)) {
+            sessionId = message.session_id;
+            observer.session(sessionId);
+          }
         } else if (message.type === "rate_limit_event") {
           const info = message.rate_limit_info;
           if (info.status === "rejected") {
