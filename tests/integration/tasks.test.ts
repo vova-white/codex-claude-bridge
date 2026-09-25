@@ -166,6 +166,81 @@ describe("read-only delegated tasks", () => {
     expect(fixture.launches()).toHaveLength(1);
   });
 
+  it("waits in the start call for a task that finishes at once", async () => {
+    const fixture = bridge({ scenario: { turns: [{ steps: [finished("Summarized.")] }] } });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+
+    const started = await start(client, assignment(project, { waitSeconds: 30 }));
+    expect(started).toMatchObject({ created: true, status: "completed", timedOut: false });
+    expect(started.lastEventSeq).toBeGreaterThan(0);
+    const result = await client.call("task_result", { project, taskId: started.taskId });
+    expect(result.data.result.summary).toBe("Summarized.");
+  });
+
+  it("leaves a task running when the start call's wait times out", async () => {
+    const fixture = bridge({ scenario: { turns: [{ steps: [{ waitFor: "never" }] }] } });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+
+    const began = Date.now();
+    const started = await start(client, assignment(project, { waitSeconds: 1 }));
+    expect(Date.now() - began).toBeGreaterThanOrEqual(1_000);
+    expect(started).toMatchObject({ created: true, status: "running", timedOut: true });
+    const status = (await client.call("task_status", { project, taskId: started.taskId })).data;
+    expect(status.status).toBe("running");
+  });
+
+  it("returns the same task and waits again when a waited start is retried", async () => {
+    const fixture = bridge({
+      scenario: { turns: [{ steps: [{ waitFor: "go" }, finished("Summarized.")] }] },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+
+    const first = await start(client, assignment(project, { waitSeconds: 1 }));
+    expect(first).toMatchObject({ created: true, timedOut: true });
+    const plain = await start(client, assignment(project));
+    expect(plain).toMatchObject({ taskId: first.taskId, created: false });
+    expect(plain).not.toHaveProperty("timedOut");
+
+    const retried = start(client, assignment(project, { waitSeconds: 30 }));
+    await waitFor(() => fixture.launches().length === 1 || undefined);
+    fixture.release("go");
+    expect(await retried).toMatchObject({
+      taskId: first.taskId,
+      executionId: first.executionId,
+      created: false,
+      status: "completed",
+      timedOut: false,
+    });
+    expect(fixture.launches()).toHaveLength(1);
+  });
+
+  it("ends the start call's wait when the task starts waiting for subscription capacity", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { rateLimit: { status: "rejected", resetsAt: 1_900_000_000 } },
+              { waitFor: "never" },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+
+    const started = await start(client, assignment(project, { waitSeconds: 30 }));
+    expect(started).toMatchObject({
+      status: "running",
+      reason: "waiting_for_capacity",
+      timedOut: false,
+    });
+  });
+
   it("keeps working after the MCP client exits and serves the result to the next client", async () => {
     const fixture = bridge({
       scenario: { turns: [{ steps: [{ waitFor: "go" }, finished("Finished offline.")] }] },

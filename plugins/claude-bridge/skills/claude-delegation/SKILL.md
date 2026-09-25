@@ -25,7 +25,8 @@ Delegate a focused investigation, review, or implementation that Claude can comp
    - `context`: file paths, findings, constraints, and decisions Claude needs.
    - `expectedResult`: what a complete answer contains.
    - Optionally `model` and `effort`, chosen from the readiness `models`.
-3. The call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes.
+   - Optionally `waitSeconds` (up to 300) for a short, single task such as a small review or lookup: the call then waits on the task's execution as `wait_task` does and adds `timedOut` and `lastEventSeq`, with `status` and `reason` as of the end of the wait. A retry with the same key waits again on the same execution. Leave it out when the task is long or you have other work to do meanwhile.
+3. Without `waitSeconds`, the call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes, also while or after a waiting call times out.
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, call `task_result` again with `part` and `offset` from `truncated.next` to read the rest, repeating until no `truncated` remains. Read further only if you need the omitted detail.
 
@@ -64,7 +65,7 @@ Only the worktrees and branches of the task and its nested writers are removed: 
 
 ## Parallel tasks and execution slots
 
-Start independent assignments as separate tasks, each with its own `requestKey`, and keep working while they run. Each writing task gets its own worktree and branch, so parallel writers never share files; another caller's tasks never share yours, even with the same key. Retrying a start with the same key returns the existing task and takes no extra slot.
+Start independent assignments as separate tasks, each with its own `requestKey`, and keep working while they run: start them without `waitSeconds` and collect each with `wait_task`. Each writing task gets its own worktree and branch, so parallel writers never share files; another caller's tasks never share yours, even with the same key. Retrying a start with the same key returns the existing task and takes no extra slot.
 
 The service runs at most `maxConcurrentExecutions` executions at once (`config.json`, default 2) across all projects and callers; each running execution holds one slot until it ends, whatever it waits for meanwhile. Other executions stay `queued` with `reason: waiting_for_slot`, `detail.position` (1 starts next), and `detail.limit`, and start in the order they began waiting as slots free up, whether the running execution completed, failed, or was cancelled. A follow-up queued behind its own task's execution joins that line only when the execution ends. `list_tasks` returns `slots`: `limit` (`null` while `config.json` is invalid), `running`, and `queued` (executions waiting for a slot). A queued task is not stalled: `wait_task` keeps waiting through it, and `read_output` shows when it started (`Running.`). Cancel queued work you no longer need to free its place.
 
@@ -76,7 +77,7 @@ The limit counts executions, not the agents working for them. Nested agents Clau
 
 Use `send_followup` to continue the same Claude session: ask a clarifying question about the result, or request an adjustment. Each follow-up is a new execution with its own `executionId` and result; the original result never changes (`task_result` without `executionId` still returns it). Choose a new `requestKey` for each follow-up and reuse it only to retry the same message.
 
-If an execution of the task is still active, the follow-up is queued behind it (`delivery: queued`, `queuedBehind`) and starts when that execution ends; when all slots are taken, it also waits for a slot (`reason: waiting_for_slot`). Follow-ups never interrupt or steer a running turn. Wait for the follow-up's own `executionId`.
+If an execution of the task is still active, the follow-up is queued behind it (`delivery: queued`, `queuedBehind`) and starts when that execution ends; when all slots are taken, it also waits for a slot (`reason: waiting_for_slot`). Follow-ups never interrupt or steer a running turn. Wait for the follow-up's own `executionId`. For a short clarifying question, pass `waitSeconds` (up to 300) to `send_followup`: it waits on the follow-up's own execution, even when queued, and returns the `wait_task` fields alongside `delivery` and `queuedBehind`; on `timedOut: true` continue with `wait_task`.
 
 If the follow-up fails with `reason: session_unavailable`, Claude Code can no longer resume the session (or the task never reached Claude). The message was not sent to any other conversation. Start a new task whose brief includes what the follow-up needs.
 
