@@ -147,7 +147,11 @@ describe("nested writers", () => {
 
     // Each Claude Code process ran in its own checkout; none in the executor's or the project's.
     const cwds = fixture.launches().map((launch) => launch.cwd);
-    expect(cwds).toEqual([executor.path, alpha.workspace.path, beta.workspace.path]);
+    // The writers start concurrently, so only the executor's launch has a fixed place.
+    expect(cwds[0]).toBe(executor.path);
+    expect(cwds.slice(1).toSorted()).toEqual(
+      [alpha.workspace.path, beta.workspace.path].toSorted(),
+    );
     expect(new Set(cwds).size).toBe(3);
     expect(cwds).not.toContain(project);
 
