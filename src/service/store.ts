@@ -118,6 +118,7 @@ const migrations: string[] = [
     problems TEXT NOT NULL,
     checked_at TEXT NOT NULL
   )`,
+  `ALTER TABLE nested_writers ADD COLUMN workspace_state TEXT`,
 ];
 
 export class StoreLockedError extends Error {}
