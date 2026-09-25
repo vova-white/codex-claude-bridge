@@ -381,6 +381,8 @@ describe("read-only delegated tasks", () => {
     const status = await statusWhen(client, project, taskId, terminal);
     expect(status).toMatchObject({ status: "failed", reason: "invalid_request" });
     expect(status.error.message).toContain("gpt-imaginary");
+    // Model values come from Claude Code; readiness reports them instead.
+    expect(status.error.message).not.toContain("sonnet");
     expect(status.error.action).toContain("readiness");
     expect(fixture.prompts()).toEqual([]);
   });

@@ -356,7 +356,7 @@ const knownServerStatuses = new Set(["connected", "failed", "needs-auth", "pendi
 const knownSignals = new Set(Object.keys(constants.signals));
 const effortLevels = new Set(["low", "medium", "high", "xhigh", "max"]);
 /** Model values Claude Code accepts as identifiers, such as `sonnet` or `claude-opus-5[1m]`. */
-export const modelIdentifier = /^[a-z][a-z0-9.-]{0,62}(\[[0-9a-z]{1,8}\])?$/;
+const modelIdentifier = /^[a-z][a-z0-9.-]{0,62}(\[[0-9a-z]{1,8}\])?$/;
 
 class TimeoutError extends Error {}
 

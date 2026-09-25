@@ -10,7 +10,6 @@ import {
   claudeProcess,
   classifyCredentials,
   credentialAction,
-  modelIdentifier,
   withTimeout,
 } from "./readiness.ts";
 
@@ -265,12 +264,9 @@ export async function runExecution(
           (model) => model.value === request.model || model.resolvedModel === request.model,
         )
       ) {
-        const available = init.models
-          .map((model) => model.value)
-          .filter((value) => modelIdentifier.test(value));
         return failed(
           "invalid_request",
-          `model ${request.model} is not available in Claude Code (available: ${available.join(", ")}); the brief was not sent`,
+          `model ${request.model} is not available in Claude Code; the brief was not sent`,
           "Choose a model from the readiness `models`, or omit `model` to use Claude Code's default.",
         );
       }
