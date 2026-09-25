@@ -65,6 +65,15 @@ export type Step =
         isError?: boolean;
         subtype?: string;
         errors?: string[];
+        /** Usage fields of the result message, as Claude Code names them; the rest keep their defaults. */
+        usage?: {
+          total_cost_usd?: number;
+          duration_ms?: number;
+          duration_api_ms?: number;
+          num_turns?: number;
+          usage?: Record<string, number>;
+          modelUsage?: Record<string, Record<string, number>>;
+        };
       };
     }
   | { exit: { code: number; stderr?: string } }
@@ -489,7 +498,14 @@ async function answer(prompt: string): Promise<void> {
         writeFileSync(resolve(scenarioDir, `${saveAs}.json`), JSON.stringify(result));
       }
     } else if ("result" in step) {
-      const { text = "", structured, isError = false, subtype = "success", errors } = step.result;
+      const {
+        text = "",
+        structured,
+        isError = false,
+        subtype = "success",
+        errors,
+        usage,
+      } = step.result;
       send({
         type: "result",
         subtype,
@@ -502,6 +518,7 @@ async function answer(prompt: string): Promise<void> {
         total_cost_usd: 0,
         usage: { input_tokens: 0, output_tokens: 0 },
         modelUsage: {},
+        ...usage,
         permission_denials: [],
         ...(structured === undefined ? {} : { structured_output: structured }),
         ...(errors ? { errors } : {}),

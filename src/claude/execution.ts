@@ -3,6 +3,7 @@ import {
   type CanUseTool,
   type PermissionResult,
   type SDKAssistantMessageError,
+  type SDKResultMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -139,7 +140,7 @@ export type RequestResponse =
   { answers: string[] } | { decision: "allow" | "deny"; message?: string };
 
 type TurnOutcome =
-  | { status: "completed"; text: string; structured?: unknown }
+  | { status: "completed"; text: string; structured?: unknown; usage?: ExecutionUsage }
   | { status: "cancelled" }
   | {
       status: "failed";
@@ -147,6 +148,8 @@ type TurnOutcome =
       message: string;
       action: string;
       detail?: { resetsAt?: number };
+      /** Present when an error result ended the run. */
+      usage?: ExecutionUsage;
     };
 
 /** `processExited` confirms that the Claude Code process is gone, whatever the outcome. */
@@ -198,6 +201,8 @@ const resultSubtypes = new Set([
   "error_max_budget_usd",
   "error_max_structured_output_retries",
 ]);
+/** A model identifier as Claude Code keys its per-model usage, such as `claude-opus-4-7[1m]` or a provider ID. */
+const modelIdentifier = /^[\w.:@/[\]-]{1,200}$/;
 const sessionIdentifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** How a turn ended, from the assistant error code and result subtype the bridge knows. */
@@ -216,6 +221,61 @@ function turnFailure(error: string | undefined, subtype: string): string {
         : "an unrecognized result";
   return `Claude Code ${reported}ended the turn with ${ending}`;
 }
+
+/** The fields of `source` that are finite numbers, renamed; anything else Claude Code sent is left out. */
+function figures<Name extends string>(source: unknown, fields: Record<Name, string>) {
+  const values = (source ?? {}) as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.entries<string>(fields).flatMap(([name, field]) => {
+      const value = values[field];
+      return typeof value === "number" && Number.isFinite(value) ? [[name, value]] : [];
+    }),
+  ) as Partial<Record<Name, number>>;
+}
+
+/**
+ * What a result message reports the run consumed: Claude Code's cost estimate,
+ * durations, turns, the main loop's tokens, and per-model totals. Only numbers
+ * and model identifiers are kept.
+ */
+function usageOf(message: SDKResultMessage) {
+  const models = Object.entries((message.modelUsage ?? {}) as Record<string, unknown>).filter(
+    ([model]) => modelIdentifier.test(model),
+  );
+  return {
+    ...figures(message, {
+      totalCostUsd: "total_cost_usd",
+      durationMs: "duration_ms",
+      apiDurationMs: "duration_api_ms",
+      turns: "num_turns",
+    }),
+    tokens: figures(message.usage, {
+      input: "input_tokens",
+      output: "output_tokens",
+      cacheRead: "cache_read_input_tokens",
+      cacheCreation: "cache_creation_input_tokens",
+    }),
+    models: Object.fromEntries(
+      models.map(([model, used]) => [
+        model,
+        figures(used, {
+          input: "inputTokens",
+          output: "outputTokens",
+          thinking: "thinkingTokens",
+          cacheRead: "cacheReadInputTokens",
+          cacheCreation: "cacheCreationInputTokens",
+          webSearchRequests: "webSearchRequests",
+          costUsd: "costUSD",
+          contextWindow: "contextWindow",
+          maxOutputTokens: "maxOutputTokens",
+        }),
+      ]),
+    ),
+  };
+}
+
+/** The usage an execution's final result message reported, as the parent agent reads it. */
+export type ExecutionUsage = ReturnType<typeof usageOf>;
 
 function failureReason(error: SDKAssistantMessageError | undefined): FailureReason {
   if (error && accountErrors.has(error)) return "authentication";
@@ -317,6 +377,9 @@ function permissionResult(
  * have all ended the executor is prompted to collect and assemble their work.
  * A result is not final while a writer that ended has reached the executor
  * neither through wait_nested_writers nor through that prompt.
+ *
+ * An outcome that a result message decided carries that message's usage; a
+ * cancelled run, or one that ended without a result, has none.
  */
 export async function runExecution(
   request: ExecutionRequest,
@@ -420,7 +483,7 @@ export async function runExecution(
     description: string,
     action: string,
     detail?: { resetsAt: number },
-  ): TurnOutcome => ({
+  ): Extract<TurnOutcome, { status: "failed" }> => ({
     status: "failed",
     reason,
     message: redact(
@@ -560,6 +623,8 @@ export async function runExecution(
           }
         } else if (message.type === "result") {
           if (request.signal.aborted) return { status: "cancelled" };
+          // Cost and per-model figures are cumulative for the process, so the last result covers every turn.
+          const usage = usageOf(message);
           if (message.subtype === "success" && !message.is_error) {
             if (runningChildren() > 0) {
               waiting = true;
@@ -574,30 +639,39 @@ export async function runExecution(
               ...(message.structured_output === undefined
                 ? {}
                 : { structured: message.structured_output }),
+              usage,
             };
           }
           const reason = failureReason(lastError);
           const description = turnFailure(lastError, message.subtype);
           if (reason === "authentication") {
-            return failed(
-              reason,
-              description,
-              withFullOutput("Run `claude`, then `/login` with your Claude subscription account."),
-            );
+            return {
+              ...failed(
+                reason,
+                description,
+                withFullOutput(
+                  "Run `claude`, then `/login` with your Claude subscription account.",
+                ),
+              ),
+              usage,
+            };
           }
           if (reason === "subscription_limit") {
-            return failed(
-              reason,
-              description,
-              withFullOutput(
-                "Wait until subscription capacity resets, then start a new task with a new request key.",
+            return {
+              ...failed(
+                reason,
+                description,
+                withFullOutput(
+                  "Wait until subscription capacity resets, then start a new task with a new request key.",
+                ),
+                typeof resetsAt === "number" && !Number.isNaN(new Date(resetsAt * 1000).getTime())
+                  ? { resetsAt }
+                  : undefined,
               ),
-              typeof resetsAt === "number" && !Number.isNaN(new Date(resetsAt * 1000).getTime())
-                ? { resetsAt }
-                : undefined,
-            );
+              usage,
+            };
           }
-          return failed(reason, description, inspect());
+          return { ...failed(reason, description, inspect()), usage };
         }
       }
       if (request.signal.aborted) return { status: "cancelled" };

@@ -122,6 +122,8 @@ const migrations: string[] = [
   `ALTER TABLE executions ADD COLUMN process TEXT;
   ALTER TABLE nested_writers ADD COLUMN process TEXT;
   CREATE TABLE service_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  `ALTER TABLE executions ADD COLUMN usage TEXT;
+  ALTER TABLE nested_writers ADD COLUMN usage TEXT`,
 ];
 
 export class StoreLockedError extends Error {}
