@@ -51,6 +51,7 @@ async function command(
   cwd: string,
   args: string[],
   signal?: AbortSignal,
+  env: Record<string, string> = {},
 ): Promise<string> {
   const { stdout } = await run(file, args, {
     cwd,
@@ -58,7 +59,7 @@ async function command(
     timeout: 30_000,
     maxBuffer: 4 * 1024 * 1024,
     // A check must fail rather than wait for credentials nobody can type.
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1" },
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", ...env },
   });
   return stdout;
 }
@@ -106,14 +107,28 @@ export async function remoteState(
   }
   state.repository = redact(url.trim(), secrets);
   // A separate push URL is where the branch was published, not the fetch URL.
+  // Git reads it from the environment as a temporary remote, since a URL may
+  // hold credentials that must stay out of command lines.
   const fetchUrl = await command("git", worktree, ["remote", "get-url", remote]).catch(() => "");
-  const target = fetchUrl.trim() === url.trim() ? remote : url.trim();
+  const pushTarget = "codex-claude-bridge-push";
+  const [target, env] =
+    fetchUrl.trim() === url.trim()
+      ? [remote, {}]
+      : [
+          pushTarget,
+          {
+            GIT_CONFIG_COUNT: "1",
+            GIT_CONFIG_KEY_0: `remote.${pushTarget}.url`,
+            GIT_CONFIG_VALUE_0: url.trim(),
+          },
+        ];
   try {
     const listed = await command(
       "git",
       worktree,
       ["ls-remote", target, `refs/heads/${branch}`],
       signal,
+      env,
     );
     const line = listed.split("\n").find((entry) => entry.endsWith(`\trefs/heads/${branch}`));
     const revision = line?.split("\t")[0] ?? "";

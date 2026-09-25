@@ -41,12 +41,17 @@ function option(name: string): string | undefined {
   return index >= 0 ? args[index + 1] : undefined;
 }
 
-const git = (...gitArgs: string[]) => execFileSync("git", gitArgs, { encoding: "utf8" }).trim();
+const git = (gitArgs: string[], env: Record<string, string> = {}) =>
+  execFileSync("git", gitArgs, { encoding: "utf8", env: { ...process.env, ...env } }).trim();
 const url = (number: number) => `https://github.example/owner/repo/pull/${number}`;
+// The push URL goes through the environment, as the bridge passes it, so tests
+// can check that no command line holds it.
 const head = (branch: string) =>
-  git("ls-remote", git("remote", "get-url", "--push", "origin"), `refs/heads/${branch}`).split(
-    "\t",
-  )[0] ?? "";
+  git(["ls-remote", "fake-gh-push", `refs/heads/${branch}`], {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "remote.fake-gh-push.url",
+    GIT_CONFIG_VALUE_0: git(["remote", "get-url", "--push", "origin"]),
+  }).split("\t")[0] ?? "";
 
 if (state.failWith) fail(state.failWith);
 const [group, action] = args;
@@ -68,7 +73,7 @@ if (group === "pr" && action === "list") {
     });
   console.log(JSON.stringify(listed));
 } else if (group === "pr" && action === "create") {
-  const branch = option("--head") ?? git("branch", "--show-current");
+  const branch = option("--head") ?? git(["branch", "--show-current"]);
   const open = state.pullRequests.find((pr) => pr.headRefName === branch && pr.state === "OPEN");
   if (open) fail(`a pull request for branch "${branch}" already exists:\n${url(open.number)}`);
   const headRefOid = head(branch);

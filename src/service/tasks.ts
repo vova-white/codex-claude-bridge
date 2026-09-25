@@ -1606,7 +1606,7 @@ export class TaskService {
     // Cancellation is confirmed without waiting for the remote; the next follow-up checks it.
     const publication =
       publishing && changes && outcome.status !== "cancelled"
-        ? await this.checkPublication(workspace, secrets)
+        ? await this.checkPublication(workspace, secrets, signal)
         : undefined;
     const retained = workspace
       ? {

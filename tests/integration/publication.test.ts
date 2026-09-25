@@ -92,7 +92,7 @@ async function setUp(scenario: Scenario, initial: FakeGitHub = { pullRequests: [
     change(state);
     writeFileSync(path, JSON.stringify(state));
   };
-  return { fixture, project, origin, client, ghCalls, github };
+  return { fixture, project, origin, client, ghCalls, github, bin };
 }
 
 function writeTask(project: string, overrides: Record<string, unknown> = {}) {
@@ -318,7 +318,7 @@ describe("task publication", () => {
   });
 
   it("check the push destination when the remote pushes elsewhere than it fetches", async () => {
-    const { fixture, project, origin, client } = await setUp({
+    const { fixture, project, origin, client, bin } = await setUp({
       turns: [
         {
           steps: [
@@ -333,6 +333,16 @@ describe("task publication", () => {
     const destination = join(fixture.root, "push.git");
     git(fixture.root, "init", "--quiet", "--bare", destination);
     git(project, "remote", "set-url", "--push", "origin", destination);
+    // Records every command line the service and Claude give Git, since a push URL may hold credentials.
+    const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    const gitCalls = join(bin, "git-calls.log");
+    writeFileSync(
+      join(bin, "git"),
+      `#!/bin/sh\necho "$*" >> '${gitCalls}'\nexec '${realGit}' "$@"\n`,
+      {
+        mode: 0o755,
+      },
+    );
 
     const { taskId } = await run(client, writeTask(project));
     const { result } = (await client.call("task_result", { project, taskId })).data;
@@ -345,6 +355,9 @@ describe("task publication", () => {
       concerns: [],
     });
     expect(git(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads")).toBe("main");
+    const calls = readFileSync(gitCalls, "utf8");
+    expect(calls).toContain("ls-remote");
+    expect(calls).not.toContain(destination);
   });
 
   it("cancel a follow-up during the remote check without starting Claude", async () => {
