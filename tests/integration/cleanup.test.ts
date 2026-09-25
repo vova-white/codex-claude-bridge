@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
@@ -257,6 +257,38 @@ describe("task cleanup", () => {
     expect(await cleanup(client, project, taskId)).toMatchObject({
       outcome: "cleaned",
       worktree: { action: "removed", unintegratedCommits: 0 },
+    });
+  });
+
+  it("refuses to drop a detached HEAD commit when the worktree directory is missing", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            { exec: ["git", "checkout", "--quiet", "--detach"] },
+            ...commit("detached.txt"),
+            finished("Done."),
+          ],
+        },
+      ],
+    });
+    const { taskId, workspace } = await run(client, project, "Commit detached.");
+    const detached = git(workspace.path, "rev-parse", "HEAD");
+    renameSync(workspace.path, `${workspace.path}-moved`);
+
+    const refused = await cleanup(client, project, taskId);
+    expect(refused).toMatchObject({
+      outcome: "refused",
+      worktree: { action: "keep", unintegratedCommits: 1 },
+      refusals: [{ code: "unintegrated_commits" }],
+    });
+    expect(refused.refusals[0].message).toContain(`detached HEAD ${detached}`);
+    expect(git(project, "fsck", "--unreachable", "--no-reflogs")).not.toContain(detached);
+
+    expect(await cleanup(client, project, taskId, { discardUnintegrated: true })).toMatchObject({
+      outcome: "cleaned",
+      worktree: { action: "removed" },
+      workspace: { state: "removed" },
     });
   });
 

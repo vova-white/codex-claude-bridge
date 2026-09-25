@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
@@ -147,7 +147,11 @@ describe("nested writers", () => {
 
     // Each Claude Code process ran in its own checkout; none in the executor's or the project's.
     const cwds = fixture.launches().map((launch) => launch.cwd);
-    expect(cwds).toEqual([executor.path, alpha.workspace.path, beta.workspace.path]);
+    // The writers start concurrently, so only the executor's launch has a fixed place.
+    expect(cwds[0]).toBe(executor.path);
+    expect(cwds.slice(1).toSorted()).toEqual(
+      [alpha.workspace.path, beta.workspace.path].toSorted(),
+    );
     expect(new Set(cwds).size).toBe(3);
     expect(cwds).not.toContain(project);
 
@@ -647,6 +651,38 @@ describe("nested writers", () => {
     });
     expect(git(project, "branch", "--list", branch)).toBe("");
     expect((await status()).executions[0].nestedWriters[0].workspace.state).toBe("removed");
+  });
+
+  it("refuse to drop a nested writer's detached HEAD commit when its worktree directory is missing", async () => {
+    const { project, client, taskId, wait, saved } = await setUp({
+      turns: [
+        {
+          match: "Alpha writer",
+          steps: retitle("Alpha", { exec: ["git", "checkout", "--quiet", "--detach"] }),
+        },
+        {
+          match: "Coordinate",
+          steps: [
+            startWriter("alpha", "Alpha writer: retitle the README."),
+            waitWriters("waited"),
+            finished("Left the alpha writer alone."),
+          ],
+        },
+      ],
+    });
+    expect(await wait()).toMatchObject({ status: "completed" });
+    const { path } = saved("alpha").data.workspace;
+    const detached = git(path, "rev-parse", "HEAD");
+    renameSync(path, `${path}-moved`);
+
+    const refused = (await client.call("cleanup_task", { project, taskId, scope: "worktree" }))
+      .data;
+    expect(refused).toMatchObject({
+      outcome: "refused",
+      nestedWriters: [{ worktree: { action: "keep", unintegratedCommits: 1 } }],
+      refusals: [{ code: "unintegrated_commits" }],
+    });
+    expect(refused.refusals[0].message).toContain(`detached HEAD ${detached}`);
   });
 
   it("refuse cleanup while a nested writer runs, and keep a cancelled writer's changes until the caller discards them", async () => {

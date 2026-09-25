@@ -535,6 +535,12 @@ lines.on("line", (line) => {
   const { request_id: requestId, request } = message;
   switch (request.subtype) {
     case "initialize":
+      if (process.env.FAKE_CLAUDE_GUIDANCE_LOG) {
+        appendFileSync(
+          process.env.FAKE_CLAUDE_GUIDANCE_LOG,
+          `${JSON.stringify(request.appendSystemPrompt ?? "")}\n`,
+        );
+      }
       sdkMcpServers = request.sdkMcpServers ?? [];
       if (resumed && scenario.lostSessions) {
         // Claude Code answers an unknown --resume with an error result and exits.
