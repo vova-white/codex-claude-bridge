@@ -133,7 +133,7 @@ describe("child questions", () => {
       { requestId: request.requestId, state: "answered", live: false },
     ]);
   });
-  it("give identical questions distinct answer keys", async () => {
+  it("give identical questions distinct answer keys and refuse different answers to them", async () => {
     const { client, project, taskId } = await startTask([
       {
         canUseTool: {
@@ -158,15 +158,22 @@ describe("child questions", () => {
       "Revoke the token? (question 2) (question 3)",
     ]);
 
-    const answered = await client.call("respond_to_request", {
-      project,
-      taskId,
-      requestId: request.requestId,
-      response: {
-        answers: Object.fromEntries(keys.map((key, index) => [key, `answer ${index + 1}`])),
-      },
-    });
+    const respond = (answers: string[]) =>
+      client.call("respond_to_request", {
+        project,
+        taskId,
+        requestId: request.requestId,
+        response: { answers: Object.fromEntries(keys.map((key, index) => [key, answers[index]])) },
+      });
+    const conflicting = await respond(["yes", "no", "later"]);
+    expect(conflicting.isError).toBe(true);
+    expect(conflicting.text).toContain("give both the same answer");
+    const answered = await respond(["yes", "yes", "later"]);
     expect(answered.isError, answered.text).toBe(false);
+    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
+    expect(await events(client, project, taskId)).toContain(
+      'AskUserQuestion answered ["yes","yes","later"]',
+    );
   });
 
   it("can be answered by a new MCP client after the first disconnects", async () => {
