@@ -184,6 +184,59 @@ describe("task publication", () => {
     expect(guidance).not.toContain("Do not push");
   });
 
+  it("publish only the task branch once the executor assembled its nested writer's work", async () => {
+    const { fixture, project, origin, client } = await setUp({
+      turns: [
+        {
+          match: "Nested writer",
+          steps: [
+            ...commit("NOTES.md", "notes\n", "docs: add notes"),
+            finished("Added the notes."),
+          ],
+        },
+        {
+          steps: [
+            {
+              mcpCall: {
+                tool: "start_nested_writer",
+                arguments: {
+                  assignment: "Nested writer: add notes.",
+                  expectedResult: "A committed change.",
+                },
+                saveAs: "writer",
+              },
+            },
+            { mcpCall: { tool: "wait_nested_writers", arguments: {} } },
+            { exec: ["git", "merge", "--quiet", "--ff-only", "{{writer.data.workspace.branch}}"] },
+            ...commit("README.md", "# Better fixture\n", "docs: improve the README"),
+            push,
+            createPullRequest,
+            finished("Assembled the notes and opened the pull request."),
+          ],
+        },
+      ],
+    });
+    const { taskId, status } = await run(client, writeTask(project));
+    expect(status.status).toBe("completed");
+
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    const [writer] = result.nestedWriters;
+    const revision = git(result.workspace.path, "rev-parse", "HEAD");
+    expect(git(result.workspace.path, "log", "--format=%s", revision)).toContain("docs: add notes");
+    expect(result.publication).toMatchObject({
+      revision,
+      pushedRevision: revision,
+      pushed: true,
+      pullRequest: { number: 1, headRevision: revision },
+      concerns: [],
+    });
+    expect(git(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads")).toBe(
+      ["main", result.workspace.branch].toSorted().join("\n"),
+    );
+    expect(writer.branch).not.toBe(result.workspace.branch);
+    expect(fixture.guidance()[0]!).toContain("never a nested writer's branch");
+  });
+
   it("point publication actions at the project once cleanup removed the worktree", async () => {
     const { project, client } = await setUp({
       turns: [
