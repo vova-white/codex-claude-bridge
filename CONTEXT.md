@@ -24,7 +24,10 @@ A caller-chosen key that identifies one request so a retry returns what the firs
 The identity that owns delegated tasks across MCP connections, such as one Codex installation. A reconnecting parent agent finds the tasks it started as the same logical caller.
 
 **Task profile**:
-The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox.
+The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except nested agents.
+
+**Task worktree**:
+The Git worktree and task branch a writing agent works in, created from a committed baseline. It isolates Git changes from other agents; it is not a sandbox.
 
 **Task result**:
 The outcome of delegated work, including findings or code changes, verification evidence, and any associated pull request.

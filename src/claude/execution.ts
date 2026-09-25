@@ -16,6 +16,7 @@ export type FailureReason =
   | "subscription_limit"
   | "invalid_request"
   | "session_unavailable"
+  | "workspace_error"
   | "provider_error";
 
 export interface ExecutionRequest {
@@ -29,6 +30,8 @@ export interface ExecutionRequest {
   disallowedTools: string[];
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /** The shape Claude must report its final answer in. */
+  resultSchema: z.ZodType;
   /** Session to continue; the prompt is sent only if Claude Code can resume it. */
   resume?: string;
   /** Aborting stops Claude Code; the outcome is then `cancelled`. */
@@ -67,8 +70,18 @@ export const reportedResult = z.object({
   failures: z.array(z.string()).describe("Anything that failed or could not be verified."),
   remainingWork: z.array(z.string()).describe("Work left for the parent agent."),
 });
-// Claude Code validates --json-schema with a draft-07 validator.
-const resultSchema = z.toJSONSchema(reportedResult, { target: "draft-7" });
+/** The result of a writing task also reports the checks run to verify the change. */
+export const writingResult = reportedResult.extend({
+  checks: z
+    .array(
+      z.object({
+        command: z.string().describe("The command or check that was run."),
+        outcome: z.enum(["passed", "failed", "not_run"]),
+        details: z.string().optional().describe("What failed, or why it was not run."),
+      }),
+    )
+    .describe("Checks run to verify the change and their outcomes."),
+});
 
 const accountErrors = new Set<SDKAssistantMessageError>([
   "authentication_failed",
@@ -203,7 +216,11 @@ export async function runExecution(
                 "No one can answer questions during this task. Make a reasonable assumption, state it, and list open questions as remaining work.",
             }
           : { behavior: "allow", updatedInput: toolInput },
-      outputFormat: { type: "json_schema", schema: resultSchema },
+      // Claude Code validates --json-schema with a draft-07 validator.
+      outputFormat: {
+        type: "json_schema",
+        schema: z.toJSONSchema(request.resultSchema, { target: "draft-7" }),
+      },
       systemPrompt: { type: "preset", preset: "claude_code", append: request.guidance },
     },
   });

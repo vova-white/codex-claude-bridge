@@ -45,6 +45,15 @@ const migrations: string[] = [
   ALTER TABLE executions ADD COLUMN request_hash TEXT;
   CREATE UNIQUE INDEX executions_by_request_key ON executions (task_id, request_key)
     WHERE request_key IS NOT NULL`,
+  `CREATE TABLE workspaces (
+    task_id TEXT PRIMARY KEY REFERENCES tasks (id),
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    parent_dirty INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
 ];
 
 export class StoreLockedError extends Error {}

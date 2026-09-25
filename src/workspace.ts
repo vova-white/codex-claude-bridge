@@ -85,3 +85,78 @@ export function changedPaths(before: Map<string, string>, after: Map<string, str
     .map((key) => key.replace(/^(index|worktree):/, ""));
   return [...new Set(paths)].toSorted();
 }
+
+/** Whether the checkout has uncommitted changes, including untracked files. */
+export async function hasUncommittedChanges(root: string): Promise<boolean> {
+  return (await git(root, "status", "--porcelain=v1", "--untracked-files=normal")).trim() !== "";
+}
+
+/** The commit a reference names, or undefined when it names none. */
+export async function resolveCommit(root: string, reference: string): Promise<string | undefined> {
+  if (reference.startsWith("-")) return undefined;
+  try {
+    return (await git(root, "rev-parse", "--verify", "--quiet", `${reference}^{commit}`)).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** GitFlow branch prefixes a writing task may use. */
+export const branchTypes = ["feature", "bugfix", "hotfix", "release", "support"] as const;
+
+/** A task branch name: GitFlow prefix, a slug of the assignment, and part of the task ID. */
+export function taskBranch(type: string, assignment: string, taskId: string): string {
+  const slug = assignment
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .split("-")
+    .slice(0, 6)
+    .join("-")
+    .slice(0, 40)
+    .replace(/-+$/, "");
+  const suffix = taskId.replace(/^task_/, "").slice(0, 8);
+  return `${type}/${slug ? `${slug}-` : ""}${suffix}`;
+}
+
+/**
+ * Adds a worktree on a new branch at the baseline. A failed attempt leaves no
+ * worktree registration, directory, or new branch behind.
+ */
+export async function addWorktree(
+  root: string,
+  path: string,
+  branch: string,
+  baseline: string,
+): Promise<void> {
+  try {
+    await git(root, "worktree", "add", "--quiet", "-b", branch, path, baseline);
+  } catch (error) {
+    await git(root, "worktree", "remove", "--force", path).catch(() => "");
+    await git(root, "worktree", "prune").catch(() => "");
+    const tip = (await resolveCommit(root, `refs/heads/${branch}`)) ?? "";
+    if (tip === baseline) await git(root, "branch", "-D", branch).catch(() => "");
+    throw error;
+  }
+}
+
+/** Commits on the branch since the baseline and files that differ from it, committed or not. */
+export async function worktreeChanges(
+  path: string,
+  baseline: string,
+): Promise<{ commits: { sha: string; subject: string }[]; changedFiles: string[] }> {
+  const log = await git(path, "log", "--format=%H%x09%s", `${baseline}..HEAD`);
+  const commits = log
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [sha = "", ...subject] = line.split("\t");
+      return { sha, subject: subject.join("\t") };
+    });
+  const tracked = await git(path, "diff", "--name-only", "-z", baseline);
+  const untracked = await git(path, "ls-files", "--others", "--exclude-standard", "-z");
+  const changedFiles = [
+    ...new Set([...tracked.split("\0"), ...untracked.split("\0")].filter(Boolean)),
+  ].toSorted();
+  return { commits, changedFiles };
+}

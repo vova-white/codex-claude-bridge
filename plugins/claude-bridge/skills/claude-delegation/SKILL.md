@@ -9,11 +9,11 @@ The `claude_bridge` MCP server connects Codex (the parent agent) to Claude Code 
 
 ## Supported scope
 
-This release supports readiness checks and **read-only** delegated tasks: Claude inspects the project's shared checkout and reports back. You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude cannot edit files, publish changes, receive answers to questions mid-task, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
+This release supports readiness checks, **read-only** tasks (Claude inspects the project's shared checkout and reports back), and **writing** tasks (Claude changes files and commits them in its own Git worktree and task branch). You can wait for a task with a timeout, read its progress, send follow-ups to Claude's session, and cancel work. Claude cannot push, open pull requests, receive answers to questions mid-task, or use nested agents yet. For those, do the work yourself. The `operations` field of the readiness report lists exactly what the running service supports; trust it over this document if they differ.
 
 ## When to delegate
 
-Delegate a focused investigation or review that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
+Delegate a focused investigation, review, or implementation that Claude can complete from the repository alone, when you have other work to do meanwhile. Keep small, quick, or tightly coupled work yourself: preparing the brief and reviewing the result also cost time.
 
 ## Delegating a read-only task
 
@@ -28,6 +28,14 @@ Delegate a focused investigation or review that Claude can complete from the rep
 3. The call returns `taskId` and `executionId` at once. Continue your own work; the task runs in the background service and keeps running if Codex disconnects or closes.
 4. When you need the result, call `wait_task` with a bounded `timeoutSeconds` (up to 300). It returns as soon as the execution finishes or becomes blocked; on `timedOut: true` the task keeps running, so do other work and wait again later rather than polling in a tight loop. `wait_task` pins the execution it waits for and names it in the response. `list_tasks` finds tasks started before a reconnect.
 5. When `status` is `completed`, read `task_result`. It is durable: read it again whenever needed. It returns at most `maxChars` characters (default 12,000); if `truncated` is present, call `task_result` again with `part` and `offset` from `truncated.next` to read the rest, repeating until no `truncated` remains. Read further only if you need the omitted detail.
+
+## Delegating a writing task
+
+Pass `mode: "write"` to `start_task` for a code change. The service creates a new Git worktree on its own GitFlow task branch (`branchType`: `feature` by default, or `bugfix`, `hotfix`, `release`, `support`) before Claude starts, and Claude edits, installs dependencies, runs checks, and commits only there. Your checkout and other tasks' worktrees are not touched. A worktree isolates Git changes; it is not a sandbox.
+
+The worktree starts from a committed revision. If your checkout has uncommitted changes, `start_task` refuses with `dirty_parent`, because Claude would not see them: commit what Claude needs first, or pass `baseline` (for example `"HEAD"`) to start deliberately from that commit without them. The result's `workspace.parentDirty` records that choice.
+
+The result adds `checks` (each check Claude ran and whether it passed) and `workspace`: `path`, `branch`, `baseline`, `commits` since the baseline, and `changedFiles` (committed or not). The worktree and its changes stay after completion, failure (`error.workspace`), and cancellation (`detail.workspace`), so you can review them, send follow-ups (which run in the same worktree), or take the changes over. Review the diff with `git -C <path> diff <baseline>` in proportion to its risk, and verify the checks that matter rather than repeating all of Claude's work. A failure with `reason: workspace_error` means the worktree could not be created and nothing ran.
 
 ## Follow-ups and cancellation
 

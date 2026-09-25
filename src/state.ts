@@ -12,6 +12,8 @@ export interface StatePaths {
   info: string;
   log: string;
   claudeMcpConfig: string;
+  /** Parent directory of the Git worktrees writing tasks work in. */
+  worktrees: string;
 }
 
 // Unix domain socket paths are limited to about 104-108 bytes depending on the platform.
@@ -30,6 +32,7 @@ export function statePaths(env: NodeJS.ProcessEnv = process.env): StatePaths {
     info: join(dir, "service.json"),
     log: join(dir, "service.log"),
     claudeMcpConfig: join(dir, "claude-mcp.json"),
+    worktrees: join(dir, "worktrees"),
   };
 }
 
