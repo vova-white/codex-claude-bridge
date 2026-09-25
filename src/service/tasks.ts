@@ -992,16 +992,20 @@ export class TaskService {
       .all(task.id) as { id: string; status: string }[];
     const root = task.project;
     const { path, branch } = workspace;
-    const worktreePresent = await this.worktreeRegistered(root, path);
+    const registration = await this.registeredWorktree(root, path);
+    const worktreePresent = registration !== undefined;
     const worktreeFiles = worktreePresent && existsSync(path);
     // undefined: Git could not tell, which counts as work that might be lost.
     const uncommittedChanges = worktreeFiles
       ? await hasUncommittedChanges(path).catch(() => undefined)
       : false;
-    const head = worktreeFiles ? await checkoutHead(path).catch(() => undefined) : undefined;
+    // A registration whose directory is missing still records its HEAD.
+    const head = worktreeFiles
+      ? await checkoutHead(path).catch(() => undefined)
+      : registration?.head;
     // Commits only the worktree's HEAD holds, as on a detached HEAD, go with the
     // worktree. The task branch counts as keeping them only if cleanup keeps it.
-    const headUnintegrated = !worktreeFiles
+    const headUnintegrated = !worktreePresent
       ? 0
       : head === undefined
         ? undefined
@@ -1062,7 +1066,7 @@ export class TaskService {
         path,
         action: worktreeAction,
         ...(worktreePresent ? { uncommittedChanges } : {}),
-        ...(worktreeFiles ? { unintegratedCommits: headUnintegrated } : {}),
+        ...(worktreePresent ? { unintegratedCommits: headUnintegrated } : {}),
       },
       branch: {
         name: branch,
@@ -1103,7 +1107,7 @@ export class TaskService {
         });
       }
     }
-    if (!(await this.worktreeRegistered(root, path))) {
+    if (!(await this.registeredWorktree(root, path))) {
       const branchKept = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
       this.db
         .prepare("UPDATE workspaces SET state = ? WHERE task_id = ?")
@@ -1507,14 +1511,14 @@ export class TaskService {
       | undefined;
   }
 
-  /** Whether Git has the task worktree registered in the project, even if its directory is gone. */
-  private async worktreeRegistered(root: string, path: string): Promise<boolean> {
+  /** Git's registration of the task worktree in the project, even if its directory is gone. */
+  private async registeredWorktree(root: string, path: string) {
     const worktrees = await registeredWorktrees(root);
     // Git may record the path with symbolic links resolved.
     const resolved = existsSync(this.paths.worktrees)
       ? join(realpathSync(this.paths.worktrees), basename(path))
       : path;
-    return worktrees.includes(path) || worktrees.includes(resolved);
+    return worktrees.find((worktree) => worktree.path === path || worktree.path === resolved);
   }
 
   /** Creates the task's worktree once; later executions reuse it. */

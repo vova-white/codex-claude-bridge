@@ -168,12 +168,26 @@ export async function worktreeChanges(
   return { commits, changedFiles };
 }
 
-/** Paths of the worktrees Git has registered for the repository, including missing ones. */
-export async function registeredWorktrees(root: string): Promise<string[]> {
-  return (await git(root, "worktree", "list", "--porcelain"))
-    .split("\n")
-    .filter((line) => line.startsWith("worktree "))
-    .map((line) => line.slice("worktree ".length));
+/**
+ * The worktrees Git has registered for the repository, including ones whose
+ * directory is missing, with the HEAD each registration records when Git lists it.
+ */
+export async function registeredWorktrees(
+  root: string,
+): Promise<{ path: string; head?: { commit: string; branch?: string } }[]> {
+  const output = await git(root, "worktree", "list", "--porcelain");
+  return output
+    .split("\n\n")
+    .filter((entry) => entry.startsWith("worktree "))
+    .map((entry) => {
+      const lines = entry.split("\n");
+      const field = (name: string) =>
+        lines.find((line) => line.startsWith(`${name} `))?.slice(name.length + 1);
+      const path = field("worktree")!;
+      const commit = field("HEAD");
+      const branch = field("branch")?.replace(/^refs\/heads\//, "");
+      return { path, ...(commit ? { head: { commit, ...(branch ? { branch } : {}) } } : {}) };
+    });
 }
 
 /** The commit a checkout's HEAD names, and its branch unless HEAD is detached. */
