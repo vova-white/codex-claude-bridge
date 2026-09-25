@@ -46,6 +46,7 @@ test("the plugin copied into a Codex cache reaches the service through its MCP e
         "send_followup",
         "cancel_task",
         "respond_to_request",
+        "cleanup_task",
       ],
     });
   } finally {

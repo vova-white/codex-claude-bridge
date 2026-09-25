@@ -24,6 +24,7 @@ export const operations = [
   "send_followup",
   "cancel_task",
   "respond_to_request",
+  "cleanup_task",
 ];
 
 function writePrivate(path: string, content: string): void {
@@ -107,6 +108,7 @@ async function start(
       send_followup: (params, { caller }) => tasks.followUp(caller, params),
       cancel_task: (params, { caller }) => tasks.cancel(caller, params),
       respond_to_request: (params, { caller }) => tasks.respond(caller, params),
+      cleanup_task: (params, { caller }) => tasks.cleanup(caller, params),
     },
     (error) => log(`request failed: ${errorOrigin(error)}`),
   );
