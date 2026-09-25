@@ -592,8 +592,8 @@ export class TaskService {
       }
       const recovery = processes[index]!;
       // What a writing execution left is recorded later; `reconciled` shows whether that is done.
-      const reconciles =
-        execution.status === "running" && this.workspace(execution.task_id)?.state === "ready";
+      // An uncertain queued one may have started before an OS crash lost that, so it counts too.
+      const reconciles = this.workspace(execution.task_id)?.state === "ready";
       this.db
         .prepare(
           `UPDATE executions SET status = 'interrupted', reason = 'service_restarted', detail = ?, ended_at = ?
@@ -623,7 +623,7 @@ export class TaskService {
           endedAt,
           execution.id,
         );
-      if (execution.status === "running") interrupted++;
+      interrupted++;
     });
     writers.forEach((writer, index) => {
       const recovery = writerProcesses[index]!;
@@ -667,8 +667,8 @@ export class TaskService {
    * in their worktrees and, for publishing tasks, what reached the remote, so
    * the parent sees them before deciding on a retry. The bridge only reads the
    * remote; it never pushes or creates a pull request itself. An execution whose
-   * worktree Git cannot read is marked reconciled without them, so neither it
-   * nor the executions after it wait forever.
+   * worktree Git cannot read is reconciled with `recovery.worktree: "unreadable"`
+   * instead, so the parent inspects the worktree itself rather than waiting.
    */
   private async reconcile(executionIds: string[]): Promise<void> {
     if (executionIds.length === 0) return;
@@ -688,17 +688,11 @@ export class TaskService {
       const { request } = this.db.prepare("SELECT request FROM tasks WHERE id = ?").get(taskId) as {
         request: string;
       };
-      let changes: Awaited<ReturnType<typeof listedChanges>>;
-      let publication: PublicationReport | undefined;
-      try {
-        changes = await listedChanges(workspace.path, workspace.baseline);
-        publication =
-          (JSON.parse(request) as StartRequest).publish === "pull_request"
-            ? await this.checkPublication(workspace, secrets)
-            : undefined;
-      } catch (error) {
-        this.log(`reconciling ${id} failed: ${errorOrigin(error)}`);
-        this.update(id, { detail: JSON.stringify(done) }, "interrupted");
+      const changes = await listedChanges(workspace.path, workspace.baseline);
+      if (!changes) {
+        this.log(`reconciling ${id}: Git could not read its worktree`);
+        const unreadable = { ...done, recovery: { ...done.recovery, worktree: "unreadable" } };
+        this.update(id, { detail: JSON.stringify(unreadable) }, "interrupted");
         this.record(
           id,
           "status",
@@ -706,6 +700,10 @@ export class TaskService {
         );
         continue;
       }
+      const publication =
+        (JSON.parse(request) as StartRequest).publish === "pull_request"
+          ? await this.checkPublication(workspace, secrets)
+          : undefined;
       const reconciled = this.update(
         id,
         {
@@ -1833,11 +1831,17 @@ export class TaskService {
     };
   }
 
-  /** The task's last execution before this one that started, if the service stopped while it ran. */
+  /**
+   * The task's last execution before this one that started, if the service
+   * stopped while it ran. One interrupted with an unknown process counts as
+   * started, as an OS crash may have lost the record of its start.
+   */
   private interruptedBefore(execution: ExecutionRow): ExecutionRow | undefined {
     const previous = this.db
       .prepare(
-        "SELECT * FROM executions WHERE task_id = ? AND ordinal < ? AND started_at IS NOT NULL ORDER BY ordinal DESC LIMIT 1",
+        `SELECT * FROM executions WHERE task_id = ? AND ordinal < ?
+           AND (started_at IS NOT NULL OR json_extract(detail, '$.recovery.process') = 'unknown')
+         ORDER BY ordinal DESC LIMIT 1`,
       )
       .get(execution.task_id, execution.ordinal) as ExecutionRow | undefined;
     return previous?.status === "interrupted" ? previous : undefined;

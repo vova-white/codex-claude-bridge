@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vite-plus/test";
@@ -247,6 +247,101 @@ describe("recovery after a service crash", () => {
       detail: { recovery: { process: "unknown" } },
     });
     expect(fixture.launches()).toHaveLength(1);
+  });
+
+  it("reconciles writing work a machine restart rolled back to queued and tells the follow-up it was interrupted", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          { match: "Continue", steps: [finished("Continued.")] },
+          {
+            steps: [
+              { writeFile: { path: "README.md", content: "# Changed\n" } },
+              commit,
+              { signal: "committed" },
+              { waitFor: "never" },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId, executionId } = await start(client, { project, mode: "write" });
+    await waitFor(() => fixture.signalled("committed") || undefined);
+    await sessionRecorded(client, project, taskId);
+    await fixture.killService();
+
+    // An OS crash lost the commits that started the execution; the database last ran in another boot.
+    const db = new DatabaseSync(join(fixture.stateDir, "state.db"));
+    db.prepare(
+      "UPDATE executions SET status = 'queued', reason = NULL, detail = NULL, started_at = NULL, process = NULL WHERE id = ?",
+    ).run(executionId);
+    db.prepare("UPDATE service_state SET value = 'an-earlier-boot' WHERE key = 'boot_id'").run();
+    db.close();
+    const reconnected = await fixture.connect();
+
+    const recovered = await waitFor(async () => {
+      const state = await status(reconnected, project, taskId);
+      return state.executions[0].detail.recovery.reconciled ? state.executions[0] : undefined;
+    });
+    expect(recovered).toMatchObject({
+      status: "interrupted",
+      reason: "service_restarted",
+      detail: {
+        recovery: { process: "unknown", reconciled: true },
+        workspace: { commitCount: 1, changedFileCount: 1 },
+      },
+    });
+    const sent = await reconnected.call("send_followup", {
+      project,
+      taskId,
+      requestKey: "more-1",
+      message: "Continue.",
+    });
+    expect(sent.data).toMatchObject({ resumes: { interruptedExecution: executionId } });
+    expect((await finish(reconnected, project, taskId, sent.data.executionId)).status).toBe(
+      "completed",
+    );
+    expect(fixture.prompts()[1]).toContain("<previous-execution-interrupted>");
+  });
+
+  it("marks an interrupted writing execution whose worktree Git cannot read as reconciled without its changes", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { writeFile: { path: "README.md", content: "# Changed\n" } },
+              commit,
+              { signal: "committed" },
+              { waitFor: "never" },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await start(client, { project, mode: "write" });
+    await waitFor(() => fixture.signalled("committed") || undefined);
+    const { workspace } = await status(client, project, taskId);
+    await fixture.killService();
+    writeFileSync(join(workspace.path, ".git"), `gitdir: ${join(fixture.root, "missing")}\n`);
+    const reconnected = await fixture.connect();
+
+    const recovered = await waitFor(async () => {
+      const state = await status(reconnected, project, taskId);
+      return state.executions[0].detail.recovery.reconciled ? state.executions[0] : undefined;
+    });
+    expect(recovered.detail.recovery).toMatchObject({ reconciled: true, worktree: "unreadable" });
+    expect(recovered.detail.workspace).toBeUndefined();
+    const events = (
+      await reconnected.call("read_output", { project, taskId, limit: 200 })
+    ).data.events.map((event: { text: string }) => event.text);
+    expect(events).toContain(
+      `Could not read the worktree at ${workspace.path} after the restart; inspect it with git directly.`,
+    );
   });
 
   it("runs a follow-up queued before the crash, telling Claude the previous execution was interrupted", async () => {
