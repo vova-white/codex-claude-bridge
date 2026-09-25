@@ -5,7 +5,7 @@ import { z } from "zod";
 import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { redactContent } from "../redact.ts";
+import { errorOrigin, redactContent } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
@@ -299,7 +299,7 @@ export class TaskService {
     // Accepted intent is durable before any Claude Code process starts.
     setImmediate(() => {
       this.execute(executionId, project, request).catch((error: unknown) => {
-        this.log(`execution ${executionId} failed unexpectedly: ${(error as Error).stack}`);
+        this.log(`execution ${executionId} failed unexpectedly: ${errorOrigin(error)}`);
         this.update(executionId, {
           status: "failed",
           reason: "provider_error",
