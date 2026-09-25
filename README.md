@@ -1,6 +1,6 @@
 # Codex to Claude bridge
 
-A local Codex-to-Claude delegation bridge. This repository currently contains a development toolchain and a small CLI scaffold; orchestration, MCP, persistence, and provider integration are not implemented.
+A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness only; delegated task execution is not implemented yet.
 
 ## Setup
 
@@ -17,6 +17,35 @@ Commit `package.json` and `bun.lock` together. Direct dependency versions are ex
 
 `trustedDependencies: []` disables Bun's default dependency-script allowlist. The selected dependencies install without trusted dependency scripts or browser downloads. The repository's own `prepare` script still runs and installs the Vite+ hook dispatcher via `vp config --no-agent`. If installation used `--ignore-scripts`, run `bun run hooks:install` explicitly. Review any new dependency that requires an installation script before adding its name to `trustedDependencies`; do not broadly trust all packages.
 
+## Install the Codex plugin
+
+Requirements: Node.js 24.21.0 on the `PATH` that Codex uses, Claude Code signed in with your Claude subscription (`claude`, then `/login`), and Git 2.32+. Build the plugin bundle from a checkout, then register the checkout as a local plugin marketplace:
+
+```sh
+bun install --frozen-lockfile
+bun run build:plugin
+codex plugin marketplace add /path/to/codex-claude-bridge
+codex plugin add claude-bridge@codex-claude-bridge
+```
+
+Codex copies the plugin, including the bundle in `plugins/claude-bridge/dist/`, into its plugin cache. After rebuilding, run `codex plugin remove claude-bridge@codex-claude-bridge` and add it again. The plugin provides the `claude-delegation` skill and the `claude_bridge` MCP server; ask Codex to check Claude readiness to verify the installation.
+
+## Architecture and state
+
+Codex launches `node dist/cli.mjs mcp` from the plugin. That MCP entry point keeps no state: it connects to the bridge service over a Unix socket in the state directory, starting `cli.mjs service` as a detached process when none is running. Every connection must present the random token the service writes to `service.token`. The state directory is private to the user (mode 0700), and the service holds an exclusive lock on its SQLite database ([ADR 0004](docs/adr/0004-node-sqlite-and-exclusive-state-ownership.md)), so concurrent MCP clients share one service per state directory. The service keeps running when Codex exits.
+
+The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (redacted diagnostics, rotated at 1 MB), and the optional `config.json`:
+
+| Key                | Meaning                                                                               |
+| ------------------ | ------------------------------------------------------------------------------------- |
+| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`               |
+| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`           |
+| `mcpServers`       | MCP servers Claude may use, in Claude Code's format; `env` and `headers` stay private |
+
+The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
+
+To stop the service, send `SIGTERM` to the PID in `service.json`.
+
 ## Commands
 
 Use `bun run <name>` to invoke these package scripts. They run Node or the local Vite+ CLI; `bun test` is a different runner and is not used here.
@@ -29,7 +58,8 @@ Use `bun run <name>` to invoke these package scripts. They run Node or the local
 | `lint`                           | Oxlint; warnings fail the command                                       |
 | `format`                         | Apply Oxfmt formatting, including Markdown                              |
 | `format:check`                   | Verify formatting without fixes                                         |
-| `build`                          | Bundle the CLI for Node into `dist/cli.mjs` with a source map           |
+| `build`                          | Bundle the CLI and its dependencies into `dist/cli.mjs`                 |
+| `build:plugin`                   | Bundle the CLI into the plugin directory for installation in Codex      |
 | `build:check`                    | Build into a temporary directory, check syntax, and execute the bundle  |
 | `test`                           | All Vitest unit and integration tests                                   |
 | `test:unit` / `test:integration` | One Vitest test category                                                |
@@ -38,17 +68,17 @@ Use `bun run <name>` to invoke these package scripts. They run Node or the local
 | `hooks:install`                  | Install or refresh the Git hook dispatcher                              |
 | `hooks:check`                    | Verify real Git commits in a disposable repository                      |
 
-The CLI accepts `--help` and `--version`. Unsupported invocations return exit code 2 with a diagnostic on stderr. For example: `bun run start --version` after `bun run build`.
+The CLI accepts `--help`, `--version`, `mcp` (the stdio MCP entry point), and `service` (the background service, normally started by `mcp`). Unsupported invocations return exit code 2 with a diagnostic on stderr. For example: `bun run start --version` after `bun run build`.
 
 ## Test boundaries
 
-- `tests/unit/**/*.test.ts`: argument parsing, including invalid combinations.
-- `tests/integration/**/*.test.ts`: launch the TypeScript entry point with Node and verify its process output.
-- `tests/e2e/**/*.e2e.ts`: Playwright Test launches the built CLI outside the source checkout and verifies stdout, stderr, exit codes, and package version.
+- `tests/unit/**/*.test.ts`: argument parsing and Claude Code version compatibility.
+- `tests/integration/**/*.test.ts`: the public MCP boundary. `tests/support/bridge.ts` gives each test a temporary state directory and launches the real MCP entry point and background service as subprocesses, with real SQLite. `tests/fixtures/fake-claude.ts` replaces the Claude Code executable: it speaks the Agent SDK's stream-json control protocol and follows a per-test scenario, so the real SDK and adapter run without credentials or model calls.
+- `tests/e2e/**/*.e2e.ts`: Playwright Test launches the built CLI outside the source checkout, and runs the plugin as Codex installs it: copied without `node_modules`, launched from its `.mcp.json`.
 
 Vitest and Playwright have separate discovery patterns. Full suites fail when no tests are found, focused tests are forbidden, and retries are disabled for E2E. There are no browser fixtures, so `playwright install` and OS browser libraries are unnecessary. If actual browser behavior is added later, document the required browser and install it explicitly in local setup and CI.
 
-All automated tests work without Claude credentials, model calls, or GitHub mutations. The scaffold does not implement the future MCP/service integration harness from issue #1. Future orchestration tests should exercise that public boundary with a deterministic provider substitute.
+All automated tests work without Claude credentials, model calls, or GitHub mutations. Tests stop the service processes they start; a test's state directory is never the installed bridge's.
 
 ## Commit checks
 

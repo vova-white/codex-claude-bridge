@@ -22,3 +22,13 @@ A child agent assigned to change project files as part of its delegated task.
 
 **Nested agent**:
 An agent engaged by a child agent to carry out part of its delegated task. The child agent remains accountable for incorporating that agent's work into its task result.
+
+**Bridge service**:
+The local background process that owns delegated work, its persisted state, and the Claude Code processes. MCP entry points connect to it and may come and go without affecting it.
+_Avoid_: Daemon, server
+
+**State directory**:
+The per-user directory whose database, socket, token, configuration, and logs belong to exactly one bridge service at a time.
+
+**Readiness**:
+Whether Claude Code can take delegated work: a compatible executable, a verified subscription login, available models, Git support, and reachable configured integrations.

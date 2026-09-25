@@ -9,7 +9,11 @@ describe("CLI arguments", () => {
   it("selects version output", () => {
     expect(parseArguments(["--version"])).toBe("version");
   });
-  it.each([["--unknown"], ["--version", "--help"], ["start"]])(
+  it("selects the MCP entry point and the background service", () => {
+    expect(parseArguments(["mcp"])).toBe("mcp");
+    expect(parseArguments(["service"])).toBe("service");
+  });
+  it.each([["--unknown"], ["--version", "--help"], ["start"], ["mcp", "extra"]])(
     "rejects unsupported invocation %s",
     (...args) => {
       expect(() => parseArguments(args)).toThrow("Use --help");
