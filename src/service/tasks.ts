@@ -1065,9 +1065,17 @@ export class TaskService {
           this.log(
             `worktree for nested writer ${id} could not be created (${(error as NodeJS.ErrnoException).code ?? "git worktree add failed"})`,
           );
-          const message = `Could not create a worktree at ${path} on branch ${branch}; the nested writer was not started.`;
-          this.endNestedWriter(id, "failed", "workspace_error", { error: { message } }, true);
-          throw new NestedWriterRefusal(message);
+          // The branch name derives from Claude's assignment, so the stored error omits it.
+          const failure = {
+            message:
+              "Execution failed with workspace_error: the bridge could not create the nested writer's worktree (see workspace); the nested writer was not started.",
+            action:
+              "Check that the repository accepts new worktrees and branches (for example with `git worktree add`).",
+          };
+          this.endNestedWriter(id, "failed", "workspace_error", { error: failure }, true);
+          throw new NestedWriterRefusal(
+            `Could not create a worktree at ${path} on branch ${branch}; the nested writer was not started.`,
+          );
         }
         if (closed || signal.aborted) {
           this.endNestedWriter(id, "cancelled", stopReason, {}, true);
@@ -1090,8 +1098,12 @@ export class TaskService {
         )
           .catch((error: unknown) => {
             this.log(`nested writer ${id} failed unexpectedly: ${errorOrigin(error)}`);
-            const message = "The bridge could not run this nested writer.";
-            this.endNestedWriter(id, "failed", "provider_error", { error: { message } }, null);
+            const failure = {
+              message:
+                "Execution failed with provider_error: the bridge could not run this nested writer.",
+              action: "Check service.log in the state directory, then start a new task.",
+            };
+            this.endNestedWriter(id, "failed", "provider_error", { error: failure }, null);
           })
           .finally(() => {
             runs.delete(id);
@@ -1164,7 +1176,7 @@ export class TaskService {
       nestedEnded: () => {},
       waitingForChildren: () => {},
     };
-    const outcome: ExecutionOutcome = executable
+    let outcome: ExecutionOutcome = executable
       ? await runExecution(
           {
             executable,
@@ -1192,6 +1204,10 @@ export class TaskService {
     // The writer's changes stay in its worktree whatever the outcome.
     const changes = await listedChanges(writer.path, writer.baseline, secrets);
     const retained = changes ? { changes } : {};
+    // Cancellation wins over a failure it raced, even after Claude Code has returned.
+    if (outcome.status === "failed" && signal.aborted) {
+      outcome = { status: "cancelled", processExited: outcome.processExited };
+    }
     let status: string;
     let reason: string | null = null;
     if (outcome.status === "completed") {
@@ -1217,7 +1233,18 @@ export class TaskService {
     } else if (outcome.status === "failed") {
       status = "failed";
       reason = outcome.reason;
-      const error = { message: outcome.message, action: outcome.action };
+      // Claude chooses file names and commit subjects, so they stay in workspace, out of `error`.
+      const error = {
+        message: [
+          outcome.message,
+          ...(changes
+            ? [
+                `The nested writer's worktree holds ${plural(changes.commitCount, "commit")} and ${plural(changes.changedFileCount, "changed file")} (see workspace).`,
+              ]
+            : []),
+        ].join(" "),
+        action: outcome.action,
+      };
       this.endNestedWriter(
         writer.id,
         status,

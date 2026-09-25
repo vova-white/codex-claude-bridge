@@ -273,7 +273,11 @@ describe("nested writers", () => {
         { match: "Alpha writer", steps: retitle("Alpha") },
         {
           match: "Beta writer",
-          steps: [{ writeFile: { path: "partial.txt", content: "p\n" } }, { exit: { code: 1 } }],
+          steps: [
+            { writeFile: { path: "partial.txt", content: "p\n" } },
+            { assistant: "Writing partial.txt" },
+            { exit: { code: 1, stderr: "claude-stderr-marker" } },
+          ],
         },
         {
           match: "Gamma writer",
@@ -305,6 +309,11 @@ describe("nested writers", () => {
       { status: "cancelled", reason: "parent_ended" },
     ]);
     expect(existsSync(join(writers[1].workspace.path, "partial.txt"))).toBe(true);
+    // A failed writer's error is composed from known fields; its files are only in workspace.
+    expect(writers[1].error.message).toMatch(/^Execution failed with provider_error: /);
+    expect(writers[1].error.message).toContain("0 commits and 1 changed file (see workspace)");
+    expect(writers[1].error.action).toContain(writers[1].workspace.path);
+    expect(JSON.stringify(writers[1].error)).not.toMatch(/partial\.txt|claude-stderr-marker/);
     const gammaPid = fixture.launches().find((launch) => launch.cwd === writers[2].workspace.path)!;
     expect(isAlive(gammaPid.pid)).toBe(false);
     expect(git(project, "branch", "--list", writers[0].workspace.branch)).not.toBe("");
