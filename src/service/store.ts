@@ -128,17 +128,29 @@ const migrations: string[] = [
 
 export class StoreLockedError extends Error {}
 
+/** How long the service that reserved the lock waits for other starting services' reads to end. */
+const lockWaitMs = 1_000;
+
 /**
  * Opens the state database and holds an exclusive lock on it for the lifetime of
  * the process. The operating system releases the lock if the service dies, so a
  * second service for the same state directory fails fast instead of sharing it.
+ * Services started at once each read the database while taking the lock, so the
+ * lock is taken in two steps: reserving it fails at once for all but one of
+ * them, and that one then commits a write, which waits out the others' brief
+ * reads as they let go. The locking mode becomes exclusive only after the
+ * reservation, as a refused service would otherwise keep its read lock.
  * WAL with `synchronous = NORMAL` keeps committed state across a service crash;
  * what an OS crash can roll back is described in ADR 0004.
  */
 export function openStore(path: string): DatabaseSync {
   const db = new DatabaseSync(path, { timeout: 0 });
   try {
-    db.exec("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;");
+    db.exec("BEGIN IMMEDIATE");
+    const { user_version } = db.prepare("PRAGMA user_version").get() as { user_version: number };
+    db.exec(
+      `PRAGMA busy_timeout = ${lockWaitMs}; PRAGMA locking_mode = EXCLUSIVE; PRAGMA user_version = ${user_version}; COMMIT;`,
+    );
   } catch (error) {
     db.close();
     if (/locked|busy/i.test((error as Error).message)) {
