@@ -1,6 +1,6 @@
 # Codex to Claude bridge
 
-A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout and writing tasks in isolated Git worktrees, with bounded waits, cursor-based progress reads, follow-ups to the same Claude session, and cancellation; publishing task pull requests and nested agents are not implemented yet.
+A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout (optionally with nested read-only agents) and writing tasks in isolated Git worktrees, with bounded waits, cursor-based progress reads, follow-ups to the same Claude session, and cancellation; publishing task pull requests is not implemented yet.
 
 ## Setup
 
@@ -52,7 +52,9 @@ Delegated tasks are stored in `state.db` with their executions, provider session
 
 A task's executions run one at a time: a follow-up is a new execution that resumes the task's Claude session (`--resume`) after the active execution ends, and fails as `session_unavailable` rather than starting a new conversation when Claude Code cannot resume it. Cancellation stops the running Claude Code process, which the service spawns itself so it can confirm the process exited (escalating to `SIGKILL` after a grace period), and cancels queued follow-ups.
 
-Each execution's progress (status changes, Claude's messages, tool calls, and the final summary) is stored as numbered events for `read_output`. Diagnostics retention is bounded separately from results: an event keeps at most 16,000 characters, and an execution keeps its newest 2,000 events. A `wait_task` call lasts at most 300 s, below the plugin's 600 s MCP tool timeout.
+Claude may start nested agents through Claude Code's Agent tool. The read-only profile disables the edit tools with session deny rules, which Claude Code (verified in 2.1.282) applies to every nested agent's tools and permission checks, whatever its definition lists. The adapter records the nested agents Claude Code reports (`task_started`, `task_progress`, `task_notification`) per execution. A successful result that arrives while some of them still run leaves the execution `running` with `reason: waiting_for_children`: Claude Code runs another turn when a nested agent finishes, and the execution completes with the first result after all have ended. If Claude Code exits first, the execution fails. Nothing bounds a nested agent that never ends except cancellation, which asks Claude Code to stop each running nested agent (`stop_task`), waits briefly for it to report them stopped, and then ends the process. In-process agents end with the process; work they started outside it is not controlled, and the cancel response discloses nested agents whose stop was not reported.
+
+Each execution's progress (status changes, Claude's messages, tool calls, nested agents, and the final summary) is stored as numbered events for `read_output`. Diagnostics retention is bounded separately from results: an event keeps at most 16,000 characters, and an execution keeps its newest 2,000 events. A `wait_task` call lasts at most 300 s, below the plugin's 600 s MCP tool timeout.
 
 To stop the service, send `SIGTERM` to the PID in `service.json`. Running tasks are then reported as interrupted.
 

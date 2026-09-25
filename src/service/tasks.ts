@@ -164,12 +164,15 @@ export const resultSchema = z.object({
 });
 const projectLookup = z.object({ project: z.string().min(1) });
 
-/** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
-const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit", "Agent"];
+/**
+ * Tools a read-only task never gets. Claude Code applies these session deny
+ * rules to nested agents too, whatever tools their definitions list.
+ */
+const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit"];
 /** Most commits and changed files a result lists, and the longest commit subject kept. */
 const maxListedChanges = 500;
 const maxSubjectChars = 1_000;
-/** Writing tasks get every tool except subagents, which could not be held to the worktree. */
+/** Writing tasks get every tool except nested agents, which could not be held to the worktree. */
 const writingDisallowedTools = ["Agent"];
 
 interface WorkspaceRow {
@@ -192,6 +195,21 @@ interface TaskRow {
   request: string;
   session_id: string | null;
   created_at: string;
+}
+
+interface NestedRow {
+  task_id: string;
+  tool_use_id: string | null;
+  parent_tool_use_id: string | null;
+  description: string;
+  agent_type: string | null;
+  background: number;
+  depth: number | null;
+  status: string;
+  summary: string | null;
+  termination: string | null;
+  started_at: string;
+  ended_at: string | null;
 }
 
 interface ExecutionRow {
@@ -243,7 +261,7 @@ function readOnlyGuidance(root: string): string {
 
 This task uses the read-only profile on a shared checkout at ${root}. Do not create, modify, or delete files, change Git state, or install anything; the Edit, Write, and NotebookEdit tools are unavailable, and shell commands are for inspection only. The bridge compares the checkout before and after the task and reports any change to the parent.
 
-Nested agents are not available in this task: do all of the work yourself.
+You may start nested agents with the Agent tool for independent research or review subtasks that can run in parallel, but only when the expected gain in quality or elapsed time outweighs the cost of briefing them, the extra usage, and reconciling their findings. Keep small, sequential, or tightly coupled work yourself. Nested agents have the same read-only restrictions. Wait for every nested agent you start, including background ones, and incorporate their findings into your result: you remain accountable for it, and the parent sees the task as waiting while nested agents run.
 
 No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
 
@@ -318,6 +336,11 @@ export class TaskService {
         "Interrupted: the bridge service stopped while this execution ran.",
       );
     }
+    this.db
+      .prepare(
+        "UPDATE nested_tasks SET status = 'unknown', termination = 'unconfirmed', ended_at = ? WHERE status = 'running'",
+      )
+      .run(now());
     if (unfinished.length > 0) {
       this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
     }
@@ -483,6 +506,7 @@ export class TaskService {
         executionId: execution.id,
         ordinal: execution.ordinal,
         ...executionState(execution),
+        ...this.nested(execution.id),
         ...(execution.started_at ? { startedAt: execution.started_at } : {}),
         ...(execution.ended_at ? { endedAt: execution.ended_at } : {}),
       })),
@@ -659,13 +683,23 @@ export class TaskService {
         (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
           false,
     );
+    const views = executions.map((execution) => ({
+      executionId: execution.id,
+      ...executionState(execution),
+      ...this.nested(execution.id),
+    }));
+    const unreported = views
+      .flatMap((view) => view.nested ?? [])
+      .filter((nested) => nested.termination !== undefined && nested.termination !== "reported");
     return {
       taskId: task.id,
       cancellation: active.length === 0 ? "none_active" : confirmed ? "confirmed" : "requested",
-      executions: executions.map((execution) => ({
-        executionId: execution.id,
-        ...executionState(execution),
-      })),
+      executions: views,
+      ...(unreported.length > 0
+        ? {
+            controlGap: `Claude Code did not report stopping ${unreported.length} nested agent(s). Those with termination process_exit ended with its process; unconfirmed ones may still run. The bridge does not control work nested agents started outside Claude Code, such as background commands.`,
+          }
+        : {}),
     };
   }
 
@@ -824,6 +858,30 @@ export class TaskService {
         .prepare("UPDATE executions SET events_pruned = events_pruned + ? WHERE id = ?")
         .run(pruned, executionId);
     }
+  }
+
+  /** The nested agents Claude Code reported for an execution, as task_status shows them. */
+  private nested(executionId: string) {
+    const rows = this.db
+      .prepare("SELECT * FROM nested_tasks WHERE execution_id = ? ORDER BY started_at, rowid")
+      .all(executionId) as unknown as NestedRow[];
+    if (rows.length === 0) return {};
+    return {
+      nested: rows.map((row) => ({
+        taskId: row.task_id,
+        ...(row.tool_use_id ? { toolUseId: row.tool_use_id } : {}),
+        ...(row.parent_tool_use_id ? { parentToolUseId: row.parent_tool_use_id } : {}),
+        description: row.description,
+        ...(row.agent_type ? { agentType: row.agent_type } : {}),
+        background: row.background === 1,
+        ...(row.depth === null ? {} : { depth: row.depth }),
+        status: row.status,
+        ...(row.summary ? { summary: row.summary } : {}),
+        ...(row.termination ? { termination: row.termination } : {}),
+        startedAt: row.started_at,
+        ...(row.ended_at ? { endedAt: row.ended_at } : {}),
+      })),
+    };
   }
 
   private executionById(taskId: string, executionId: string): ExecutionRow {
@@ -1026,12 +1084,77 @@ export class TaskService {
           },
           message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
           // Strings are redacted before serialization, which would escape them.
-          toolCall: (name, input) =>
+          toolCall: (name, input, nestedTaskId) =>
             this.record(
               executionId,
-              "tool",
-              `${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
+              nestedTaskId ? "nested" : "tool",
+              `${nestedTaskId ? `${nestedTaskId}: ` : ""}${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
             ),
+          nestedStarted: (nested) => {
+            const description = redactContent(nested.description, secrets);
+            this.db
+              .prepare(
+                `INSERT OR IGNORE INTO nested_tasks (execution_id, task_id, tool_use_id, parent_tool_use_id,
+                   description, agent_type, background, depth, status, started_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)`,
+              )
+              .run(
+                executionId,
+                nested.taskId,
+                nested.toolUseId ?? null,
+                nested.parentToolUseId ?? null,
+                description,
+                nested.agentType ?? null,
+                nested.background ? 1 : 0,
+                nested.depth ?? null,
+                now(),
+              );
+            this.record(
+              executionId,
+              "nested",
+              `${nested.taskId} started${nested.background ? " in the background" : ""}: ${description}`,
+            );
+          },
+          nestedProgress: (taskId, summary) =>
+            this.record(executionId, "nested", `${taskId}: ${redactContent(summary, secrets)}`),
+          nestedEnded: (taskId, end) => {
+            const summary = end.summary === undefined ? null : redactContent(end.summary, secrets);
+            this.db
+              .prepare(
+                `UPDATE nested_tasks SET status = ?, summary = ?, termination = ?, ended_at = ?
+                 WHERE execution_id = ? AND task_id = ? AND status = 'running'`,
+              )
+              .run(end.status, summary, end.termination, now(), executionId, taskId);
+            this.record(
+              executionId,
+              "nested",
+              `${taskId} ${end.status}${end.termination === "reported" ? "" : ` (${end.termination})`}${summary ? `: ${summary}` : ""}`,
+            );
+          },
+          waitingForChildren: (count) => {
+            const current = this.db
+              .prepare("SELECT reason FROM executions WHERE id = ?")
+              .get(executionId) as { reason: string | null };
+            if (count === 0 && current.reason !== "waiting_for_children") return;
+            const changed = this.update(
+              executionId,
+              count > 0
+                ? {
+                    reason: "waiting_for_children",
+                    detail: JSON.stringify({ runningNested: count }),
+                  }
+                : { reason: null, detail: null },
+            );
+            if (changed && current.reason !== "waiting_for_children") {
+              this.record(
+                executionId,
+                "status",
+                `Claude finished its turn; waiting for ${count} nested agent(s).`,
+              );
+            } else if (changed && count === 0) {
+              this.record(executionId, "status", "Nested agents ended; Claude continues.");
+            }
+          },
         },
       );
     }
