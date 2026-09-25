@@ -253,9 +253,14 @@ export function claudeEnvironment(config: BridgeConfig): NodeJS.ProcessEnv {
  */
 export function mcpConfigArgs(paths: StatePaths, config: BridgeConfig): Record<string, string> {
   if (Object.keys(config.mcpServers).length === 0) return {};
-  writeFileSync(paths.claudeMcpConfig, JSON.stringify({ mcpServers: config.mcpServers }), {
-    mode: 0o600,
-  });
+  // autoApprove is the bridge's own setting, not part of Claude Code's format.
+  const mcpServers = Object.fromEntries(
+    Object.entries(config.mcpServers).map(([name, server]) => {
+      const { autoApprove: _, ...entry } = server;
+      return [name, entry];
+    }),
+  );
+  writeFileSync(paths.claudeMcpConfig, JSON.stringify({ mcpServers }), { mode: 0o600 });
   return { "mcp-config": paths.claudeMcpConfig };
 }
 

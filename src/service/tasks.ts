@@ -10,6 +10,8 @@ import {
   writingResult,
   type ExecutionObserver,
   type ExecutionOutcome,
+  type PendingRequest,
+  type RequestResponse,
 } from "../claude/execution.ts";
 import {
   NestedWriterRefusal,
@@ -170,6 +172,30 @@ export const resultSchema = z.object({
 });
 const projectLookup = z.object({ project: z.string().min(1) });
 
+/** Arguments of respond_to_request. */
+export const respondSchema = z.object({
+  project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
+  taskId: z.string().min(1).describe("Task identifier returned by start_task."),
+  requestId: z.string().min(1).describe("Request identifier from task_status."),
+  response: z
+    .union([
+      z.strictObject({
+        decision: z.enum(["allow", "deny"]),
+        message: z.string().min(1).optional().describe("Why; Claude sees it with a denial."),
+      }),
+      z.strictObject({
+        answers: z
+          .record(z.string(), z.string().min(1))
+          .describe("An answer for each question, keyed by the question text."),
+      }),
+    ])
+    .describe(
+      "For a permission request { decision, message? }; for a question { answers }. The request's responseShape shows the expected form.",
+    ),
+});
+
+const expiredNote = "The Claude session that asked is no longer running; send a follow-up instead.";
+
 /**
  * Tools a read-only task never gets. Claude Code applies these session deny
  * rules to nested agents too, whatever tools their definitions list.
@@ -222,6 +248,37 @@ interface TaskRow {
   created_at: string;
 }
 
+/**
+ * What a running execution waits for: requests the caller must answer, oldest
+ * first; subscription capacity; and nested agents still running after the
+ * executor's turn.
+ */
+interface Waits {
+  requests: Set<string>;
+  capacity?: { resetsAt?: number };
+  runningNested: number;
+}
+
+interface RequestRow {
+  id: string;
+  task_id: string;
+  execution_id: string;
+  session_id: string | null;
+  /** The nested writer that asked; absent when the executor did. */
+  writer_id: string | null;
+  tool_name: string;
+  kind: "question" | "permission";
+  payload: string;
+  response_shape: string;
+  state: "pending" | "answered" | "expired";
+  /** The response as the parent sees it, redacted. */
+  response: string | null;
+  /** Identifies the response as given, so a repeat can be recognized. */
+  response_hash: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 interface NestedRow {
   task_id: string;
   tool_use_id: string | null;
@@ -261,7 +318,7 @@ interface ExecutionRow {
 const cancelConfirmationMs = 20_000;
 const terminalStatuses = ["completed", "failed", "cancelled", "interrupted"];
 /** Reasons a running execution cannot progress on its own; entering one ends a wait. */
-const blockedReasons = new Set(["waiting_for_capacity"]);
+const blockedReasons = new Set(["waiting_for_capacity", "needs_input"]);
 
 function parse<T>(schema: z.ZodType<T>, params: unknown): T {
   const parsed = schema.safeParse(params ?? {});
@@ -288,7 +345,7 @@ This task uses the read-only profile on a shared checkout at ${root}. Do not cre
 
 You may start nested agents with the Agent tool for independent research or review subtasks that can run in parallel, but only when the expected gain in quality or elapsed time outweighs the cost of briefing them, the extra usage, and reconciling their findings. Keep small, sequential, or tightly coupled work yourself. Nested agents have the same read-only restrictions. Wait for every nested agent you start, including background ones, and incorporate their findings into your result: you remain accountable for it, and the parent sees the task as waiting while nested agents run.
 
-No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+Work without asking whenever you can: make reasonable assumptions, state them, and list anything unresolved as remaining work. When a decision genuinely needs the user or the parent, ask with AskUserQuestion; the parent answers while you wait. Some MCP tools need the parent's approval before each call; if a call is denied, continue without it and report what you could not do.
 
 Finish with the structured result: summary (the answer or outcome), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), and remainingWork (what is left for the parent).`;
 }
@@ -304,7 +361,7 @@ Claude Code's Agent tool is not available, because its agents would share your w
 
 Use nested writers only when changes are independent and large enough that working in parallel outweighs the cost: each is a full Claude Code session on the same subscription, and you brief it, review its work, and merge it. Keep small, sequential, or tightly coupled changes yourself. Nested writers cannot start nested writers, and the bridge does not limit how many you start, so start only as many as the work justifies.
 
-No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+Work without asking whenever you can: make reasonable assumptions, state them, and list anything unresolved as remaining work. When a decision genuinely needs the user or the parent, ask with AskUserQuestion; the parent answers while you wait. Some MCP tools need the parent's approval before each call; if a call is denied, continue without it and report what you could not do.
 
 Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the parent), and checks (each check you ran and whether it passed).`;
 }
@@ -318,7 +375,7 @@ Make the changes the assignment needs. Install dependencies and run the checks t
 
 Nested agents are not available: do all of the work yourself.
 
-No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+Work without asking whenever you can: make reasonable assumptions, state them, and list anything unresolved as remaining work. When a decision genuinely needs the user or Codex, ask with AskUserQuestion; Codex answers while you wait. Some MCP tools need Codex's approval before each call; if a call is denied, continue without it and report what you could not do.
 
 Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the executor), and checks (each check you ran and whether it passed).`;
 }
@@ -344,6 +401,13 @@ export class TaskService {
   >();
   /** Tasks whose next queued execution is about to start. */
   private readonly launching = new Set<string>();
+  /** Requests Claude is waiting on in this process, with the means to answer them. */
+  /** What each execution running in this process waits for; its reason is derived from it. */
+  private readonly waits = new Map<string, Waits>();
+  private readonly live = new Map<
+    string,
+    { resolve: (response: RequestResponse | undefined) => void; secrets: readonly string[] }
+  >();
 
   constructor(
     db: DatabaseSync,
@@ -392,6 +456,10 @@ export class TaskService {
     if (unfinished.length > 0) {
       this.log(`marked ${unfinished.length} unfinished execution(s) interrupted`);
     }
+    const pending = this.db.prepare("SELECT id FROM requests WHERE state = 'pending'").all() as {
+      id: string;
+    }[];
+    for (const { id } of pending) this.expire(id);
   }
 
   async start(caller: string, params: unknown) {
@@ -540,6 +608,9 @@ export class TaskService {
       .all(task.id) as unknown as ExecutionRow[];
     const latest = executions.at(-1)!;
     const intent = JSON.parse(task.request) as Omit<StartRequest, "project" | "requestKey">;
+    const requests = this.db
+      .prepare("SELECT * FROM requests WHERE task_id = ? ORDER BY created_at, rowid")
+      .all(task.id) as unknown as RequestRow[];
     const workspace = this.workspace(task.id);
     return {
       taskId: task.id,
@@ -559,7 +630,57 @@ export class TaskService {
         ...(execution.started_at ? { startedAt: execution.started_at } : {}),
         ...(execution.ended_at ? { endedAt: execution.ended_at } : {}),
       })),
+      requests: requests.map((request) => this.requestView(request)),
     };
+  }
+
+  /**
+   * Answers a request Claude is waiting on. The response reaches Claude once:
+   * repeating it returns the recorded outcome, and a different response to an
+   * answered request fails. A request whose execution has ended cannot be answered.
+   */
+  async respond(caller: string, params: unknown) {
+    const { project, taskId, requestId, response } = parse(respondSchema, params);
+    const task = await this.task(caller, project, taskId);
+    const request = this.db
+      .prepare("SELECT * FROM requests WHERE id = ? AND task_id = ?")
+      .get(requestId, task.id) as RequestRow | undefined;
+    if (!request) {
+      throw new ServiceError("not_found", `Task ${task.id} has no request ${requestId}.`);
+    }
+    if (request.state === "answered") {
+      if (request.response_hash !== responseHash(this.checkResponse(request, response).given)) {
+        throw new ServiceError(
+          "request_already_answered",
+          `Request ${requestId} was already answered with a different response, which cannot be replaced.`,
+        );
+      }
+      return { taskId: task.id, ...this.requestView(request), repeated: true };
+    }
+    const live = this.live.get(requestId);
+    if (!live) {
+      this.expire(requestId);
+      throw new ServiceError("request_expired", `Request ${requestId} has expired: ${expiredNote}`);
+    }
+    const { given, answer } = this.checkResponse(request, response);
+    const shown = redactStrings(given, (text) => redactContent(text, live.secrets));
+    this.db
+      .prepare(
+        "UPDATE requests SET state = 'answered', response = ?, response_hash = ?, resolved_at = ? WHERE id = ? AND state = 'pending'",
+      )
+      .run(JSON.stringify(shown), responseHash(given), now(), requestId);
+    this.live.delete(requestId);
+    this.record(
+      request.execution_id,
+      "status",
+      `Request ${requestId} answered${"decision" in answer ? ` (${answer.decision})` : ""}.`,
+    );
+    this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
+    live.resolve(answer);
+    const answered = this.db
+      .prepare("SELECT * FROM requests WHERE id = ?")
+      .get(requestId) as unknown as RequestRow;
+    return { taskId: task.id, ...this.requestView(answered), repeated: false };
   }
 
   /**
@@ -773,7 +894,11 @@ export class TaskService {
     const deadline = Date.now() + timeoutSeconds * 1000;
     for (;;) {
       const current = this.executionById(task.id, pinned.id);
-      const blocked = current.reason !== initialReason && blockedReasons.has(current.reason ?? "");
+      // A pending request needs the caller's answer, so it ends a wait at once;
+      // a capacity wait ends a wait only when it begins.
+      const blocked =
+        current.reason === "needs_input" ||
+        (current.reason !== initialReason && blockedReasons.has(current.reason ?? ""));
       const remaining = deadline - Date.now();
       if (terminalStatuses.includes(current.status) || blocked || remaining <= 0) {
         return {
@@ -848,6 +973,177 @@ export class TaskService {
           }
         : {}),
     };
+  }
+
+  /**
+   * Checks that a response fits the request. Returns it as given, in a stable
+   * form, and as Claude receives it: answers go by question position, because
+   * the parent answers the question texts as displayed, possibly redacted.
+   */
+  private checkResponse(
+    request: RequestRow,
+    response: z.infer<typeof respondSchema>["response"],
+  ): { given: object; answer: RequestResponse } {
+    if (request.kind === "permission") {
+      if (!("decision" in response)) {
+        throw new ServiceError(
+          "invalid_arguments",
+          `Request ${request.id} asks for permission; respond with { decision: "allow" | "deny", message? }.`,
+        );
+      }
+      const decision = {
+        decision: response.decision,
+        ...(response.message ? { message: response.message } : {}),
+      };
+      return { given: decision, answer: decision };
+    }
+    const asked = questionTexts(JSON.parse(request.payload));
+    if (
+      !("answers" in response) ||
+      Object.keys(response.answers).length !== asked.length ||
+      !asked.every((question) => question in response.answers)
+    ) {
+      throw new ServiceError(
+        "invalid_arguments",
+        `Request ${request.id} asks questions; respond with { answers } holding one answer for each of: ${asked.map((question) => JSON.stringify(question)).join(", ")}.`,
+      );
+    }
+    const answers = asked.map((question) => response.answers[question]!);
+    return {
+      given: {
+        answers: Object.fromEntries(asked.map((question, index) => [question, answers[index]])),
+      },
+      answer: { answers },
+    };
+  }
+
+  /** A request as status shows it; only a live request can be answered. */
+  private requestView(request: RequestRow) {
+    const live = request.state === "pending" && this.live.has(request.id);
+    return {
+      requestId: request.id,
+      executionId: request.execution_id,
+      ...(request.writer_id ? { writerId: request.writer_id } : {}),
+      ...(request.session_id ? { sessionId: request.session_id } : {}),
+      kind: request.kind,
+      toolName: request.tool_name,
+      state: request.state,
+      live,
+      [request.kind === "question" ? "question" : "action"]: JSON.parse(request.payload),
+      ...(live ? { responseShape: JSON.parse(request.response_shape) } : {}),
+      ...(request.response ? { response: JSON.parse(request.response) } : {}),
+      createdAt: request.created_at,
+      ...(request.resolved_at ? { resolvedAt: request.resolved_at } : {}),
+      ...(request.state === "expired" ? { note: expiredNote } : {}),
+    };
+  }
+
+  /**
+   * Records what Claude asks the parent and waits for the answer. The request
+   * stays live until it is answered or `signal` ends it, which expires it. A
+   * nested writer's request belongs to the execution that started the writer.
+   */
+  private raise(
+    executionId: string,
+    request: PendingRequest,
+    signal: AbortSignal,
+    secrets: readonly string[],
+    writerId?: string,
+  ): Promise<RequestResponse | undefined> {
+    const clean = (value: unknown) => redactStrings(value, (text) => redactContent(text, secrets));
+    const { kind, toolName, sessionId, ...content } = request;
+    const payload = clean(kind === "question" ? content : { toolName, ...content });
+    const questions = kind === "question" ? questionTexts(payload) : [];
+    const responseShape =
+      kind === "question"
+        ? {
+            answers: Object.fromEntries(
+              questions.map((text) => [
+                text,
+                "an option label (several comma-separated when multiSelect) or your own answer",
+              ]),
+            ),
+          }
+        : { decision: "allow | deny", message: "optional: why, shown to Claude" };
+    const id = `req_${randomUUID()}`;
+    this.db
+      .prepare(
+        `INSERT INTO requests (id, task_id, execution_id, session_id, writer_id, tool_name, kind, payload, response_shape, state, created_at)
+         VALUES (?, (SELECT task_id FROM executions WHERE id = ?), ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      )
+      .run(
+        id,
+        executionId,
+        executionId,
+        sessionId ?? null,
+        writerId ?? null,
+        toolName,
+        kind,
+        JSON.stringify(payload),
+        JSON.stringify(responseShape),
+        now(),
+      );
+    return new Promise((resolve) => {
+      this.live.set(id, { resolve, secrets });
+      const asker = writerId ? ` from nested writer ${writerId}` : "";
+      this.record(
+        executionId,
+        "status",
+        kind === "question"
+          ? `Needs input: request ${id}${asker} asks ${questions.join(" ")}`
+          : `Needs input: request ${id}${asker} asks to call ${toolName}.`,
+      );
+      this.block(executionId, (waits) => waits.requests.add(id));
+      if (signal.aborted) this.expire(id);
+      else signal.addEventListener("abort", () => this.expire(id), { once: true });
+    });
+  }
+
+  /** Ends an unanswered request; Claude, if still waiting, is told no one answered. */
+  private expire(requestId: string): void {
+    const request = this.db
+      .prepare("SELECT execution_id FROM requests WHERE id = ?")
+      .get(requestId) as { execution_id: string } | undefined;
+    const expired =
+      this.db
+        .prepare(
+          "UPDATE requests SET state = 'expired', resolved_at = ? WHERE id = ? AND state = 'pending'",
+        )
+        .run(now(), requestId).changes > 0;
+    const live = this.live.get(requestId);
+    this.live.delete(requestId);
+    if (expired && request) {
+      this.record(request.execution_id, "status", `Request ${requestId} expired unanswered.`);
+      this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
+    }
+    live?.resolve(undefined);
+  }
+
+  /**
+   * Changes what a running execution waits for and shows the most pressing wait
+   * as its reason: a request the caller must answer, then subscription
+   * capacity, then nested agents after the executor's turn.
+   */
+  private block(executionId: string, change: (waits: Waits) => void): void {
+    const waits = this.waits.get(executionId);
+    if (!waits) return;
+    change(waits);
+    const [firstRequest] = waits.requests;
+    const [reason, detail] =
+      firstRequest !== undefined
+        ? ["needs_input", { requestId: firstRequest }]
+        : waits.capacity
+          ? ["waiting_for_capacity", waits.capacity]
+          : waits.runningNested > 0
+            ? ["waiting_for_children", { runningNested: waits.runningNested }]
+            : [null, null];
+    const shown = detail === null ? null : JSON.stringify(detail);
+    const current = this.db
+      .prepare("SELECT reason, detail FROM executions WHERE id = ?")
+      .get(executionId) as { reason: string | null; detail: string | null };
+    if (current.reason !== reason || current.detail !== shown) {
+      this.update(executionId, { reason, detail: shown });
+    }
   }
 
   private async projectRoot(path: string): Promise<string> {
@@ -1170,6 +1466,8 @@ export class TaskService {
       message: (text) => event(`: ${clean(text)}`),
       // Strings are redacted before serialization, which would escape them.
       toolCall: (name, input) => event(`: ${name} ${JSON.stringify(redactStrings(input, clean))}`),
+      request: (pending, requestSignal) =>
+        this.raise(writer.execution_id, pending, requestSignal, secrets, writer.id),
       // Without the Agent tool, Claude Code reports no nested agents of a nested writer.
       nestedStarted: () => {},
       nestedProgress: () => {},
@@ -1187,6 +1485,7 @@ export class TaskService {
             guidance: nestedWriterGuidance(writer, executor),
             disallowedTools: writingDisallowedTools,
             resultSchema: writingResult,
+            approvalServers: approvalServers(config),
             ...(request.model ? { model: request.model } : {}),
             ...(request.effort ? { effort: request.effort } : {}),
             signal,
@@ -1355,6 +1654,7 @@ export class TaskService {
       })
       .finally(() => {
         this.running.delete(executionId);
+        this.waits.delete(executionId);
         this.schedule(taskId);
       });
     this.running.set(executionId, { controller, done });
@@ -1362,6 +1662,7 @@ export class TaskService {
 
   private async execute(executionId: string, signal: AbortSignal): Promise<void> {
     if (!this.update(executionId, { status: "running", started_at: now() }, "queued")) return;
+    this.waits.set(executionId, { requests: new Set(), runningNested: 0 });
     this.record(executionId, "status", "Running.");
     const execution = this.db
       .prepare("SELECT * FROM executions WHERE id = ?")
@@ -1422,6 +1723,7 @@ export class TaskService {
           guidance: workspace ? writingGuidance(workspace, root) : readOnlyGuidance(root),
           disallowedTools: workspace ? writingDisallowedTools : readOnlyDisallowedTools,
           resultSchema: workspace ? writingResult : reportedResult,
+          approvalServers: approvalServers(config),
           ...(request.model ? { model: request.model } : {}),
           ...(request.effort ? { effort: request.effort } : {}),
           secrets,
@@ -1437,27 +1739,19 @@ export class TaskService {
               .run(sessionId, executionId);
           },
           capacity: (waiting) => {
-            const current = this.db
-              .prepare("SELECT reason, detail FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null; detail: string | null };
-            const detail = waiting ? JSON.stringify(waiting) : null;
-            const unchanged = waiting
-              ? current.reason === "waiting_for_capacity" && current.detail === detail
-              : current.reason !== "waiting_for_capacity";
-            if (unchanged) return;
-            const changed = this.update(
+            const waits = this.waits.get(executionId);
+            if (!waits || JSON.stringify(waits.capacity) === JSON.stringify(waiting)) return;
+            this.block(executionId, (current) => {
+              if (waiting) current.capacity = waiting;
+              else delete current.capacity;
+            });
+            this.record(
               executionId,
-              waiting ? { reason: "waiting_for_capacity", detail } : { reason: null, detail: null },
+              "status",
+              waiting
+                ? `Waiting for subscription capacity${waiting.resetsAt ? ` until ${new Date(waiting.resetsAt * 1000).toISOString()}` : ""}.`
+                : "Subscription capacity is available again.",
             );
-            if (changed) {
-              this.record(
-                executionId,
-                "status",
-                waiting
-                  ? `Waiting for subscription capacity${waiting.resetsAt ? ` until ${new Date(waiting.resetsAt * 1000).toISOString()}` : ""}.`
-                  : "Running.",
-              );
-            }
           },
           message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
           // Strings are redacted before serialization, which would escape them.
@@ -1467,6 +1761,8 @@ export class TaskService {
               nestedTaskId ? "nested" : "tool",
               `${nestedTaskId ? `${nestedTaskId}: ` : ""}${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
             ),
+          request: (pending, requestSignal) =>
+            this.raise(executionId, pending, requestSignal, secrets),
           nestedStarted: (nested) => {
             const description = redactContent(nested.description, secrets);
             this.db
@@ -1509,26 +1805,17 @@ export class TaskService {
             );
           },
           waitingForChildren: (count) => {
-            const current = this.db
-              .prepare("SELECT reason FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null };
-            if (count === 0 && current.reason !== "waiting_for_children") return;
-            const changed = this.update(
-              executionId,
-              count > 0
-                ? {
-                    reason: "waiting_for_children",
-                    detail: JSON.stringify({ runningNested: count }),
-                  }
-                : { reason: null, detail: null },
-            );
-            if (changed && current.reason !== "waiting_for_children") {
+            const waits = this.waits.get(executionId);
+            if (!waits) return;
+            const previous = waits.runningNested;
+            this.block(executionId, (current) => (current.runningNested = count));
+            if (previous === 0 && count > 0) {
               this.record(
                 executionId,
                 "status",
                 `Claude finished its turn; waiting for ${count} nested agent(s).`,
               );
-            } else if (changed && count === 0) {
+            } else if (previous > 0 && count === 0) {
               this.record(executionId, "status", "Nested agents ended; Claude continues.");
             }
           },
@@ -1755,6 +2042,28 @@ function readParts(parts: ResultPart[], start: number, offset: number, budget: n
   return { parts: page };
 }
 
+/**
+ * The keys the parent answers a question request's questions by, in the order
+ * asked: each question's displayed text, with " (question N)" appended while
+ * it equals the key of an earlier question.
+ */
+function questionTexts(payload: unknown): string[] {
+  const questions = (payload as { questions?: unknown }).questions;
+  if (!Array.isArray(questions)) return [];
+  const keys = new Set<string>();
+  return questions.map((item: { question?: unknown }, index) => {
+    // Redaction can make questions look alike; later ones are told apart by position.
+    let key = typeof item.question === "string" ? item.question : `Question ${index + 1}`;
+    while (keys.has(key)) key = `${key} (question ${index + 1})`;
+    keys.add(key);
+    return key;
+  });
+}
+
+function responseHash(response: object): string {
+  return createHash("sha256").update(JSON.stringify(response)).digest("hex");
+}
+
 /** Applies `clean` to every string inside a JSON-like value. */
 function redactStrings(value: unknown, clean: (text: string) => string): unknown {
   if (typeof value === "string") return clean(value);
@@ -1765,6 +2074,13 @@ function redactStrings(value: unknown, clean: (text: string) => string): unknown
     );
   }
   return value;
+}
+
+/** MCP servers whose tool calls wait for the parent agent's approval. */
+function approvalServers(config: BridgeConfig): string[] {
+  return Object.entries(config.mcpServers)
+    .filter(([, server]) => !server.autoApprove)
+    .map(([name]) => name);
 }
 
 const worktreeIsolation =

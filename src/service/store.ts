@@ -70,6 +70,23 @@ const migrations: string[] = [
     state TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE requests (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks (id),
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    session_id TEXT,
+    tool_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    response_shape TEXT NOT NULL,
+    state TEXT NOT NULL,
+    response TEXT,
+    response_hash TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+  );
+  CREATE INDEX requests_by_task ON requests (task_id, created_at);
+  CREATE INDEX requests_by_execution ON requests (execution_id, state)`,
   `CREATE TABLE nested_writers (
     id TEXT PRIMARY KEY,
     execution_id TEXT NOT NULL REFERENCES executions (id),
@@ -85,7 +102,8 @@ const migrations: string[] = [
     created_at TEXT NOT NULL,
     ended_at TEXT
   );
-  CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at)`,
+  CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at);
+  ALTER TABLE requests ADD COLUMN writer_id TEXT`,
 ];
 
 export class StoreLockedError extends Error {}
