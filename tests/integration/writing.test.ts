@@ -72,6 +72,125 @@ async function run(client: BridgeClient, args: Record<string, unknown>) {
 }
 
 describe("writing tasks", () => {
+  it("report commits and files without configured secrets, including staged-only changes", async () => {
+    const fixture = new BridgeFixture({
+      config: {
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-COMMITSECRET" } } },
+      },
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { writeFile: { path: "notes.txt", content: "n\n" } },
+              { exec: ["git", "add", "notes.txt"] },
+              commit("docs: add notes for tok-COMMITSECRET"),
+              { writeFile: { path: "README.md", content: "# Staged\n" } },
+              { exec: ["git", "add", "README.md"] },
+              { writeFile: { path: "README.md", content: "# Fixture\n" } },
+              finished("Done."),
+            ],
+          },
+        ],
+      },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await run(client, writeTask(project));
+
+    const result = await client.call("task_result", { project, taskId });
+    expect(result.data.result.workspace).toMatchObject({
+      commits: [{ subject: "docs: add notes for [REDACTED]" }],
+      changedFiles: ["README.md", "notes.txt"],
+    });
+    expect(result.text).not.toContain("COMMITSECRET");
+  });
+
+  it("bound checks by maxChars and serve them in full through the result cursor", async () => {
+    const details = `${"d".repeat(20_000)}-END`;
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            {
+              result: {
+                structured: {
+                  summary: "Done.",
+                  evidence: [],
+                  failures: [],
+                  remainingWork: [],
+                  checks: [{ command: "npm test", outcome: "failed", details }],
+                },
+              },
+            },
+          ],
+        },
+      ],
+    });
+    const { taskId } = await run(client, writeTask(project));
+
+    const first = (await client.call("task_result", { project, taskId, maxChars: 200 })).data;
+    expect(first.result.checks).toEqual([
+      { command: "npm test", outcome: "failed", details: expect.any(String), complete: false },
+    ]);
+    expect(first.result.checks[0].details.length).toBeLessThan(200);
+    let text = `npm test\n${first.result.checks[0].details}`;
+    let next = first.truncated.next;
+    while (next) {
+      const page = (
+        await client.call("task_result", { project, taskId, maxChars: 16_000, ...next })
+      ).data;
+      text += page.parts.map((part: { text: string }) => part.text).join("");
+      next = page.truncated?.next;
+    }
+    expect(text).toBe(`npm test\n${details}`);
+  });
+
+  it("return one task for concurrent identical submissions", async () => {
+    const { project, client } = await setUp({ turns: [{ steps: [finished("Done.")] }] });
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () => client.call("start_task", writeTask(project))),
+    );
+    expect(results.map((result) => result.isError)).toEqual([false, false, false, false, false]);
+    expect(new Set(results.map((result) => result.data.taskId)).size).toBe(1);
+    expect(results.filter((result) => result.data.created)).toHaveLength(1);
+  });
+
+  it("run follow-ups in the task's worktree", async () => {
+    const { fixture, project, client } = await setUp({
+      turns: [
+        {
+          match: "Also",
+          steps: [{ writeFile: { path: "more.txt", content: "m\n" } }, finished("More.")],
+        },
+        { steps: [finished("First.")] },
+      ],
+    });
+    const { taskId } = await run(client, writeTask(project));
+    const sent = await client.call("send_followup", {
+      project,
+      taskId,
+      requestKey: "more-1",
+      message: "Also add more.txt.",
+    });
+    await client.call("wait_task", {
+      project,
+      taskId,
+      executionId: sent.data.executionId,
+      timeoutSeconds: 30,
+    });
+
+    const launches = fixture.launches();
+    expect(launches).toHaveLength(2);
+    expect(launches[1]!.cwd).toBe(launches[0]!.cwd);
+    const later = await client.call("task_result", {
+      project,
+      taskId,
+      executionId: sent.data.executionId,
+    });
+    expect(later.data.result.workspace.changedFiles).toEqual(["more.txt"]);
+  });
+
   it("work on their own branch and worktree from a recorded baseline and report the change set", async () => {
     const { fixture, project, client } = await setUp({
       turns: [

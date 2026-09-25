@@ -66,7 +66,7 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
     {
       title: "Delegate a task to Claude",
       description:
-        "Start a read-only delegated task: Claude Code inspects the project's shared checkout and returns a structured result (summary, evidence, failures, remaining work). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here.",
+        "Start a delegated task. mode read-only (default): Claude Code inspects the project's shared checkout. mode write: Claude changes files and commits in a new Git worktree on its own task branch from a committed baseline (refused with dirty_parent when the checkout has uncommitted changes and no baseline is given). Both return a structured result (summary, evidence, failures, remaining work; writing tasks add checks and the workspace). Returns task and execution identifiers immediately while Claude works in the background, independent of this connection. Repeating a call with the same requestKey and arguments returns the existing task instead of starting another; reusing the key with different arguments fails. Claude receives only the assignment, context, and expected result given here.",
       inputSchema: startSchema.shape,
       annotations: { readOnlyHint: false, openWorldHint: true },
     },

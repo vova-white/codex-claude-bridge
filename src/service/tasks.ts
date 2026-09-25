@@ -329,24 +329,27 @@ export class TaskService {
     const { requestKey, project: _path, ...intent } = request;
     const hash = createHash("sha256").update(JSON.stringify(intent)).digest("hex");
 
-    const existing = this.db
-      .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
-      .get(project, caller, requestKey) as TaskRow | undefined;
-    if (existing) {
-      if (existing.request_hash !== hash) {
+    const existing = () => {
+      const task = this.db
+        .prepare("SELECT * FROM tasks WHERE project = ? AND caller = ? AND request_key = ?")
+        .get(project, caller, requestKey) as TaskRow | undefined;
+      if (!task) return undefined;
+      if (task.request_hash !== hash) {
         throw new ServiceError(
           "request_key_conflict",
-          `Request key "${requestKey}" already started task ${existing.id} with different arguments. Use a new request key for different work.`,
+          `Request key "${requestKey}" already started task ${task.id} with different arguments. Use a new request key for different work.`,
         );
       }
-      const execution = this.execution(existing.id, 1);
+      const execution = this.execution(task.id, 1);
       return {
-        taskId: existing.id,
+        taskId: task.id,
         executionId: execution.id,
         status: execution.status,
         created: false,
       };
-    }
+    };
+    const earlier = existing();
+    if (earlier) return earlier;
 
     let workspace: { baseline: string; parentDirty: boolean } | undefined;
     if (request.mode === "write") {
@@ -377,6 +380,13 @@ export class TaskService {
     const createdAt = now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // A concurrent request with the same key may have been accepted while this
+      // one checked the checkout.
+      const accepted = existing();
+      if (accepted) {
+        this.db.exec("ROLLBACK");
+        return accepted;
+      }
       this.db
         .prepare(
           `INSERT INTO tasks (id, project, caller, request_key, request_hash, mode, request, created_at)
@@ -496,6 +506,7 @@ export class TaskService {
       evidence: string[];
       failures: string[];
       remainingWork: string[];
+      checks?: Check[];
     };
     const parts = resultParts(stored);
     const page = readParts(parts, part ?? 0, offset ?? 0, maxChars);
@@ -514,7 +525,7 @@ export class TaskService {
     }
     const rest = Object.fromEntries(
       Object.entries(stored).filter(
-        ([key]) => !["summary", "evidence", "failures", "remainingWork"].includes(key),
+        ([key]) => !["summary", "evidence", "failures", "remainingWork", "checks"].includes(key),
       ),
     );
     const shown = (field: string) =>
@@ -526,6 +537,9 @@ export class TaskService {
         evidence: shown("evidence"),
         failures: shown("failures"),
         remainingWork: shown("remainingWork"),
+        ...(stored.checks
+          ? { checks: page.parts.filter((item) => item.field === "checks").map(shownCheck) }
+          : {}),
         ...rest,
       },
       ...truncation,
@@ -1016,8 +1030,12 @@ export class TaskService {
         ? await worktreeChanges(workspace.path, workspace.baseline)
             .then(({ commits, changedFiles }) => ({
               // Long lists are cut; the worktree itself holds every change.
-              commits: commits.slice(0, maxListedChanges),
-              changedFiles: changedFiles.slice(0, maxListedChanges),
+              commits: commits
+                .slice(0, maxListedChanges)
+                .map(({ sha, subject }) => ({ sha, subject: redactContent(subject, secrets) })),
+              changedFiles: changedFiles
+                .slice(0, maxListedChanges)
+                .map((file) => redactContent(file, secrets)),
               commitCount: commits.length,
               changedFileCount: changedFiles.length,
             }))
@@ -1111,7 +1129,24 @@ interface ResultPart {
   part: number;
   field: string;
   index?: number;
+  /** The outcome of a check part. */
+  outcome?: string;
   text: string;
+}
+
+type Check = z.infer<typeof writingResult>["checks"][number];
+
+/** A check as shown in a bounded result, from its part's (possibly cut) text. */
+function shownCheck(part: ResultPart & { complete?: false }) {
+  const newline = part.text.indexOf("\n");
+  const command = newline < 0 ? part.text : part.text.slice(0, newline);
+  const details = newline < 0 ? undefined : part.text.slice(newline + 1);
+  return {
+    command,
+    outcome: part.outcome,
+    ...(details === undefined ? {} : { details }),
+    ...(part.complete === false ? { complete: false } : {}),
+  };
 }
 
 /** The text of a result as an ordered list of parts: the summary, then each list item. */
@@ -1120,6 +1155,7 @@ function resultParts(result: {
   evidence: string[];
   failures: string[];
   remainingWork: string[];
+  checks?: Check[];
 }): ResultPart[] {
   const fields = [
     ["evidence", result.evidence],
@@ -1129,6 +1165,13 @@ function resultParts(result: {
   const parts: Omit<ResultPart, "part">[] = [
     { field: "summary", text: result.summary },
     ...fields.flatMap(([field, items]) => items.map((text, index) => ({ field, index, text }))),
+    // A check's text is its command, then its details on the next line.
+    ...(result.checks ?? []).map((check, index) => ({
+      field: "checks",
+      index,
+      outcome: check.outcome,
+      text: check.details ? `${check.command}\n${check.details}` : check.command,
+    })),
   ];
   return parts.map((item, part) => ({ part, ...item }));
 }

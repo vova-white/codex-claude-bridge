@@ -153,10 +153,12 @@ export async function worktreeChanges(
       const [sha = "", ...subject] = line.split("\t");
       return { sha, subject: subject.join("\t") };
     });
-  const tracked = await git(path, "diff", "--name-only", "-z", baseline);
+  // Working files, the index, and untracked files can each differ from the baseline.
+  const working = await git(path, "diff", "--name-only", "-z", baseline);
+  const staged = await git(path, "diff", "--cached", "--name-only", "-z", baseline);
   const untracked = await git(path, "ls-files", "--others", "--exclude-standard", "-z");
   const changedFiles = [
-    ...new Set([...tracked.split("\0"), ...untracked.split("\0")].filter(Boolean)),
+    ...new Set([working, staged, untracked].flatMap((list) => list.split("\0")).filter(Boolean)),
   ].toSorted();
   return { commits, changedFiles };
 }
