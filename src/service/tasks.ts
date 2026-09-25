@@ -223,7 +223,7 @@ export const cleanupSchema = z.object({
     .enum(["all", "worktree"])
     .default("all")
     .describe(
-      "all: remove the task worktree and delete the task branch; worktree: remove only the worktree and keep the branch.",
+      "all: remove the worktrees and delete the branches of the task and its nested writers; worktree: remove only the worktrees and keep the branches.",
     ),
   dryRun: z
     .boolean()
@@ -235,7 +235,7 @@ export const cleanupSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Explicit decision to discard the worktree's uncommitted and untracked changes, and commits no ref that cleanup keeps contains: at the worktree's HEAD (such as a detached HEAD) and, with scope all, on the task branch. Without it, cleanup refuses rather than lose them.",
+      "Explicit decision to discard the worktrees' uncommitted and untracked changes, and commits no ref that cleanup keeps contains: at a worktree's HEAD (such as a detached HEAD) and, with scope all, on the branches of the task and its nested writers. Without it, cleanup refuses rather than lose them.",
     ),
 });
 /** Workspace states after cleanup removed the worktree; follow-ups cannot run in them. */
@@ -291,6 +291,8 @@ interface NestedWriterRow {
   process_exited: number | null;
   created_at: string;
   ended_at: string | null;
+  /** What cleanup_task left of the writer's worktree and branch: removed or branch_kept. */
+  workspace_state: string | null;
 }
 
 /** The running nested writers of one execution, and the means to stop them when it ends. */
@@ -1070,6 +1072,15 @@ export class TaskService {
       .all(task.id) as { id: string; status: string }[];
     const root = task.project;
     const { path, branch } = workspace;
+    const writers = this.db
+      .prepare(
+        `SELECT nested_writers.* FROM nested_writers JOIN executions ON executions.id = nested_writers.execution_id
+         WHERE executions.task_id = ? ORDER BY executions.ordinal, nested_writers.created_at, nested_writers.rowid`,
+      )
+      .all(task.id) as unknown as NestedWriterRow[];
+    // Commits count as kept only by refs that outlive this cleanup, so branches
+    // it deletes together cannot vouch for each other.
+    const deleting = scope === "all" ? [branch, ...writers.map((row) => row.branch)] : [];
     const registration = await this.registeredWorktree(root, path);
     const worktreePresent = registration !== undefined;
     const worktreeFiles = worktreePresent && existsSync(path);
@@ -1089,15 +1100,16 @@ export class TaskService {
         ? undefined
         : head.branch === branch
           ? 0
-          : await unintegratedCommits(
-              root,
-              head.commit,
-              scope === "all" ? branch : undefined,
-            ).catch(() => undefined);
+          : await unintegratedCommits(root, head.commit, deleting).catch(() => undefined);
     const branchPresent = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
     const unintegrated = branchPresent
-      ? await unintegratedCommits(root, `refs/heads/${branch}`, branch).catch(() => undefined)
+      ? await unintegratedCommits(root, `refs/heads/${branch}`, [branch, ...deleting]).catch(
+          () => undefined,
+        )
       : 0;
+    const writerInspections = await Promise.all(
+      writers.map((writer) => this.inspectNestedWriter(root, writer, deleting)),
+    );
 
     const refusals: { code: string; message: string }[] = [];
     for (const execution of active) {
@@ -1123,8 +1135,33 @@ export class TaskService {
     if (scope === "all" && branchPresent && unintegrated !== 0 && !discardUnintegrated) {
       refusals.push({
         code: "unintegrated_commits",
-        message: `${unintegrated === undefined ? `Git could not check which commits of branch ${branch}` : `${unintegrated} commit(s) of branch ${branch}`} are not contained in any other branch, tag, remote-tracking ref, or the checkout's HEAD. Merge or push the branch, pass scope "worktree" to keep it, or pass discardUnintegrated: true to delete its commits.`,
+        message: `${unintegrated === undefined ? `Git could not check which commits of branch ${branch}` : `${unintegrated} commit(s) of branch ${branch}`} are not contained in any other branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Merge or push the branch, pass scope "worktree" to keep it, or pass discardUnintegrated: true to delete its commits.`,
       });
+    }
+    // Messages name a writer by ID and path: its branch name derives from Claude's assignment.
+    for (const found of discardUnintegrated ? [] : writerInspections) {
+      const { writer } = found;
+      const worktree = `worktree of nested writer ${writer.id} at ${writer.path}`;
+      if (found.present && found.uncommittedChanges !== false) {
+        refusals.push({
+          code: "uncommitted_changes",
+          message: `${found.uncommittedChanges ? `The ${worktree} has` : `Git could not check the ${worktree} for`} uncommitted or untracked changes. Commit what should be kept to its branch or copy it elsewhere, or pass discardUnintegrated: true to delete the changes.`,
+        });
+      }
+      if (found.headUnintegrated !== 0) {
+        refusals.push({
+          code: "unintegrated_commits",
+          message: found.head
+            ? `${found.headUnintegrated ?? "Some"} commit(s) at the ${found.head.branch ? "HEAD" : "detached HEAD"} ${found.head.commit} of the ${worktree} are not contained in any branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Create a branch or tag at ${found.head.commit}, or pass discardUnintegrated: true to delete them.`
+            : `Git could not read the HEAD of the ${worktree}, so commits only it holds could be lost. Pass discardUnintegrated: true to remove the worktree anyway.`,
+        });
+      }
+      if (scope === "all" && found.branchPresent && found.unintegrated !== 0) {
+        refusals.push({
+          code: "unintegrated_commits",
+          message: `${found.unintegrated === undefined ? "Git could not check which commits" : `${found.unintegrated} commit(s)`} of the branch of nested writer ${writer.id} (see nestedWriters) are not contained in any branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Merge it into a branch that stays, pass scope "worktree" to keep it, or pass discardUnintegrated: true to delete its commits.`,
+        });
+      }
     }
     const removingWorktree = refusals.length === 0 && worktreePresent;
     const removingBranch = refusals.length === 0 && scope === "all" && branchPresent;
@@ -1134,7 +1171,13 @@ export class TaskService {
         : "keep"
       : "already_removed";
     let branchAction = branchPresent ? (removingBranch ? "remove" : "keep") : "already_removed";
-    const failures: { resource: string; message: string }[] = [];
+    const planned = refusals.length === 0 ? "remove" : "keep";
+    const writerCleanups = writerInspections.map((found) => ({
+      ...found,
+      worktreeAction: found.present ? planned : "already_removed",
+      branchAction: found.branchPresent ? (scope === "all" ? planned : "keep") : "already_removed",
+    }));
+    const failures: { resource: string; writerId?: string; message: string }[] = [];
     const report = (outcome: string) => ({
       taskId: task.id,
       scope,
@@ -1151,6 +1194,24 @@ export class TaskService {
         action: branchAction,
         ...(branchPresent ? { unintegratedCommits: unintegrated } : {}),
       },
+      ...(writerCleanups.length > 0
+        ? {
+            nestedWriters: writerCleanups.map((found) => ({
+              writerId: found.writer.id,
+              worktree: {
+                path: found.writer.path,
+                action: found.worktreeAction,
+                ...(found.present ? { uncommittedChanges: found.uncommittedChanges } : {}),
+                ...(found.present ? { unintegratedCommits: found.headUnintegrated } : {}),
+              },
+              branch: {
+                name: found.writer.branch,
+                action: found.branchAction,
+                ...(found.branchPresent ? { unintegratedCommits: found.unintegrated } : {}),
+              },
+            })),
+          }
+        : {}),
       ...(refusals.length > 0 ? { refusals } : {}),
       ...(failures.length > 0 ? { failures } : {}),
       workspace: workspaceReport(this.workspace(task.id)!),
@@ -1159,6 +1220,44 @@ export class TaskService {
     });
     if (refusals.length > 0) return report("refused");
     if (dryRun) return report("planned");
+
+    for (const cleanup of writerCleanups) {
+      const { writer } = cleanup;
+      if (cleanup.worktreeAction === "remove") {
+        try {
+          await removeWorktree(root, writer.path, discardUnintegrated);
+          cleanup.worktreeAction = "removed";
+        } catch (error) {
+          cleanup.worktreeAction = "failed";
+          failures.push({
+            resource: "worktree",
+            writerId: writer.id,
+            message: `git worktree remove ${exitStatus(error)}; the worktree of nested writer ${writer.id} at ${writer.path} and its branch are kept.`,
+          });
+        }
+      }
+      if (cleanup.branchAction === "remove" && cleanup.worktreeAction === "failed") {
+        cleanup.branchAction = "keep";
+      } else if (cleanup.branchAction === "remove") {
+        try {
+          await deleteBranch(root, writer.branch);
+          cleanup.branchAction = "removed";
+        } catch (error) {
+          cleanup.branchAction = "failed";
+          failures.push({
+            resource: "branch",
+            writerId: writer.id,
+            message: `git branch -D ${exitStatus(error)}; the branch of nested writer ${writer.id} is kept.`,
+          });
+        }
+      }
+      if (!(await this.registeredWorktree(root, writer.path))) {
+        const branchKept = (await resolveCommit(root, `refs/heads/${writer.branch}`)) !== undefined;
+        this.db
+          .prepare("UPDATE nested_writers SET workspace_state = ? WHERE id = ?")
+          .run(branchKept ? "branch_kept" : "removed", writer.id);
+      }
+    }
 
     if (removingWorktree) {
       try {
@@ -1585,6 +1684,50 @@ export class TaskService {
     return this.db.prepare("SELECT * FROM workspaces WHERE task_id = ?").get(taskId) as
       | WorkspaceRow
       | undefined;
+  }
+
+  /**
+   * What cleanup finds of a nested writer's worktree and branch, counting as
+   * unintegrated the commits no ref holds except the writer's branch and the
+   * branches in `deleting`.
+   * undefined stands for what Git could not tell.
+   */
+  private async inspectNestedWriter(
+    root: string,
+    writer: NestedWriterRow,
+    deleting: readonly string[],
+  ) {
+    const registration = await this.registeredWorktree(root, writer.path);
+    const present = registration !== undefined;
+    const files = present && existsSync(writer.path);
+    const uncommittedChanges = files
+      ? await hasUncommittedChanges(writer.path).catch(() => undefined)
+      : false;
+    // A registration whose directory is missing still records its HEAD.
+    const head = files
+      ? await checkoutHead(writer.path).catch(() => undefined)
+      : registration?.head;
+    const headUnintegrated = !present
+      ? 0
+      : head === undefined
+        ? undefined
+        : head.branch === writer.branch
+          ? 0
+          : await unintegratedCommits(root, head.commit, deleting).catch(() => undefined);
+    const tip = `refs/heads/${writer.branch}`;
+    const branchPresent = (await resolveCommit(root, tip)) !== undefined;
+    const unintegrated = branchPresent
+      ? await unintegratedCommits(root, tip, [writer.branch, ...deleting]).catch(() => undefined)
+      : 0;
+    return {
+      writer,
+      present,
+      uncommittedChanges,
+      head,
+      headUnintegrated,
+      branchPresent,
+      unintegrated,
+    };
   }
 
   /** The task's publication as last recorded, if the bridge has checked it. */
@@ -2686,6 +2829,7 @@ function nestedWriterReport(row: NestedWriterRow) {
       branch: row.branch,
       baseline: row.baseline,
       isolation: worktreeIsolation,
+      ...(row.workspace_state ? { state: row.workspace_state } : {}),
       ...outcome.changes,
     },
     ...(outcome.result ? { result: outcome.result } : {}),
