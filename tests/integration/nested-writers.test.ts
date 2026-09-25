@@ -522,7 +522,7 @@ describe("nested writers", () => {
     expect(git(project, "branch", "--list", writers[0].workspace.branch)).not.toBe("");
   }, 30_000);
 
-  it("are cleaned up with their task once the task branch holds their assembled work", async () => {
+  it("are cleaned up with their task: branches merged into the task branch go once the task branch is integrated", async () => {
     const { project, client, taskId, status, wait, saved } = await setUp({
       turns: [
         { match: "Alpha writer", steps: retitle("Alpha") },
@@ -541,12 +541,13 @@ describe("nested writers", () => {
     const { path, branch } = saved("alpha").data.workspace;
     const writerId = saved("alpha").data.writerId;
     const { workspace } = await status();
+    const cleanup = async (options: Record<string, unknown> = {}) =>
+      (await client.call("cleanup_task", { project, taskId, ...options })).data;
     // The fast-forward merge leaves the task branch and the writer's branch at one commit.
     expect(git(project, "rev-parse", workspace.branch)).toBe(git(project, "rev-parse", branch));
 
     // With scope all both branches go, so neither keeps the other's commits.
-    const all = (await client.call("cleanup_task", { project, taskId, dryRun: true })).data;
-    expect(all).toMatchObject({
+    expect(await cleanup({ dryRun: true })).toMatchObject({
       outcome: "refused",
       branch: { action: "keep", unintegratedCommits: 1 },
       nestedWriters: [
@@ -559,33 +560,45 @@ describe("nested writers", () => {
       refusals: [{ code: "unintegrated_commits" }, { code: "unintegrated_commits" }],
     });
 
-    const plan = { project, taskId, scope: "worktree" };
-    expect((await client.call("cleanup_task", { ...plan, dryRun: true })).data).toMatchObject({
-      outcome: "planned",
-      worktree: { action: "remove" },
-      branch: { action: "keep" },
-      nestedWriters: [
-        { worktree: { action: "remove" }, branch: { action: "remove", unintegratedCommits: 0 } },
-      ],
-    });
-    expect(existsSync(path)).toBe(true);
-
-    const cleaned = (await client.call("cleanup_task", plan)).data;
-    expect(cleaned).toMatchObject({
+    // The kept task branch holds the writer's commits.
+    expect(await cleanup({ scope: "worktree" })).toMatchObject({
       outcome: "cleaned",
       worktree: { action: "removed" },
       branch: { action: "keep" },
-      nestedWriters: [{ worktree: { action: "removed" }, branch: { action: "removed" } }],
+      nestedWriters: [
+        { worktree: { action: "removed" }, branch: { action: "keep", unintegratedCommits: 0 } },
+      ],
     });
     expect(existsSync(path)).toBe(false);
+    expect(git(project, "branch", "--list", branch)).not.toBe("");
+    expect((await status()).executions[0].nestedWriters[0].workspace.state).toBe("branch_kept");
+
+    git(project, "merge", "--quiet", "--ff-only", workspace.branch);
+    expect(await cleanup()).toMatchObject({
+      outcome: "cleaned",
+      worktree: { action: "already_removed" },
+      branch: { action: "removed", unintegratedCommits: 0 },
+      nestedWriters: [
+        {
+          worktree: { action: "already_removed" },
+          branch: { action: "removed", unintegratedCommits: 0 },
+        },
+      ],
+    });
     expect(git(project, "branch", "--list", branch)).toBe("");
-    expect(git(project, "log", "--format=%s", "-1", workspace.branch)).toBe("docs: alpha title");
     const after = await status();
-    expect(after.workspace.state).toBe("branch_kept");
+    expect(after.workspace.state).toBe("removed");
     expect(after.executions[0].nestedWriters[0].workspace.state).toBe("removed");
+
+    expect(await cleanup()).toMatchObject({
+      outcome: "cleaned",
+      nestedWriters: [
+        { worktree: { action: "already_removed" }, branch: { action: "already_removed" } },
+      ],
+    });
   });
 
-  it("refuse cleanup while a nested writer's branch holds work the executor did not assemble", async () => {
+  it("refuse to delete a nested writer's branch that holds work the executor did not assemble", async () => {
     const { project, client, taskId, status, wait, saved } = await setUp({
       turns: [
         { match: "Alpha writer", steps: retitle("Alpha") },
@@ -602,9 +615,10 @@ describe("nested writers", () => {
     expect(await wait()).toMatchObject({ status: "completed" });
     const { path, branch } = saved("alpha").data.workspace;
     const { workspace } = await status();
+    const cleanup = async (options: Record<string, unknown> = {}) =>
+      (await client.call("cleanup_task", { project, taskId, ...options })).data;
 
-    const refused = (await client.call("cleanup_task", { project, taskId, scope: "worktree" }))
-      .data;
+    const refused = await cleanup();
     expect(refused).toMatchObject({
       outcome: "refused",
       worktree: { action: "keep" },
@@ -616,16 +630,20 @@ describe("nested writers", () => {
     expect(refused.refusals[0].message).toContain(saved("alpha").data.writerId);
     expect(existsSync(path)).toBe(true);
     expect(existsSync(workspace.path)).toBe(true);
-    expect(git(project, "branch", "--list", branch)).not.toBe("");
 
-    const discarded = await client.call("cleanup_task", {
-      project,
-      taskId,
-      discardUnintegrated: true,
-    });
-    expect(discarded.data).toMatchObject({
+    // Scope worktree keeps the branch, so its commits stay reachable.
+    expect(await cleanup({ scope: "worktree" })).toMatchObject({
       outcome: "cleaned",
-      nestedWriters: [{ worktree: { action: "removed" }, branch: { action: "removed" } }],
+      nestedWriters: [
+        { worktree: { action: "removed" }, branch: { action: "keep", unintegratedCommits: 1 } },
+      ],
+    });
+    expect(existsSync(path)).toBe(false);
+    expect(git(project, "log", "--format=%s", "-1", branch)).toBe("docs: alpha title");
+
+    expect(await cleanup({ discardUnintegrated: true })).toMatchObject({
+      outcome: "cleaned",
+      nestedWriters: [{ worktree: { action: "already_removed" }, branch: { action: "removed" } }],
     });
     expect(git(project, "branch", "--list", branch)).toBe("");
     expect((await status()).executions[0].nestedWriters[0].workspace.state).toBe("removed");

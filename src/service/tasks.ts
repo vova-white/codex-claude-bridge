@@ -210,7 +210,7 @@ export const cleanupSchema = z.object({
     .enum(["all", "worktree"])
     .default("all")
     .describe(
-      "all: remove the task worktree and delete the task branch; worktree: remove only the worktree and keep the task branch. Either way, the worktrees and branches of the task's nested writers are removed.",
+      "all: remove the worktrees and delete the branches of the task and its nested writers; worktree: remove only the worktrees and keep the branches.",
     ),
   dryRun: z
     .boolean()
@@ -222,7 +222,7 @@ export const cleanupSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Explicit decision to discard the worktrees' uncommitted and untracked changes, and commits no ref that cleanup keeps contains: at a worktree's HEAD (such as a detached HEAD), on nested writers' branches, and, with scope all, on the task branch. Without it, cleanup refuses rather than lose them.",
+      "Explicit decision to discard the worktrees' uncommitted and untracked changes, and commits no ref that cleanup keeps contains: at a worktree's HEAD (such as a detached HEAD) and, with scope all, on the branches of the task and its nested writers. Without it, cleanup refuses rather than lose them.",
     ),
 });
 /** Workspace states after cleanup removed the worktree; follow-ups cannot run in them. */
@@ -1002,8 +1002,7 @@ export class TaskService {
       .all(task.id) as unknown as NestedWriterRow[];
     // Commits count as kept only by refs that outlive this cleanup, so branches
     // it deletes together cannot vouch for each other.
-    const writerBranches = writers.map((row) => row.branch);
-    const deleting = [...(scope === "all" ? [branch] : []), ...writerBranches];
+    const deleting = scope === "all" ? [branch, ...writers.map((row) => row.branch)] : [];
     const worktreePresent = await this.worktreeRegistered(root, path);
     const worktreeFiles = worktreePresent && existsSync(path);
     // undefined: Git could not tell, which counts as work that might be lost.
@@ -1022,11 +1021,11 @@ export class TaskService {
           : await unintegratedCommits(root, head.commit, deleting).catch(() => undefined);
     const branchPresent = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
     const unintegrated = branchPresent
-      ? await unintegratedCommits(root, `refs/heads/${branch}`, [branch, ...writerBranches]).catch(
+      ? await unintegratedCommits(root, `refs/heads/${branch}`, [branch, ...deleting]).catch(
           () => undefined,
         )
       : 0;
-    const nested = await Promise.all(
+    const writerInspections = await Promise.all(
       writers.map((writer) => this.inspectNestedWriter(root, writer, deleting)),
     );
 
@@ -1058,7 +1057,7 @@ export class TaskService {
       });
     }
     // Messages name a writer by ID and path: its branch name derives from Claude's assignment.
-    for (const found of discardUnintegrated ? [] : nested) {
+    for (const found of discardUnintegrated ? [] : writerInspections) {
       const { writer } = found;
       const worktree = `worktree of nested writer ${writer.id} at ${writer.path}`;
       if (found.present && found.uncommittedChanges !== false) {
@@ -1075,10 +1074,10 @@ export class TaskService {
             : `Git could not read the HEAD of the ${worktree}, so commits only it holds could be lost. Pass discardUnintegrated: true to remove the worktree anyway.`,
         });
       }
-      if (found.branchPresent && found.unintegrated !== 0) {
+      if (scope === "all" && found.branchPresent && found.unintegrated !== 0) {
         refusals.push({
           code: "unintegrated_commits",
-          message: `${found.unintegrated === undefined ? "Git could not check which commits" : `${found.unintegrated} commit(s)`} of the branch of nested writer ${writer.id} (see nestedWriters) are not contained in any branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Merge it into a branch that stays, such as the task branch with scope "worktree", create a branch or tag at it, or pass discardUnintegrated: true to delete its commits.`,
+          message: `${found.unintegrated === undefined ? "Git could not check which commits" : `${found.unintegrated} commit(s)`} of the branch of nested writer ${writer.id} (see nestedWriters) are not contained in any branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Merge it into a branch that stays, pass scope "worktree" to keep it, or pass discardUnintegrated: true to delete its commits.`,
         });
       }
     }
@@ -1090,18 +1089,11 @@ export class TaskService {
         : "keep"
       : "already_removed";
     let branchAction = branchPresent ? (removingBranch ? "remove" : "keep") : "already_removed";
-    const writerCleanups = nested.map((found) => ({
+    const planned = refusals.length === 0 ? "remove" : "keep";
+    const writerCleanups = writerInspections.map((found) => ({
       ...found,
-      worktreeAction: found.present
-        ? refusals.length === 0
-          ? "remove"
-          : "keep"
-        : "already_removed",
-      branchAction: found.branchPresent
-        ? refusals.length === 0
-          ? "remove"
-          : "keep"
-        : "already_removed",
+      worktreeAction: found.present ? planned : "already_removed",
+      branchAction: found.branchPresent ? (scope === "all" ? planned : "keep") : "already_removed",
     }));
     const failures: { resource: string; writerId?: string; message: string }[] = [];
     const report = (outcome: string) => ({
@@ -1120,7 +1112,7 @@ export class TaskService {
         action: branchAction,
         ...(branchPresent ? { unintegratedCommits: unintegrated } : {}),
       },
-      ...(nested.length > 0
+      ...(writerCleanups.length > 0
         ? {
             nestedWriters: writerCleanups.map((found) => ({
               writerId: found.writer.id,
@@ -1616,7 +1608,8 @@ export class TaskService {
 
   /**
    * What cleanup finds of a nested writer's worktree and branch, counting as
-   * unintegrated the commits no ref holds except the branches in `deleting`.
+   * unintegrated the commits no ref holds except the writer's branch and the
+   * branches in `deleting`.
    * undefined stands for what Git could not tell.
    */
   private async inspectNestedWriter(
@@ -1640,7 +1633,7 @@ export class TaskService {
     const tip = `refs/heads/${writer.branch}`;
     const branchPresent = (await resolveCommit(root, tip)) !== undefined;
     const unintegrated = branchPresent
-      ? await unintegratedCommits(root, tip, deleting).catch(() => undefined)
+      ? await unintegratedCommits(root, tip, [writer.branch, ...deleting]).catch(() => undefined)
       : 0;
     return {
       writer,
