@@ -13,7 +13,15 @@ import metadata from "../../package.json" with { type: "json" };
 const maxLogBytes = 1024 * 1024;
 
 /** Operations the service implements. Only these are advertised to Codex. */
-export const operations = ["readiness", "start_task", "list_tasks", "task_status", "task_result"];
+export const operations = [
+  "readiness",
+  "start_task",
+  "list_tasks",
+  "task_status",
+  "task_result",
+  "wait_task",
+  "read_output",
+];
 
 function writePrivate(path: string, content: string): void {
   const temporary = `${path}.${process.pid}.tmp`;
@@ -91,6 +99,8 @@ async function start(
       list_tasks: (params, { caller }) => tasks.list(caller, params),
       task_status: (params, { caller }) => tasks.status(caller, params),
       task_result: (params, { caller }) => tasks.result(caller, params),
+      wait_task: (params, { caller }) => tasks.wait(caller, params),
+      read_output: (params, { caller }) => tasks.readOutput(caller, params),
     },
     (error) => log(`request failed: ${errorOrigin(error)}`),
   );

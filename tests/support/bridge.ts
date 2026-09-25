@@ -107,6 +107,11 @@ export class BridgeFixture {
     }
   }
 
+  /** Replaces the scripted Claude Code behaviour for processes started from now on. */
+  scenario(scenario: Scenario): void {
+    writeFileSync(join(this.root, "scenario.json"), JSON.stringify(scenario));
+  }
+
   /** Lets a scripted `waitFor` step with this name continue. */
   release(name: string): void {
     writeFileSync(join(this.root, name), "");

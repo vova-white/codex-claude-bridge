@@ -29,6 +29,16 @@ const migrations: string[] = [
     ended_at TEXT,
     UNIQUE (task_id, ordinal)
   )`,
+  "ALTER TABLE tasks RENAME COLUMN assignment TO request",
+  `CREATE TABLE events (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL
+  );
+  CREATE INDEX events_by_execution ON events (execution_id, seq);
+  ALTER TABLE executions ADD COLUMN events_pruned INTEGER NOT NULL DEFAULT 0`,
 ];
 
 export class StoreLockedError extends Error {}
