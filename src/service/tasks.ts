@@ -164,8 +164,6 @@ interface ExecutionRow {
   input: string | null;
   request_key: string | null;
   request_hash: string | null;
-  provider_pid: number | null;
-  cancel_requested_at: string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
@@ -506,11 +504,6 @@ export class TaskService {
     const requestedAt = now();
     const stopping: Promise<void>[] = [];
     for (const execution of active) {
-      this.db
-        .prepare(
-          "UPDATE executions SET cancel_requested_at = COALESCE(cancel_requested_at, ?) WHERE id = ?",
-        )
-        .run(requestedAt, execution.id);
       if (execution.status === "queued") {
         const cancelled = this.update(
           execution.id,
@@ -827,11 +820,6 @@ export class TaskService {
           secrets,
         },
         {
-          process: (pid) => {
-            this.db
-              .prepare("UPDATE executions SET provider_pid = ? WHERE id = ?")
-              .run(pid, executionId);
-          },
           session: (sessionId) => {
             this.update(executionId, { session_id: sessionId });
             this.db

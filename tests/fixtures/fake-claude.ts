@@ -20,6 +20,8 @@ export type Step =
   | { writeFile: { path: string; content: string } }
   /** Runs a command in the working directory, as the Bash tool could. */
   | { exec: string[] }
+  /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
+  | { ignoreTermination: true }
   | {
       result: {
         text?: string;
@@ -144,6 +146,7 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 let initialized = false;
+let ignoreTermination = false;
 let queue = Promise.resolve();
 
 async function answer(prompt: string): Promise<void> {
@@ -188,6 +191,9 @@ async function answer(prompt: string): Promise<void> {
       await waitForFile(resolve(scenarioDir, step.waitFor));
     } else if ("writeFile" in step) {
       writeFileSync(resolve(process.cwd(), step.writeFile.path), step.writeFile.content);
+    } else if ("ignoreTermination" in step) {
+      ignoreTermination = true;
+      process.on("SIGTERM", () => {});
     } else if ("exec" in step) {
       const [command = "true", ...commandArgs] = step.exec;
       execFileSync(command, commandArgs, { cwd: process.cwd() });
@@ -302,4 +308,6 @@ lines.on("line", (line) => {
   }
 });
 // Like Claude Code, stop when the SDK closes stdin, even in the middle of a turn.
-lines.on("close", () => process.exit(0));
+lines.on("close", () => {
+  if (!ignoreTermination) process.exit(0);
+});

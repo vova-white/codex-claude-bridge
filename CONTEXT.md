@@ -18,7 +18,7 @@ A bounded assignment from the parent agent to a child agent, with an expected re
 One run of Claude Code for a delegated task, with its own identity, status, and result. The first execution carries the original assignment.
 
 **Request key**:
-A caller-chosen key that identifies one start request within a project and logical caller, so a retried request returns the existing task instead of creating another.
+A caller-chosen key that identifies one request so a retry returns what the first attempt created: a start request within a project and logical caller returns the existing task, and a follow-up within a task returns the existing execution.
 
 **Logical caller**:
 The identity that owns delegated tasks across MCP connections, such as one Codex installation. A reconnecting parent agent finds the tasks it started as the same logical caller.

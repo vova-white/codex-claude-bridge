@@ -37,8 +37,6 @@ export interface ExecutionRequest {
 }
 
 export interface ExecutionObserver {
-  /** The operating-system process of Claude Code, known once it has started. */
-  process(pid: number): void;
   session(id: string): void;
   /** Called with the reset time while Claude Code waits for subscription capacity, and with undefined once it proceeds. */
   capacity(waiting: { resetsAt?: number } | undefined): void;
@@ -170,15 +168,18 @@ export async function runExecution(
           signal: options.signal,
         });
         child = process;
+        // Only the exit event proves the process is gone: an abort also emits
+        // "error" while the process may still run. A spawn failure has no process.
         exited = new Promise((resolve) => {
           process.once("exit", () => resolve());
-          process.once("error", () => resolve());
+          process.once("error", () => {
+            if (process.pid === undefined) resolve();
+          });
         });
         process.stderr.on("data", (data: Buffer) => {
           stderr.push(data.toString());
           if (stderr.length > 50) stderr.shift();
         });
-        if (process.pid) observer.process(process.pid);
         return process;
       },
       ...(request.model ? { model: request.model } : {}),

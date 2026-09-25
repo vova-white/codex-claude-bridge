@@ -43,8 +43,6 @@ const migrations: string[] = [
   ALTER TABLE executions ADD COLUMN input TEXT;
   ALTER TABLE executions ADD COLUMN request_key TEXT;
   ALTER TABLE executions ADD COLUMN request_hash TEXT;
-  ALTER TABLE executions ADD COLUMN provider_pid INTEGER;
-  ALTER TABLE executions ADD COLUMN cancel_requested_at TEXT;
   CREATE UNIQUE INDEX executions_by_request_key ON executions (task_id, request_key)
     WHERE request_key IS NOT NULL`,
 ];

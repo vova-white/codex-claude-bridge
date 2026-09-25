@@ -109,10 +109,25 @@ describe("follow-ups", () => {
     expect(conflict.isError).toBe(true);
     expect(fixture.launches()).toHaveLength(1);
 
+    const second = await followUp(client, project, taskId, "more-2", "Then a second part.");
+    expect(second).toMatchObject({ status: "queued", queuedBehind: queued.executionId });
+    await client.close();
+    const reconnected = await fixture.connect();
+    const afterReconnect = await followUp(
+      reconnected,
+      project,
+      taskId,
+      "more-1",
+      "Do the second part.",
+    );
+    expect(afterReconnect).toMatchObject({ executionId: queued.executionId, created: false });
+
     fixture.release("go");
-    expect((await finish(client, project, taskId, queued.executionId)).status).toBe("completed");
-    expect(fixture.prompts()).toHaveLength(2);
-    const status = (await client.call("task_status", { project, taskId })).data;
+    expect((await finish(reconnected, project, taskId, second.executionId)).status).toBe(
+      "completed",
+    );
+    expect(fixture.prompts()).toHaveLength(3);
+    const status = (await reconnected.call("task_status", { project, taskId })).data;
     expect(
       status.executions.map((execution: { ordinal: number; status: string }) => [
         execution.ordinal,
@@ -121,6 +136,7 @@ describe("follow-ups", () => {
     ).toEqual([
       [1, "completed"],
       [2, "completed"],
+      [3, "completed"],
     ]);
   });
 
@@ -175,6 +191,32 @@ describe("follow-ups", () => {
   });
 });
 
+describe("recovery", () => {
+  it("reports queued follow-ups as interrupted after the service restarts, never starting them", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [{ steps: [{ waitFor: "never" }] }],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+    const queued = await followUp(client, project, taskId, "more-1", "Later.");
+    const pid = fixture.servicePid()!;
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid) || undefined);
+
+    const reconnected = await fixture.connect();
+    const status = (await reconnected.call("task_status", { project, taskId })).data;
+    expect(
+      status.executions.map((execution: { executionId: string; status: string }) => [
+        execution.executionId,
+        execution.status,
+      ]),
+    ).toEqual([
+      [first, "interrupted"],
+      [queued.executionId, "interrupted"],
+    ]);
+    expect(fixture.launches()).toHaveLength(1);
+  });
+});
+
 describe("cancellation", () => {
   it("stops running work, cancels queued follow-ups, confirms termination, and is idempotent", async () => {
     const { fixture, project, client, taskId, first } = await setUp({
@@ -197,7 +239,6 @@ describe("cancellation", () => {
 
     const again = await client.call("cancel_task", { project, taskId });
     expect(again.data).toMatchObject({ cancellation: "none_active" });
-    await new Promise((resolve) => setTimeout(resolve, 200));
     expect(fixture.launches()).toHaveLength(1);
     const status = (await client.call("task_status", { project, taskId })).data;
     expect(status.executions.map((execution: { status: string }) => execution.status)).toEqual([
@@ -205,6 +246,20 @@ describe("cancellation", () => {
       "cancelled",
     ]);
   });
+
+  it("confirms only once Claude Code has really exited, even if it ignores termination", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [{ steps: [{ ignoreTermination: true }, { waitFor: "never" }] }],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+
+    const cancelled = await client.call("cancel_task", { project, taskId });
+    expect(cancelled.data).toMatchObject({
+      cancellation: "confirmed",
+      executions: [{ executionId: first, status: "cancelled", detail: { processExited: true } }],
+    });
+    expect(isAlive(fixture.launches()[0]!.pid)).toBe(false);
+  }, 30_000);
 
   it("leaves a finished execution completed when cancellation arrives late", async () => {
     const { project, client, taskId, first } = await setUp({
