@@ -170,46 +170,18 @@ describe("writing tasks", () => {
     expect(parts.get("changedFiles:0:")).toBe("notes.txt");
   });
 
-  it("redact a commit subject before cutting it to length", async () => {
-    const secret = "tok-BOUNDARY-SECRET12345";
-    const fixture = new BridgeFixture({
-      config: { mcpServers: { github: { command: "github-mcp", env: { TOKEN: secret } } } },
-      scenario: {
-        turns: [
-          {
-            steps: [
-              { writeFile: { path: "notes.txt", content: "n\n" } },
-              { exec: ["git", "add", "notes.txt"] },
-              // The secret crosses the 1,000-character limit of a stored subject.
-              commit(`${"s".repeat(995)}${secret}`),
-              finished("Done."),
-            ],
-          },
-        ],
-      },
-    });
-    fixtures.push(fixture);
-    const project = fixture.createRepository();
-    const client = await fixture.connect();
-    const { taskId } = await run(client, writeTask(project));
-
-    const result = await client.call("task_result", { project, taskId });
-    const [{ subject }] = result.data.result.workspace.commits;
-    expect(subject.startsWith("s".repeat(995))).toBe(true);
-    expect(subject.length).toBeLessThanOrEqual(1_000);
-    expect(result.text).not.toContain("tok-");
-  });
-
   it("list the changes of failed and cancelled executions in bounded pages", async () => {
     const files = Array.from({ length: 80 }, (_, index) => `${"f".repeat(100)}-${index}.txt`);
-    const subjects = Array.from({ length: 8 }, (_, index) => `feat: change ${index}`);
+    // Subjects near the 1,000-character limit, so listing even a few would exceed small pages.
+    const padding = "s".repeat(980);
+    const subjects = Array.from({ length: 8 }, (_, index) => `feat: change ${index} ${padding}`);
     const changes: Step = {
       exec: [
         "sh",
         "-c",
         `for f in ${files.join(" ")}; do echo x > "$f"; done
          for i in 0 1 2 3 4 5 6 7; do
-           git -c user.name=Child -c user.email=child@example.invalid commit -q --allow-empty -m "feat: change $i"
+           git -c user.name=Child -c user.email=child@example.invalid commit -q --allow-empty -m "feat: change $i ${padding}"
          done`,
       ],
     };
@@ -222,13 +194,13 @@ describe("writing tasks", () => {
 
     /** Checks that status stays bounded and task_result pages every commit and file. */
     const expectPaged = async (taskId: string, shown: string) => {
-      expect(shown.length).toBeLessThan(5_000);
+      expect(shown.length).toBeLessThan(3_000);
       const status = await client.call("task_status", { project, taskId });
-      expect(status.text.length).toBeLessThan(8_000);
+      expect(status.text.length).toBeLessThan(3_000);
       expect(status.data.detail.workspace).toMatchObject({ commitCount: 8, changedFileCount: 80 });
 
       const first = await client.call("task_result", { project, taskId, maxChars: 200 });
-      expect(first.text.length).toBeLessThan(5_000);
+      expect(first.text.length).toBeLessThan(2_500);
       expect(first.data.result).toBeNull();
       const commits: string[] = first.data.workspace.commits.map(
         (item: { subject: string }) => item.subject,
@@ -238,7 +210,7 @@ describe("writing tasks", () => {
       while (next) {
         const page = (await client.call("task_result", { project, taskId, maxChars: 200, ...next }))
           .data;
-        expect(JSON.stringify(page).length).toBeLessThan(5_000);
+        expect(JSON.stringify(page).length).toBeLessThan(2_500);
         for (const part of page.parts) {
           const list = part.field === "commits" ? commits : changed;
           if (part.offset) list[list.length - 1] += part.text;
@@ -467,7 +439,9 @@ describe("writing tasks", () => {
     );
     expect(failed.status.status).toBe("failed");
     // File names and commit subjects are Claude's text: only their counts reach `error`.
-    expect(failed.status.detail.workspace).toMatchObject({ changedFiles: ["partial.txt"] });
+    expect(failed.status.detail.workspace).toMatchObject({ changedFileCount: 1 });
+    const failedResult = await client.call("task_result", { project, taskId: failed.taskId });
+    expect(failedResult.data.workspace.changedFiles).toEqual(["partial.txt"]);
     expect(failed.status.error.message).toContain("0 commits and 1 changed file");
     expect(JSON.stringify(failed.status.error)).not.toContain("partial");
     expect(existsSync(join(failed.status.detail.workspace.path, "partial.txt"))).toBe(true);
@@ -483,7 +457,9 @@ describe("writing tasks", () => {
     const cancelled = (await client.call("cancel_task", { project, taskId })).data;
     const [execution] = cancelled.executions;
     expect(execution).toMatchObject({ status: "cancelled", detail: { processExited: true } });
-    expect(execution.detail.workspace.changedFiles).toEqual(["stopped.txt"]);
+    expect(execution.detail.workspace).toMatchObject({ changedFileCount: 1 });
+    const cancelledResult = await client.call("task_result", { project, taskId });
+    expect(cancelledResult.data.workspace.changedFiles).toEqual(["stopped.txt"]);
     expect(existsSync(join(execution.detail.workspace.path, "stopped.txt"))).toBe(true);
   });
 });

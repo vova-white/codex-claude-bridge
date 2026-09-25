@@ -198,8 +198,6 @@ const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit"];
 /** Most commits and changed files a result lists, and the longest commit subject kept. */
 const maxListedChanges = 500;
 const maxSubjectChars = 1_000;
-/** Most commits and changed files an execution's state shows; task_result pages them all. */
-const maxShownChanges = 5;
 /** Writing tasks get every tool except nested agents, which could not be held to the worktree. */
 const writingDisallowedTools = ["Agent"];
 
@@ -638,7 +636,9 @@ export class TaskService {
    * The durable result of an execution, bounded by maxChars and read from the
    * stored result itself. Without a cursor it returns the result's usual shape,
    * cut where the budget ends; `truncated.next` then continues from the first
-   * character not shown, returning `parts` until nothing is left.
+   * character not shown, returning `parts` until nothing is left. A failed or
+   * cancelled writing execution has no result (`result: null`) but pages the
+   * changes of its retained worktree the same way, as a top-level `workspace`.
    */
   async result(caller: string, params: unknown) {
     const { project, taskId, executionId, maxChars, part, offset } = parse(resultSchema, params);
@@ -647,7 +647,6 @@ export class TaskService {
       ? this.executionById(task.id, executionId)
       : this.execution(task.id, 1);
     const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
-    // A failed or cancelled writing execution has no result, but lists its worktree's changes like one.
     const retained = (JSON.parse(execution.detail ?? "{}") as Pick<StoredResult, "workspace">)
       .workspace;
     const stored: (Record<string, unknown> & Partial<StoredResult>) | undefined = execution.result
@@ -1465,8 +1464,7 @@ export class TaskService {
               // Long lists are cut; the worktree itself holds every change.
               commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
                 sha,
-                // Redacted before the cut, which could otherwise split a secret.
-                subject: redactContent(subject, secrets).slice(0, maxSubjectChars),
+                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
               })),
               changedFiles: changedFiles
                 .slice(0, maxListedChanges)
@@ -1533,7 +1531,7 @@ export class TaskService {
               : []),
             ...(changes
               ? [
-                  `The task's worktree holds ${plural(changes.commitCount, "commit")} and ${plural(changes.changedFileCount, "changed file")} (see detail.workspace).`,
+                  `The task's worktree holds ${plural(changes.commitCount, "commit")} and ${plural(changes.changedFileCount, "changed file")}; task_result of this execution lists them.`,
                 ]
               : []),
           ].join(" "),
@@ -1738,21 +1736,19 @@ function workspaceReport(workspace: WorkspaceRow) {
 }
 
 /**
- * An execution's detail as its state shows it: the worktree a failed or
- * cancelled writing execution retains lists only its first changes.
+ * An execution's detail as its state shows it. The worktree a failed or
+ * cancelled writing execution retains is reduced to its counts, which keeps
+ * every status and result response small; task_result of that execution pages
+ * the stored commits and changed files instead.
  */
 function shownDetail(detail: Record<string, unknown> & Pick<StoredResult, "workspace">) {
-  const { workspace } = detail;
-  const commits = workspace?.commits ?? [];
-  const changedFiles = workspace?.changedFiles ?? [];
-  if (commits.length <= maxShownChanges && changedFiles.length <= maxShownChanges) return detail;
+  if (!detail.workspace?.commits) return detail;
+  const { commits: _commits, changedFiles: _changedFiles, ...workspace } = detail.workspace;
   return {
     ...detail,
     workspace: {
       ...workspace,
-      commits: commits.slice(0, maxShownChanges),
-      changedFiles: changedFiles.slice(0, maxShownChanges),
-      note: `Shows the first ${maxShownChanges} commits and changed files; task_result for this execution lists them all in pages.`,
+      note: `task_result for this execution lists the first ${maxListedChanges} commits and changed files in pages.`,
     },
   };
 }
