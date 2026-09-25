@@ -8,8 +8,14 @@ import {
   reportedResult,
   runExecution,
   writingResult,
+  type ExecutionObserver,
   type ExecutionOutcome,
 } from "../claude/execution.ts";
+import {
+  NestedWriterRefusal,
+  type NestedWriterBrief,
+  type NestedWriterHost,
+} from "../claude/nested-writers.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
 import { errorOrigin, redactContent } from "../redact.ts";
@@ -185,6 +191,25 @@ interface WorkspaceRow {
   created_at: string;
 }
 
+interface NestedWriterRow {
+  id: string;
+  execution_id: string;
+  brief: string;
+  path: string;
+  branch: string;
+  baseline: string;
+  status: string;
+  reason: string | null;
+  session_id: string | null;
+  outcome: string | null;
+  process_exited: number | null;
+  created_at: string;
+  ended_at: string | null;
+}
+
+/** The running nested writers of one execution, and the means to stop them when it ends. */
+type NestedWriters = NestedWriterHost & { stopAll(): Promise<void> };
+
 interface TaskRow {
   id: string;
   project: string;
@@ -246,7 +271,7 @@ function parse<T>(schema: z.ZodType<T>, params: unknown): T {
 
 const now = () => new Date().toISOString();
 
-function prompt(request: StartRequest): string {
+function prompt(request: NestedWriterBrief): string {
   return [
     `<assignment>\n${request.assignment}\n</assignment>`,
     request.context ? `<context>\n${request.context}\n</context>` : "",
@@ -275,12 +300,30 @@ This task uses the writing profile in its own Git worktree at ${workspace.path},
 
 Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${workspace.branch} with Conventional Commits messages, following the repository's own guidance. Do not push or open pull requests: publication is not enabled for this task.
 
-Nested agents are not available in this task: do all of the work yourself.
+Claude Code's Agent tool is not available, because its agents would share your worktree. To split independent changes among nested writers working in parallel, use the bridge's start_nested_writer tool. Each nested writer is a separate Claude Code run that the bridge starts in its own worktree, on its own branch, from the commit your HEAD points to: commit the state it should start from first, as a worktree with uncommitted changes is refused. The tool returns at once; wait_nested_writers returns each writer's branch, baseline, commits, changed files, checks, and result. Assemble their work yourself: merge or cherry-pick each branch into ${workspace.branch}, run the checks that matter, and report in failures any conflict you could not resolve, naming the branch. You remain accountable for the result; your task is not complete while nested writers run, and if your turn ends first you are prompted to assemble their work once they have all ended.
+
+Use nested writers only when changes are independent and large enough that working in parallel outweighs the cost: each is a full Claude Code session on the same subscription, and you brief it, review its work, and merge it. Keep small, sequential, or tightly coupled changes yourself. Nested writers cannot start nested writers, and the bridge does not limit how many you start, so start only as many as the work justifies.
 
 No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
 
 Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the parent), and checks (each check you ran and whether it passed).`;
 }
+
+function nestedWriterGuidance(writer: NestedWriterRow, executor: WorkspaceRow): string {
+  return `You are a nested writer: a Claude agent working on part of a task that Codex delegated to another Claude agent, the executor, which assigned you this part and will assemble your work. Work autonomously on the assignment in the user message.
+
+You work in your own Git worktree at ${writer.path}, on branch ${writer.branch}, starting from commit ${writer.baseline}. Work only inside this worktree: other checkouts, including the executor's at ${executor.path}, belong to other agents. The worktree isolates Git changes; it is not a sandbox.
+
+Make the changes the assignment needs. Install dependencies and run the checks that fit your changes. Commit your work to ${writer.branch} with Conventional Commits messages, following the repository's own guidance. Do not merge other branches, push, or open pull requests: the executor integrates your branch.
+
+Nested agents are not available: do all of the work yourself.
+
+No one can answer questions while you work. Make reasonable assumptions, state them, and list anything unresolved as remaining work.
+
+Finish with the structured result: summary (what you changed and why), evidence (what you inspected or ran and what it showed), failures (anything that failed or could not be verified), remainingWork (what is left for the executor), and checks (each check you ran and whether it passed).`;
+}
+
+const ending = () => new NestedWriterRefusal("The task is ending; no nested writer was started.");
 
 /**
  * Owns delegated tasks: their durable identity, their executions, and the
@@ -339,6 +382,11 @@ export class TaskService {
     this.db
       .prepare(
         "UPDATE nested_tasks SET status = 'unknown', termination = 'unconfirmed', ended_at = ? WHERE status = 'running'",
+      )
+      .run(now());
+    this.db
+      .prepare(
+        "UPDATE nested_writers SET status = 'interrupted', reason = 'service_restarted', ended_at = ? WHERE status = 'running'",
       )
       .run(now());
     if (unfinished.length > 0) {
@@ -507,6 +555,7 @@ export class TaskService {
         ordinal: execution.ordinal,
         ...executionState(execution),
         ...this.nested(execution.id),
+        ...this.nestedWriterReports(execution.id),
         ...(execution.started_at ? { startedAt: execution.started_at } : {}),
         ...(execution.ended_at ? { endedAt: execution.ended_at } : {}),
       })),
@@ -675,19 +724,25 @@ export class TaskService {
       new Promise((resolve) => setTimeout(resolve, cancelConfirmationMs)),
     ]);
     const executions = active.map((execution) => this.executionById(task.id, execution.id));
-    // Every terminal state is written after Claude Code's process exited, or
-    // records processExited: false when it could not be confirmed.
-    const confirmed = executions.every(
-      (execution) =>
-        terminalStatuses.includes(execution.status) &&
-        (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
-          false,
-    );
     const views = executions.map((execution) => ({
       executionId: execution.id,
       ...executionState(execution),
       ...this.nested(execution.id),
+      ...this.nestedWriterReports(execution.id),
     }));
+    // Every terminal state is written after the Claude Code processes of the
+    // execution and its nested writers exited, or records processExited: false
+    // when that could not be confirmed.
+    const confirmed =
+      executions.every(
+        (execution) =>
+          terminalStatuses.includes(execution.status) &&
+          (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
+            false,
+      ) &&
+      views
+        .flatMap((view) => view.nestedWriters ?? [])
+        .every((writer) => writer.status !== "running" && writer.processExited !== false);
     const unreported = views
       .flatMap((view) => view.nested ?? [])
       .filter((nested) => nested.termination !== undefined && nested.termination !== "reported");
@@ -948,6 +1003,294 @@ export class TaskService {
     return true;
   }
 
+  /**
+   * The nested writers an execution may start. Each is bound to its own
+   * worktree and branch, created from the executor's committed HEAD, before its
+   * Claude Code process starts there. They stop when the execution is cancelled
+   * or ends.
+   */
+  private nestedWriters(
+    executionId: string,
+    request: StartRequest,
+    executor: WorkspaceRow,
+    signal: AbortSignal,
+  ): NestedWriters {
+    const runs = new Map<string, { controller: AbortController; done: Promise<void> }>();
+    const listeners = new Set<() => void>();
+    let closed = false;
+    /** Why writers still running are stopped: the task was cancelled, or the execution ended first. */
+    let stopReason = "parent_ended";
+    const stop = () => {
+      for (const run of runs.values()) run.controller.abort();
+    };
+    const cancelled = () => {
+      stopReason = "cancelled";
+      stop();
+    };
+    signal.addEventListener("abort", cancelled, { once: true });
+    const { project } = this.db
+      .prepare("SELECT project FROM tasks WHERE id = ?")
+      .get(executor.task_id) as { project: string };
+    return {
+      start: async (brief) => {
+        if (closed || signal.aborted) throw ending();
+        if (await hasUncommittedChanges(executor.path)) {
+          throw new NestedWriterRefusal(
+            `${executor.path} has uncommitted changes, which a nested writer would not see: it starts from a commit. Commit the state it should start from, then start it again.`,
+          );
+        }
+        const baseline = await resolveCommit(executor.path, "HEAD");
+        if (!baseline) throw new NestedWriterRefusal(`HEAD names no commit in ${executor.path}.`);
+        const secrets = configSecrets(this.config());
+        const clean = (text: string) => redactContent(text, secrets);
+        const stored: NestedWriterBrief = {
+          assignment: clean(brief.assignment),
+          ...(brief.context ? { context: clean(brief.context) } : {}),
+          expectedResult: clean(brief.expectedResult),
+        };
+        const uuid = randomUUID();
+        const id = `writer_${uuid}`;
+        const path = join(this.paths.worktrees, id);
+        const branch = taskBranch(request.branchType ?? "feature", stored.assignment, uuid);
+        // The worktree is bound to the writer before any process can edit.
+        this.db
+          .prepare(
+            `INSERT INTO nested_writers (id, execution_id, brief, path, branch, baseline, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'running', ?)`,
+          )
+          .run(id, executionId, JSON.stringify(stored), path, branch, baseline, now());
+        try {
+          await addWorktree(project, path, branch, baseline);
+        } catch (error) {
+          this.log(
+            `worktree for nested writer ${id} could not be created (${(error as NodeJS.ErrnoException).code ?? "git worktree add failed"})`,
+          );
+          const message = `Could not create a worktree at ${path} on branch ${branch}; the nested writer was not started.`;
+          this.endNestedWriter(id, "failed", "workspace_error", { error: { message } }, true);
+          throw new NestedWriterRefusal(message);
+        }
+        if (closed || signal.aborted) {
+          this.endNestedWriter(id, "cancelled", stopReason, {}, true);
+          throw ending();
+        }
+        const writer = this.nestedWriterRow(id);
+        this.record(
+          executionId,
+          "nested",
+          `${id} started on ${branch} from ${baseline}: ${stored.assignment}`,
+        );
+        const controller = new AbortController();
+        const done = this.runNestedWriter(
+          writer,
+          stored,
+          executor,
+          request,
+          controller.signal,
+          () => stopReason,
+        )
+          .catch((error: unknown) => {
+            this.log(`nested writer ${id} failed unexpectedly: ${errorOrigin(error)}`);
+            const message = "The bridge could not run this nested writer.";
+            this.endNestedWriter(id, "failed", "provider_error", { error: { message } }, null);
+          })
+          .finally(() => {
+            runs.delete(id);
+            for (const listener of listeners) listener();
+          });
+        runs.set(id, { controller, done });
+        return nestedWriterReport(writer);
+      },
+      wait: async (writerIds) => {
+        const own = (
+          this.db
+            .prepare(
+              "SELECT id FROM nested_writers WHERE execution_id = ? ORDER BY created_at, rowid",
+            )
+            .all(executionId) as { id: string }[]
+        ).map((row) => row.id);
+        const unknown = (writerIds ?? []).filter((id) => !own.includes(id));
+        if (unknown.length > 0) {
+          throw new NestedWriterRefusal(
+            `This task started no nested writer ${unknown.join(", ")}.`,
+          );
+        }
+        const selected = writerIds ?? own;
+        await Promise.all(selected.map((id) => runs.get(id)?.done));
+        return selected.map((id) => nestedWriterReport(this.nestedWriterRow(id)));
+      },
+      running: () => runs.size,
+      onEnded: (listener) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      stopAll: async () => {
+        closed = true;
+        signal.removeEventListener("abort", cancelled);
+        stop();
+        await Promise.all([...runs.values()].map((run) => run.done));
+      },
+    };
+  }
+
+  /** Runs a nested writer's Claude Code process in its worktree and records how it ended. */
+  private async runNestedWriter(
+    writer: NestedWriterRow,
+    brief: NestedWriterBrief,
+    executor: WorkspaceRow,
+    request: StartRequest,
+    signal: AbortSignal,
+    stopReason: () => string,
+  ): Promise<void> {
+    const config = this.config();
+    const secrets = configSecrets(config);
+    const executable = claudeExecutable(config);
+    const clean = (text: string) => redactContent(text, secrets);
+    const event = (text: string) =>
+      this.record(writer.execution_id, "nested", `${writer.id}${text}`);
+    const observer: ExecutionObserver = {
+      session: (sessionId) => {
+        this.db
+          .prepare("UPDATE nested_writers SET session_id = ? WHERE id = ?")
+          .run(sessionId, writer.id);
+      },
+      capacity: (waiting) =>
+        event(waiting ? " is waiting for subscription capacity." : " continues."),
+      message: (text) => event(`: ${clean(text)}`),
+      // Strings are redacted before serialization, which would escape them.
+      toolCall: (name, input) => event(`: ${name} ${JSON.stringify(redactStrings(input, clean))}`),
+      // Without the Agent tool, Claude Code reports no nested agents of a nested writer.
+      nestedStarted: () => {},
+      nestedProgress: () => {},
+      nestedEnded: () => {},
+      waitingForChildren: () => {},
+    };
+    const outcome: ExecutionOutcome = executable
+      ? await runExecution(
+          {
+            executable,
+            env: claudeEnvironment(config),
+            extraArgs: mcpConfigArgs(this.paths, config),
+            cwd: writer.path,
+            prompt: prompt(brief),
+            guidance: nestedWriterGuidance(writer, executor),
+            disallowedTools: writingDisallowedTools,
+            resultSchema: writingResult,
+            ...(request.model ? { model: request.model } : {}),
+            ...(request.effort ? { effort: request.effort } : {}),
+            signal,
+            secrets,
+          },
+          observer,
+        )
+      : {
+          status: "failed",
+          reason: "provider_error",
+          message: "Claude Code was not found.",
+          processExited: true,
+        };
+    // The writer's changes stay in its worktree whatever the outcome.
+    const changes = await listedChanges(writer.path, writer.baseline, secrets);
+    const retained = changes ? { changes } : {};
+    let status: string;
+    let reason: string | null = null;
+    if (outcome.status === "completed") {
+      const parsed = writingResult.safeParse(outcome.structured);
+      const reported = parsed.success
+        ? parsed.data
+        : { summary: outcome.text, evidence: [], failures: [], remainingWork: [], checks: [] };
+      const result = {
+        summary: clean(reported.summary),
+        evidence: reported.evidence.map(clean),
+        failures: reported.failures.map(clean),
+        remainingWork: reported.remainingWork.map(clean),
+        checks: reported.checks.map((check) => redactStrings(check, clean)),
+      };
+      status = "completed";
+      this.endNestedWriter(
+        writer.id,
+        status,
+        reason,
+        { result, ...retained },
+        outcome.processExited,
+      );
+    } else if (outcome.status === "failed") {
+      status = "failed";
+      reason = outcome.reason;
+      const error = {
+        message: outcome.message,
+        ...(outcome.action ? { action: outcome.action } : {}),
+      };
+      this.endNestedWriter(
+        writer.id,
+        status,
+        reason,
+        { error, ...retained },
+        outcome.processExited,
+      );
+    } else {
+      status = "cancelled";
+      reason = stopReason();
+      this.endNestedWriter(writer.id, status, reason, retained, outcome.processExited);
+    }
+    event(` ${status}${reason ? ` (${reason})` : ""}.`);
+  }
+
+  /** Records how a running nested writer ended; a writer that already ended keeps its outcome. */
+  private endNestedWriter(
+    id: string,
+    status: string,
+    reason: string | null,
+    outcome: object,
+    processExited: boolean | null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE nested_writers SET status = ?, reason = ?, outcome = ?, process_exited = ?, ended_at = ?
+         WHERE id = ? AND status = 'running'`,
+      )
+      .run(
+        status,
+        reason,
+        JSON.stringify(outcome),
+        processExited === null ? null : processExited ? 1 : 0,
+        now(),
+        id,
+      );
+  }
+
+  private nestedWriterRow(id: string): NestedWriterRow {
+    return this.db
+      .prepare("SELECT * FROM nested_writers WHERE id = ?")
+      .get(id) as unknown as NestedWriterRow;
+  }
+
+  private nestedWriterRows(executionId: string): NestedWriterRow[] {
+    return this.db
+      .prepare("SELECT * FROM nested_writers WHERE execution_id = ? ORDER BY created_at, rowid")
+      .all(executionId) as unknown as NestedWriterRow[];
+  }
+
+  /** The nested writers an execution started, as task_status and cancel_task show them. */
+  private nestedWriterReports(executionId: string) {
+    const rows = this.nestedWriterRows(executionId);
+    return rows.length > 0 ? { nestedWriters: rows.map(nestedWriterReport) } : {};
+  }
+
+  /** Where each nested writer's work is, kept with the execution's result. */
+  private nestedWriterReferences(executionId: string) {
+    const rows = this.nestedWriterRows(executionId);
+    if (rows.length === 0) return {};
+    return {
+      nestedWriters: rows.map((row) => ({
+        writerId: row.id,
+        status: row.status,
+        branch: row.branch,
+        baseline: row.baseline,
+        path: row.path,
+      })),
+    };
+  }
+
   /** Starts the task's next queued execution unless one of its executions is running. */
   private schedule(taskId: string): void {
     if (this.launching.has(taskId)) return;
@@ -1005,6 +1348,7 @@ export class TaskService {
     const executable = claudeExecutable(config);
     let outcome: ExecutionOutcome;
     let before: Map<string, string> | undefined;
+    let writers: NestedWriters | undefined;
     if (!executable) {
       outcome = {
         status: "failed",
@@ -1034,6 +1378,7 @@ export class TaskService {
       };
     } else {
       if (!workspace) before = await checkoutState(root);
+      if (workspace) writers = this.nestedWriters(executionId, request, workspace, signal);
       outcome = await runExecution(
         {
           executable,
@@ -1049,6 +1394,7 @@ export class TaskService {
           ...(request.model ? { model: request.model } : {}),
           ...(request.effort ? { effort: request.effort } : {}),
           secrets,
+          ...(writers ? { nestedWriters: writers } : {}),
         },
         {
           session: (sessionId) => {
@@ -1158,25 +1504,14 @@ export class TaskService {
         },
       );
     }
+    // The execution ends only once the nested writers it started have stopped.
+    await writers?.stopAll();
     const endedAt = now();
     const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
     // A writing task's changes stay in its worktree whatever the outcome.
     const changes =
       workspace && this.workspace(task.id)?.state === "ready"
-        ? await worktreeChanges(workspace.path, workspace.baseline)
-            .then(({ commits, changedFiles }) => ({
-              // Long lists are cut; the worktree itself holds every change.
-              commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
-                sha,
-                subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
-              })),
-              changedFiles: changedFiles
-                .slice(0, maxListedChanges)
-                .map((file) => redactContent(file, secrets)),
-              commitCount: commits.length,
-              changedFileCount: changedFiles.length,
-            }))
-            .catch(() => undefined)
+        ? await listedChanges(workspace.path, workspace.baseline, secrets)
         : undefined;
     const retained = workspace
       ? { workspace: { ...workspaceReport(this.workspace(task.id)!), ...changes } }
@@ -1248,6 +1583,7 @@ export class TaskService {
         ? {
             checks: checks.map((check) => redactStrings(check, clean)),
             ...retained,
+            ...this.nestedWriterReferences(executionId),
           }
         : { workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles } }),
     };
@@ -1380,6 +1716,9 @@ function redactStrings(value: unknown, clean: (text: string) => string): unknown
   return value;
 }
 
+const worktreeIsolation =
+  "Git worktree: separate files and branch, not an operating-system sandbox.";
+
 function workspaceReport(workspace: WorkspaceRow) {
   return {
     kind: "worktree",
@@ -1388,7 +1727,55 @@ function workspaceReport(workspace: WorkspaceRow) {
     baseline: workspace.baseline,
     parentDirty: workspace.parent_dirty === 1,
     state: workspace.state,
-    isolation: "Git worktree: separate files and branch, not an operating-system sandbox.",
+    isolation: worktreeIsolation,
+  };
+}
+
+/** Commits and changed files of a worktree since its baseline, redacted, with long lists cut. */
+function listedChanges(path: string, baseline: string, secrets: readonly string[]) {
+  return worktreeChanges(path, baseline)
+    .then(({ commits, changedFiles }) => ({
+      // Long lists are cut; the worktree itself holds every change.
+      commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
+        sha,
+        subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+      })),
+      changedFiles: changedFiles
+        .slice(0, maxListedChanges)
+        .map((file) => redactContent(file, secrets)),
+      commitCount: commits.length,
+      changedFileCount: changedFiles.length,
+    }))
+    .catch(() => undefined);
+}
+
+/** A nested writer with its workspace, change set, and result or error, as the executor and the parent see it. */
+function nestedWriterReport(row: NestedWriterRow) {
+  const brief = JSON.parse(row.brief) as NestedWriterBrief;
+  const outcome = (row.outcome ? JSON.parse(row.outcome) : {}) as {
+    result?: object;
+    error?: object;
+    changes?: object;
+  };
+  return {
+    writerId: row.id,
+    status: row.status,
+    ...(row.reason ? { reason: row.reason } : {}),
+    assignment: brief.assignment,
+    workspace: {
+      kind: "worktree",
+      path: row.path,
+      branch: row.branch,
+      baseline: row.baseline,
+      isolation: worktreeIsolation,
+      ...outcome.changes,
+    },
+    ...(outcome.result ? { result: outcome.result } : {}),
+    ...(outcome.error ? { error: outcome.error } : {}),
+    ...(row.process_exited === 0 ? { processExited: false } : {}),
+    ...(row.session_id ? { sessionId: row.session_id } : {}),
+    startedAt: row.created_at,
+    ...(row.ended_at ? { endedAt: row.ended_at } : {}),
   };
 }
 

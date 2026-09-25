@@ -21,8 +21,22 @@ export type Step =
   | { signal: string }
   /** Writes a file relative to the working directory, as a shell command could. */
   | { writeFile: { path: string; content: string } }
-  /** Runs a command in the working directory, as the Bash tool could. */
-  | { exec: string[] }
+  /** Runs a command in the working directory, as the Bash tool could; `mayFail` tolerates a non-zero exit. */
+  | { exec: string[]; mayFail?: true }
+  /**
+   * Calls a tool of an SDK MCP server the way Claude Code does, with an
+   * `mcp_message` control request, and waits for its result. `saveAs` keeps the
+   * result for `{{name.path}}` templates in later steps and writes it to
+   * `<name>.json` next to the scenario file.
+   */
+  | {
+      mcpCall: {
+        server?: string;
+        tool: string;
+        arguments?: Record<string, unknown>;
+        saveAs?: string;
+      };
+    }
   /** From now on ignores SIGTERM and stdin closing, like a process that hangs on shutdown. */
   | { ignoreTermination: true }
   /** The Agent tool call and Claude Code's task_started for a nested agent; `parent` spawns it inside another one. */
@@ -195,6 +209,84 @@ async function waitForFile(path: string): Promise<void> {
 let initialized = false;
 let ignoreTermination = false;
 let queue = Promise.resolve();
+/** SDK MCP servers the SDK registered in its initialize request. */
+let sdkMcpServers: string[] = [];
+/** Control requests this process sent to the SDK, by request ID. */
+const pendingControl = new Map<string, (response: ControlResponse) => void>();
+/** Results of `mcpCall` steps kept with `saveAs`. */
+const saved = new Map<string, unknown>();
+let mcpMessageId = 0;
+
+interface ControlResponse {
+  subtype: string;
+  error?: string;
+  response?: { mcp_response?: { result?: ToolCallResult; error?: { message?: string } } };
+}
+
+interface ToolCallResult {
+  isError?: boolean;
+  content?: { type: string; text?: string }[];
+}
+
+/** Replaces `{{name.path}}` in the strings of a value with fields of saved results. */
+function fill(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(/\{\{([\w.-]+)\}\}/g, (_, path: string) => {
+      const [name = "", ...keys] = path.split(".");
+      let current = saved.get(name);
+      for (const key of keys) current = (current as Record<string, unknown> | undefined)?.[key];
+      return String(current ?? "");
+    });
+  }
+  if (Array.isArray(value)) return value.map(fill);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, fill(item)]));
+  }
+  return value;
+}
+
+/** Calls a tool of an SDK MCP server: the assistant's tool use, then Claude Code's mcp_message. */
+async function callMcpTool(
+  server: string,
+  tool: string,
+  input: Record<string, unknown>,
+): Promise<{ isError: boolean; text: string; data: unknown }> {
+  assistant([
+    { type: "tool_use", id: `toolu_${randomUUID()}`, name: `mcp__${server}__${tool}`, input },
+  ]);
+  if (!sdkMcpServers.includes(server)) {
+    return { isError: true, text: `No such tool available: mcp__${server}__${tool}`, data: null };
+  }
+  const requestId = `req_${randomUUID()}`;
+  const response = await new Promise<ControlResponse>((answered) => {
+    pendingControl.set(requestId, answered);
+    send({
+      type: "control_request",
+      request_id: requestId,
+      request: {
+        subtype: "mcp_message",
+        server_name: server,
+        message: {
+          jsonrpc: "2.0",
+          id: ++mcpMessageId,
+          method: "tools/call",
+          params: { name: tool, arguments: input },
+        },
+      },
+    });
+  });
+  const mcp = response.response?.mcp_response;
+  const result = mcp?.result ?? {
+    isError: true,
+    content: [{ type: "text", text: mcp?.error?.message ?? response.error ?? "" }],
+  };
+  const text = (result.content ?? []).map((part) => part.text ?? "").join("\n");
+  let data: unknown = null;
+  try {
+    data = JSON.parse(text);
+  } catch {}
+  return { isError: result.isError === true, text, data };
+}
 
 async function answer(prompt: string): Promise<void> {
   if (!initialized) {
@@ -294,8 +386,19 @@ async function answer(prompt: string): Promise<void> {
     } else if ("nestedEnd" in step) {
       taskNotification(step.nestedEnd.id, step.nestedEnd.status, step.nestedEnd.summary);
     } else if ("exec" in step) {
-      const [command = "true", ...commandArgs] = step.exec;
-      execFileSync(command, commandArgs, { cwd: process.cwd() });
+      const [command = "true", ...commandArgs] = fill(step.exec) as string[];
+      try {
+        execFileSync(command, commandArgs, { cwd: process.cwd() });
+      } catch (error) {
+        if (!step.mayFail) throw error;
+      }
+    } else if ("mcpCall" in step) {
+      const { server = "bridge", tool, arguments: input = {}, saveAs } = step.mcpCall;
+      const result = await callMcpTool(server, tool, fill(input) as Record<string, unknown>);
+      if (saveAs) {
+        saved.set(saveAs, result);
+        writeFileSync(resolve(scenarioDir, `${saveAs}.json`), JSON.stringify(result));
+      }
     } else if ("result" in step) {
       const { text = "", structured, isError = false, subtype = "success", errors } = step.result;
       send({
@@ -335,10 +438,17 @@ lines.on("line", (line) => {
     queue = queue.then(() => answer(prompt));
     return;
   }
+  if (message.type === "control_response") {
+    const response = message.response as ControlResponse & { request_id: string };
+    pendingControl.get(response.request_id)?.(response);
+    pendingControl.delete(response.request_id);
+    return;
+  }
   if (message.type !== "control_request") return;
   const { request_id: requestId, request } = message;
   switch (request.subtype) {
     case "initialize":
+      sdkMcpServers = request.sdkMcpServers ?? [];
       if (resumed && scenario.lostSessions) {
         // Claude Code answers an unknown --resume with an error result and exits.
         send({

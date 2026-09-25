@@ -24,7 +24,7 @@ A caller-chosen key that identifies one request so a retry returns what the firs
 The identity that owns delegated tasks across MCP connections, such as one Codex installation. A reconnecting parent agent finds the tasks it started as the same logical caller.
 
 **Task profile**:
-The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except nested agents.
+The tools and workspace a child agent gets for a delegated task. The read-only profile inspects a shared checkout without edit tools; it is a tool policy, not a sandbox. The writing profile works in a task worktree with all tools except Claude Code's own nested agents, and may start nested writers.
 
 **Task worktree**:
 The Git worktree and task branch a writing agent works in, created from a committed baseline. It isolates Git changes from other agents; it is not a sandbox.
@@ -37,6 +37,9 @@ A child agent assigned to change project files as part of its delegated task.
 
 **Nested agent**:
 An agent engaged by a child agent to carry out part of its delegated task. The child agent remains accountable for incorporating that agent's work into its task result.
+
+**Nested writer**:
+A nested agent that changes files for a writing agent, run by the bridge service as a separate Claude Code execution in its own worktree and branch, starting from the writing agent's committed state. The writing agent assembles its branch into the task result.
 
 **Bridge service**:
 The local background process that owns delegated work, its persisted state, and the Claude Code processes. MCP entry points connect to it and may come and go without affecting it.

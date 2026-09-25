@@ -6,11 +6,20 @@ import {
 import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { redact } from "../redact.ts";
+import {
+  nestedWriterServer,
+  nestedWriterServerName,
+  type NestedWriterHost,
+} from "./nested-writers.ts";
 import { classifyCredentials, credentialAction, withTimeout } from "./readiness.ts";
 
 const initializeTimeoutMs = 60_000;
 /** How long cancellation waits for Claude Code to report stopped nested agents before ending its process. */
 const nestedStopGraceMs = 5_000;
+/** Continues the executor's session when its nested writers end after its turn did. */
+const nestedWritersEndedPrompt = `<nested-writers-ended>
+Every nested writer you started has ended. Call wait_nested_writers to collect their reports, assemble their branches into yours or report the conflicts, and finish with the structured result.
+</nested-writers-ended>`;
 
 /** Why an execution failed, in terms the parent agent can act on. */
 export type FailureReason =
@@ -39,6 +48,8 @@ export interface ExecutionRequest {
   /** Aborting stops Claude Code; the outcome is then `cancelled`. */
   signal: AbortSignal;
   secrets: readonly string[];
+  /** Nested writers the executor may start through the bridge's in-process MCP tools. */
+  nestedWriters?: NestedWriterHost;
 }
 
 /** A nested agent Claude Code reported starting through its Agent tool. */
@@ -187,6 +198,10 @@ function within(event: Promise<void>, ms: number): Promise<boolean> {
  * turn for each nested agent that finishes, and that later result carries the
  * incorporated work. Cancellation asks Claude Code to stop running nested
  * agents before it ends the process.
+ *
+ * Nested writers run outside Claude Code, so it does not start a turn when they
+ * end: a result that arrives while some run waits for them too, and once they
+ * have all ended the executor is prompted to collect and assemble their work.
  */
 export async function runExecution(
   request: ExecutionRequest,
@@ -211,15 +226,28 @@ export async function runExecution(
   /** The nested agent whose Agent tool call each tool call belongs to. */
   const toolUseParents = new Map<string, string>();
   let waiting = false;
+  const writers = request.nestedWriters;
+  const runningChildren = () => nested.size + (writers?.running() ?? 0);
+  const childEnded = () => {
+    if (!waiting) return;
+    const count = runningChildren();
+    observer.waitingForChildren(count);
+    waiting = count > 0;
+  };
   const endNested = (taskId: string, end: NestedEnd) => {
     if (!nested.delete(taskId)) return;
     observer.nestedEnded(taskId, end);
     for (const listener of nestedChanged) listener();
-    if (waiting) {
-      observer.waitingForChildren(nested.size);
-      waiting = nested.size > 0;
-    }
+    childEnded();
   };
+  /** Whether the executor's turn ended while nested writers ran. */
+  let writersPending = false;
+  const stopWatchingWriters = writers?.onEnded(() => {
+    childEnded();
+    if (!writersPending || writers.running() > 0 || request.signal.aborted) return;
+    writersPending = false;
+    input.push(nestedWritersEndedPrompt);
+  });
   const allEnded = (taskIds: string[]) =>
     new Promise<void>((resolve) => {
       const check = () => {
@@ -282,6 +310,7 @@ export async function runExecution(
       ...(request.model ? { model: request.model } : {}),
       ...(request.effort ? { effort: request.effort } : {}),
       ...(request.resume ? { resume: request.resume } : {}),
+      ...(writers ? { mcpServers: { [nestedWriterServerName]: nestedWriterServer(writers) } } : {}),
       permissionMode: "default",
       disallowedTools: request.disallowedTools,
       canUseTool: async (tool, toolInput) =>
@@ -394,9 +423,10 @@ export async function runExecution(
         } else if (message.type === "result") {
           if (request.signal.aborted) return { status: "cancelled" };
           if (message.subtype === "success" && !message.is_error) {
-            if (nested.size > 0) {
+            if (runningChildren() > 0) {
               waiting = true;
-              observer.waitingForChildren(nested.size);
+              writersPending = (writers?.running() ?? 0) > 0;
+              observer.waitingForChildren(runningChildren());
               continue;
             }
             return {
@@ -439,6 +469,7 @@ export async function runExecution(
       );
     } finally {
       request.signal.removeEventListener("abort", cancel);
+      stopWatchingWriters?.();
     }
   };
   const outcome = await turn();

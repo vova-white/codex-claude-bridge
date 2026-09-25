@@ -70,6 +70,22 @@ const migrations: string[] = [
     state TEXT NOT NULL,
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE nested_writers (
+    id TEXT PRIMARY KEY,
+    execution_id TEXT NOT NULL REFERENCES executions (id),
+    brief TEXT NOT NULL,
+    path TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    baseline TEXT NOT NULL,
+    status TEXT NOT NULL,
+    reason TEXT,
+    session_id TEXT,
+    outcome TEXT,
+    process_exited INTEGER,
+    created_at TEXT NOT NULL,
+    ended_at TEXT
+  );
+  CREATE INDEX nested_writers_by_execution ON nested_writers (execution_id, created_at)`,
 ];
 
 export class StoreLockedError extends Error {}
