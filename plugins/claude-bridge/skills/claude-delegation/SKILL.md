@@ -63,6 +63,8 @@ Claude assembles their work: it merges or cherry-picks each writer's branch into
 
 `task_status` lists them per execution as `nestedWriters`: `writerId`, `status` (`running`, `completed`, `failed`, `cancelled`, `interrupted`), `reason` (a failure reason, `workspace_error`, `cancelled`, `parent_ended` when the execution ended first, or `service_restarted`), `assignment`, `workspace` (`path`, `branch`, `baseline`, `commits`, `changedFiles`), and the writer's own `result` (with `checks`) or `error` (`message` and `action` composed like an execution's, with its commits and files only in `workspace`). The task result lists their branches in `nestedWriters`. Their worktrees and branches are kept after completion, failure, and cancellation, so unintegrated work remains available: review a branch that Claude did not merge before deciding what to do with it. `read_output` shows their progress as `nested` events prefixed with the `writerId`.
 
+A nested writer may ask questions and permission requests like Claude itself. They appear in the task's `requests` with the executor's `executionId`, the writer's `writerId`, and its `sessionId`, and put that execution in `needs_input`; answer them with `respond_to_request` as usual. They expire when the writer ends. The tools Claude uses to start and collect nested writers never ask for approval.
+
 Limits: the bridge does not limit how many nested writers Claude starts, and they are not counted against any service limit yet. Each is a full Claude Code session on the same subscription, so they share its usage limits and add to its cost. Claude's instructions ask it to use nested writers only for independent changes large enough to justify that cost; this is guidance, not enforcement. To keep a task small and cheap, say so in the brief.
 
 ## Questions and permission requests
@@ -123,6 +125,6 @@ When readiness fails, report the problems and their actions to the user instead 
 
 - `claudeExecutable`: absolute path to Claude Code when `claude` is not on the service `PATH`.
 - `claudeConfigDir`: a separate Claude Code configuration directory (sets `CLAUDE_CONFIG_DIR`).
-- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. Readiness reports each configured server by name and status only, never its configuration or its error text; the user can see a connection error by running `claude` in a terminal and inspecting `/mcp`. Each call to their tools waits for your approval unless the server entry sets `"autoApprove": true`.
+- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. Readiness reports each configured server by name and status only, never its configuration or its error text; the user can see a connection error by running `claude` in a terminal and inspecting `/mcp`. Each call to their tools waits for your approval unless the server entry sets `"autoApprove": true`. The name `codex_claude_bridge` is reserved for the bridge's own tools.
 
 The service reads the file on every check, so edits apply without a restart.

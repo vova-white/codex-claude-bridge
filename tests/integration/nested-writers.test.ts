@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import type { Scenario, Step } from "../fixtures/fake-claude.ts";
-import { BridgeFixture, isAlive, waitFor } from "../support/bridge.ts";
+import { BridgeFixture, isAlive, waitFor, type BridgeOptions } from "../support/bridge.ts";
 
 const fixtures: BridgeFixture[] = [];
 
@@ -59,8 +59,11 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 }
 
-async function setUp(scenario: Scenario) {
-  const fixture = new BridgeFixture({ scenario });
+/** A configured MCP server whose tools need the parent's approval. */
+const trackerConfig = { mcpServers: { tracker: { command: "tracker-mcp" } } };
+
+async function setUp(scenario: Scenario, options: Omit<BridgeOptions, "scenario"> = {}) {
+  const fixture = new BridgeFixture({ ...options, scenario });
   fixtures.push(fixture);
   const project = fixture.createRepository();
   const client = await fixture.connect();
@@ -84,39 +87,44 @@ async function setUp(scenario: Scenario) {
 
 describe("nested writers", () => {
   it("run concurrently in their own worktrees from the executor's committed state, and the executor merges one and reports the other's conflict", async () => {
-    const { fixture, project, client, taskId, status, wait, saved } = await setUp({
-      turns: [
-        {
-          match: "Alpha writer",
-          steps: retitle("Alpha", { signal: "alpha-running" }, { waitFor: "beta-running" }),
-        },
-        {
-          match: "Beta writer",
-          steps: retitle("Beta", { signal: "beta-running" }, { waitFor: "alpha-running" }),
-        },
-        {
-          match: "Coordinate",
-          steps: [
-            { writeFile: { path: "notes.txt", content: "n\n" } },
-            startWriter("dirty", "Alpha writer: retitle the README."),
-            ...commitAll("chore: add notes"),
-            startWriter("alpha", "Alpha writer: retitle the README."),
-            { writeFile: { path: "docs.txt", content: "d\n" } },
-            ...commitAll("docs: add docs"),
-            startWriter("beta", "Beta writer: retitle the README."),
-            waitWriters("waited"),
-            merge("alpha"),
-            merge("beta", true),
-            { exec: ["git", "merge", "--abort"] },
-            finished("Merged the alpha writer's change.", [
-              "The beta writer's branch conflicts with the alpha writer's change in README.md.",
-            ]),
-          ],
-        },
-      ],
-    });
+    const { fixture, project, client, taskId, status, wait, saved } = await setUp(
+      {
+        turns: [
+          {
+            match: "Alpha writer",
+            steps: retitle("Alpha", { signal: "alpha-running" }, { waitFor: "beta-running" }),
+          },
+          {
+            match: "Beta writer",
+            steps: retitle("Beta", { signal: "beta-running" }, { waitFor: "alpha-running" }),
+          },
+          {
+            match: "Coordinate",
+            steps: [
+              { writeFile: { path: "notes.txt", content: "n\n" } },
+              startWriter("dirty", "Alpha writer: retitle the README."),
+              ...commitAll("chore: add notes"),
+              startWriter("alpha", "Alpha writer: retitle the README."),
+              { writeFile: { path: "docs.txt", content: "d\n" } },
+              ...commitAll("docs: add docs"),
+              startWriter("beta", "Beta writer: retitle the README."),
+              waitWriters("waited"),
+              merge("alpha"),
+              merge("beta", true),
+              { exec: ["git", "merge", "--abort"] },
+              finished("Merged the alpha writer's change.", [
+                "The beta writer's branch conflicts with the alpha writer's change in README.md.",
+              ]),
+            ],
+          },
+        ],
+      },
+      // The bridge's own tools run without approval even when configured servers need it.
+      { config: trackerConfig },
+    );
     expect(await wait()).toMatchObject({ status: "completed" });
 
+    expect((await status()).requests).toEqual([]);
     const dirty = saved("dirty");
     expect(dirty.isError).toBe(true);
     expect(dirty.text).toContain("uncommitted");
@@ -222,6 +230,84 @@ describe("nested writers", () => {
     expect(fixture.prompts().some((prompt) => prompt.includes("<nested-writers-ended>"))).toBe(
       true,
     );
+  });
+
+  it("refuse a configured MCP server that takes the name of the bridge's own tools", async () => {
+    const fixture = new BridgeFixture({
+      config: { mcpServers: { codex_claude_bridge: { command: "impostor-mcp" } } },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const refused = await client.call("start_task", {
+      project,
+      requestKey: "write-1",
+      mode: "write",
+      assignment: "Coordinate the README work.",
+      expectedResult: "One branch.",
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toContain("reserved for the bridge's own tools");
+    expect(fixture.launches()).toEqual([]);
+  });
+
+  it("surface a nested writer's question as a request of the executor's execution", async () => {
+    const question = {
+      questions: [
+        {
+          question: "Which title should the README get?",
+          header: "Title",
+          multiSelect: false,
+          options: [
+            { label: "Alpha", description: "The first title" },
+            { label: "Beta", description: "The second title" },
+          ],
+        },
+      ],
+    };
+    const { project, client, taskId, status, wait, saved } = await setUp(
+      {
+        turns: [
+          {
+            match: "Alpha writer",
+            steps: retitle("Alpha", { canUseTool: { name: "AskUserQuestion", input: question } }),
+          },
+          {
+            match: "Coordinate",
+            steps: [
+              startWriter("alpha", "Alpha writer: retitle the README."),
+              waitWriters("waited"),
+              merge("alpha"),
+              finished("Merged the alpha writer."),
+            ],
+          },
+        ],
+      },
+      { config: trackerConfig },
+    );
+    const asking = await waitFor(async () => {
+      const current = await status();
+      return current.reason === "needs_input" ? current : undefined;
+    });
+    const [request] = asking.requests;
+    expect(asking.detail).toEqual({ requestId: request.requestId });
+    expect(request).toMatchObject({
+      executionId: asking.executions[0].executionId,
+      writerId: saved("alpha").data.writerId,
+      kind: "question",
+      live: true,
+    });
+    expect(request.sessionId).toBe(asking.executions[0].nestedWriters[0].sessionId);
+
+    const answered = await client.call("respond_to_request", {
+      project,
+      taskId,
+      requestId: request.requestId,
+      response: { answers: { "Which title should the README get?": "Alpha" } },
+    });
+    expect(answered.isError, answered.text).toBe(false);
+    expect(await wait()).toMatchObject({ status: "completed" });
+    expect((await status()).executions[0].nestedWriters[0].status).toBe("completed");
   });
 
   it("stop running nested writers when the task is cancelled and keep their worktrees", async () => {

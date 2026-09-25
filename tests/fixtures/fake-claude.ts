@@ -24,8 +24,9 @@ export type Step =
   /** Runs a command in the working directory, as the Bash tool could; `mayFail` tolerates a non-zero exit. */
   | { exec: string[]; mayFail?: true }
   /**
-   * Calls a tool of an SDK MCP server the way Claude Code does, with an
-   * `mcp_message` control request, and waits for its result. `saveAs` keeps the
+   * Calls a tool of an SDK MCP server the way Claude Code does: it asks the
+   * SDK's canUseTool callback, then sends an `mcp_message` control request and
+   * waits for its result. `saveAs` keeps the
    * result for `{{name.path}}` templates in later steps and writes it to
    * `<name>.json` next to the scenario file.
    */
@@ -274,6 +275,25 @@ async function callMcpTool(
   if (!sdkMcpServers.includes(server)) {
     return { isError: true, text: `No such tool available: mcp__${server}__${tool}`, data: null };
   }
+  const permissionId = `req_${randomUUID()}`;
+  const permission = new Promise<Record<string, unknown>>((settle) =>
+    awaiting.set(permissionId, settle),
+  );
+  send({
+    type: "control_request",
+    request_id: permissionId,
+    request: {
+      subtype: "can_use_tool",
+      tool_name: `mcp__${server}__${tool}`,
+      input,
+      tool_use_id: `toolu_${randomUUID()}`,
+      mcp_server: { name: server, source: "sdk" },
+    },
+  });
+  const decision = ((await permission).response ?? {}) as { behavior?: string };
+  if (decision.behavior !== "allow") {
+    return { isError: true, text: `Permission to use mcp__${server}__${tool} denied`, data: null };
+  }
   const requestId = `req_${randomUUID()}`;
   const response = await new Promise<ControlResponse>((answered) => {
     pendingControl.set(requestId, answered);
@@ -456,7 +476,7 @@ async function answer(prompt: string): Promise<void> {
         if (!step.mayFail) throw error;
       }
     } else if ("mcpCall" in step) {
-      const { server = "bridge", tool, arguments: input = {}, saveAs } = step.mcpCall;
+      const { server = "codex_claude_bridge", tool, arguments: input = {}, saveAs } = step.mcpCall;
       const result = await callMcpTool(server, tool, fill(input) as Record<string, unknown>);
       if (saveAs) {
         saved.set(saveAs, result);

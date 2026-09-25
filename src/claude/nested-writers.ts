@@ -6,8 +6,12 @@ import {
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-/** The name of the in-process MCP server; Claude sees its tools as `mcp__bridge__<tool>`. */
-export const nestedWriterServerName = "bridge";
+/**
+ * The name of the in-process MCP server; Claude sees its tools as
+ * `mcp__codex_claude_bridge__<tool>`. The configuration reserves it, so no
+ * configured server shares it and its tools never wait for approval.
+ */
+export const nestedWriterServerName = "codex_claude_bridge";
 
 /** The part of a writing task an executor hands to a nested writer. */
 export interface NestedWriterBrief {
