@@ -87,6 +87,7 @@ Use `bun run <name>` to invoke these package scripts. They run Node or the local
 | `test`                           | All Vitest unit and integration tests                                   |
 | `test:unit` / `test:integration` | One Vitest test category                                                |
 | `test:e2e`                       | Build a fresh temporary bundle and run Playwright process tests         |
+| `smoke`                          | Opt-in check against the installed Claude Code (see Test boundaries)    |
 | `check`                          | Formatting, lint, types, build verification, Vitest, then Playwright    |
 | `hooks:install`                  | Install or refresh the Git hook dispatcher                              |
 | `hooks:check`                    | Verify real Git commits in a disposable repository                      |
@@ -96,12 +97,14 @@ The CLI accepts `--help`, `--version`, `mcp` (the stdio MCP entry point), and `s
 ## Test boundaries
 
 - `tests/unit/**/*.test.ts`: argument parsing, Claude Code version compatibility, and diagnostic redaction.
-- `tests/integration/**/*.test.ts`: the public MCP boundary. `tests/support/bridge.ts` gives each test a temporary state directory and launches the real MCP entry point and background service as subprocesses, with real SQLite. `tests/fixtures/fake-claude.ts` replaces the Claude Code executable: it speaks the Agent SDK's stream-json control protocol and follows a per-test scenario, so the real SDK and adapter run without credentials or model calls. Publication tests use a local bare repository as `origin` and put `tests/fixtures/fake-gh.ts`, which keeps pull requests in a JSON file, first on the service `PATH` as `gh`.
+- `tests/integration/**/*.test.ts`: the public MCP boundary. `tests/support/bridge.ts` gives each test a temporary state directory and launches the real MCP entry point and background service as subprocesses, with real SQLite. `tests/fixtures/fake-claude.ts` replaces the Claude Code executable: it speaks the Agent SDK's stream-json control protocol and follows a per-test scenario, so the real SDK and adapter run without credentials or model calls. Publication tests use a local bare repository as `origin` and put `tests/fixtures/fake-gh.ts`, which keeps pull requests in a JSON file, first on the service `PATH` as `gh`. `acceptance.test.ts` runs one parent-agent session across these features, as the delegation skill instructs it.
 - `tests/e2e/**/*.e2e.ts`: Playwright Test launches the built CLI outside the source checkout, and runs the plugin as Codex installs it: copied without `node_modules`, launched from its `.mcp.json`.
 
 Vitest and Playwright have separate discovery patterns. Full suites fail when no tests are found, focused tests are forbidden, and retries are disabled for E2E. There are no browser fixtures, so `playwright install` and OS browser libraries are unnecessary. If actual browser behavior is added later, document the required browser and install it explicitly in local setup and CI.
 
 All automated tests work without Claude credentials, model calls, or GitHub mutations. Tests stop the service processes they start; a test's state directory is never the installed bridge's.
+
+`bun run smoke` is not part of any suite or CI. It checks the bridge against the installed Claude Code and your existing login, in a temporary state directory and Git repository: it starts the MCP entry point as Codex does, checks readiness, delegates a small read-only assignment with the cheapest model readiness offers, disconnects and finds the task again with a new client, reads the result, sends a follow-up, and prints a pass or fail line per step without credentials or Claude's output. It uses subscription usage for two short turns. Then it stops the service it started and removes its temporary directories. `--readiness-only` stops after readiness and sends no prompt; `--bundle` launches `dist/cli.mjs` from `bun run build` instead of `src/cli.ts`; `--claude <path>` names the Claude Code executable when `claude` is not on the `PATH`.
 
 ## Commit checks
 
