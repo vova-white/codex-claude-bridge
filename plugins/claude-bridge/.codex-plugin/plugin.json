@@ -10,7 +10,7 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Claude Bridge",
-    "shortDescription": "Delegate read-only and writing tasks to Claude Code",
+    "shortDescription": "Delegate reviews and code changes, up to a pull request, to Claude Code",
     "developerName": "vova-white",
     "category": "Coding",
     "capabilities": ["Read", "Write"]
