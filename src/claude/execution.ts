@@ -57,7 +57,8 @@ export const reportedResult = z.object({
   failures: z.array(z.string()).describe("Anything that failed or could not be verified."),
   remainingWork: z.array(z.string()).describe("Work left for the parent agent."),
 });
-const resultSchema = z.toJSONSchema(reportedResult);
+// Claude Code validates --json-schema with a draft-07 validator.
+const resultSchema = z.toJSONSchema(reportedResult, { target: "draft-7" });
 
 const accountErrors = new Set<SDKAssistantMessageError>([
   "authentication_failed",
