@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { ServiceConnection } from "../ipc.ts";
 import { connectService } from "../service/launcher.ts";
 import {
+  cleanupSchema,
   followUpSchema,
   outputSchema,
   resultSchema,
@@ -152,6 +153,22 @@ export async function runMcpServer(paths: StatePaths, cliPath: string): Promise<
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
     (args) => call("cancel_task", args),
+  );
+  server.registerTool(
+    "cleanup_task",
+    {
+      title: "Clean up a writing task's worktree and branch",
+      description:
+        "Release a writing task's disposable resources: remove its worktree and, with scope all (default), delete its task branch; scope worktree keeps the branch. Nothing else is touched: not your checkout, other worktrees, remotes, or the task's results and session. Refuses (outcome refused, with refusals giving each code and reason) while an execution is queued or running (active_execution), when the worktree has uncommitted or untracked changes (uncommitted_changes), or with scope all when the branch has commits no other branch, tag, remote-tracking ref, or the checkout's HEAD contains (unintegrated_commits); a refusal removes nothing. discardUnintegrated: true is the explicit decision to delete such changes and commits. dryRun reports the plan (action remove, keep, or already_removed per resource) without acting. Otherwise outcome is cleaned, or partial with failures per resource; workspace.state becomes removed or branch_kept, and follow-ups to the task are refused from then on. Safe to repeat.",
+      inputSchema: cleanupSchema.shape,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    (args) => call("cleanup_task", args),
   );
 
   // Codex closing stdin ends this entry point; the service and its work continue.

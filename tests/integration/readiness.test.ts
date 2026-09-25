@@ -63,6 +63,7 @@ describe("readiness", () => {
       "read_output",
       "send_followup",
       "cancel_task",
+      "cleanup_task",
     ]);
     expect(report.git.project.root).toBe(process.cwd());
     expect(existsSync(fixture.promptLog)).toBe(false);
