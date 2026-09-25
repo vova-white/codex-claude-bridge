@@ -4,6 +4,8 @@ export default defineConfig({
   fmt: {
     ignorePatterns: [
       "bun.lock",
+      // release-please writes it in its own Markdown style.
+      "CHANGELOG.md",
       "dist/**",
       "plugins/claude-bridge/dist/**",
       "test-results/**",

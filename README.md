@@ -59,6 +59,12 @@ codex plugin add claude-bridge@codex-claude-bridge
 
 Then [stop the service](#stopping-the-service) if it is running, so the next request starts the new version.
 
+### Versions
+
+The bridge follows [Semantic Versioning](https://semver.org), and [`CHANGELOG.md`](CHANGELOG.md) lists what changed in each version. Before 1.0, a breaking change raises the minor version (0.1 → 0.2) and everything else raises the patch version. A change is breaking when something that worked stops working after an update: the MCP tools' inputs, outputs, and errors that the delegation skill relies on, the CLI commands, `config.json`, or a state directory left by an earlier version.
+
+Every release is a Git tag `vX.Y.Z` with a GitHub release. To install a specific version, check out its tag before building, for example `git checkout v0.1.0`.
+
 ## Usage
 
 Ask Codex in plain words, for example:
