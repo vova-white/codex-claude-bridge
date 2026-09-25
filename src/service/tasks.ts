@@ -647,14 +647,16 @@ export class TaskService {
           },
           capacity: (waiting) => {
             const current = this.db
-              .prepare("SELECT reason FROM executions WHERE id = ?")
-              .get(executionId) as { reason: string | null };
-            if ((current.reason === "waiting_for_capacity") === Boolean(waiting)) return;
+              .prepare("SELECT reason, detail FROM executions WHERE id = ?")
+              .get(executionId) as { reason: string | null; detail: string | null };
+            const detail = waiting ? JSON.stringify(waiting) : null;
+            const unchanged = waiting
+              ? current.reason === "waiting_for_capacity" && current.detail === detail
+              : current.reason !== "waiting_for_capacity";
+            if (unchanged) return;
             const changed = this.update(
               executionId,
-              waiting
-                ? { reason: "waiting_for_capacity", detail: JSON.stringify(waiting) }
-                : { reason: null, detail: null },
+              waiting ? { reason: "waiting_for_capacity", detail } : { reason: null, detail: null },
             );
             if (changed) {
               this.record(
