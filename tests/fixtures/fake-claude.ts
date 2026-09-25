@@ -42,6 +42,8 @@ export interface Scenario {
   mcpStatus?: Record<string, { status: string; error?: string }>;
   settingsMcpServers?: { name: string; status: string; scope: string }[];
   turns?: Turn[];
+  /** Delays the answer to the SDK's initialize request until this file exists. */
+  initializeWaitFor?: string;
 }
 
 const scenarioPath = process.env.FAKE_CLAUDE_SCENARIO;
@@ -219,18 +221,27 @@ lines.on("line", (line) => {
   const { request_id: requestId, request } = message;
   switch (request.subtype) {
     case "initialize":
-      respond(requestId, {
-        commands: [],
-        agents: [],
-        output_style: "default",
-        available_output_styles: ["default"],
-        models: scenario.models ?? [
-          { value: "default", displayName: "Default", description: "Recommended model" },
-          { value: "sonnet", displayName: "Sonnet", description: "Everyday model" },
-        ],
-        account: scenario.account ?? { subscriptionType: "Claude Max", apiProvider: "firstParty" },
-        pid: process.pid,
-      });
+      void (
+        scenario.initializeWaitFor
+          ? waitForFile(resolve(scenarioDir, scenario.initializeWaitFor))
+          : Promise.resolve()
+      ).then(() =>
+        respond(requestId, {
+          commands: [],
+          agents: [],
+          output_style: "default",
+          available_output_styles: ["default"],
+          models: scenario.models ?? [
+            { value: "default", displayName: "Default", description: "Recommended model" },
+            { value: "sonnet", displayName: "Sonnet", description: "Everyday model" },
+          ],
+          account: scenario.account ?? {
+            subscriptionType: "Claude Max",
+            apiProvider: "firstParty",
+          },
+          pid: process.pid,
+        }),
+      );
       break;
     case "mcp_status":
       respond(requestId, {

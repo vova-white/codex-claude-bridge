@@ -3,6 +3,7 @@ import {
   type SDKAssistantMessageError,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 import { redact } from "../redact.ts";
 import { classifyCredentials, credentialAction, withTimeout } from "./readiness.ts";
 
@@ -46,29 +47,13 @@ export type ExecutionOutcome =
     };
 
 /** The shape Claude Code must return its final answer in. */
-export const resultSchema = {
-  type: "object",
-  properties: {
-    summary: { type: "string", description: "The answer or outcome of the assignment." },
-    evidence: {
-      type: "array",
-      items: { type: "string" },
-      description: "What was inspected or run, and what it showed.",
-    },
-    failures: {
-      type: "array",
-      items: { type: "string" },
-      description: "Anything that failed or could not be verified.",
-    },
-    remainingWork: {
-      type: "array",
-      items: { type: "string" },
-      description: "Work left for the parent agent.",
-    },
-  },
-  required: ["summary", "evidence", "failures", "remainingWork"],
-  additionalProperties: false,
-};
+export const reportedResult = z.object({
+  summary: z.string().describe("The answer or outcome of the assignment."),
+  evidence: z.array(z.string()).describe("What was inspected or run, and what it showed."),
+  failures: z.array(z.string()).describe("Anything that failed or could not be verified."),
+  remainingWork: z.array(z.string()).describe("Work left for the parent agent."),
+});
+const resultSchema = z.toJSONSchema(reportedResult);
 
 const accountErrors = new Set<SDKAssistantMessageError>([
   "authentication_failed",

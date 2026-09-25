@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
-import { runExecution, type ExecutionOutcome } from "../claude/execution.ts";
+import { reportedResult, runExecution, type ExecutionOutcome } from "../claude/execution.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
+import { redact } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import { changedPaths, checkoutState, repositoryRoot } from "../workspace.ts";
@@ -25,13 +26,6 @@ export type StartRequest = z.infer<typeof startSchema>;
 const taskLookup = z.object({ project: z.string().min(1), taskId: z.string().min(1) });
 const resultLookup = taskLookup.extend({ executionId: z.string().min(1).optional() });
 const projectLookup = z.object({ project: z.string().min(1) });
-
-const structuredResult = z.object({
-  summary: z.string(),
-  evidence: z.array(z.string()),
-  failures: z.array(z.string()),
-  remainingWork: z.array(z.string()),
-});
 
 /** Tools a read-only task never gets: file editing and, until nested work is supported, subagents. */
 const readOnlyDisallowedTools = ["Edit", "Write", "NotebookEdit", "Agent"];
@@ -365,32 +359,36 @@ export class TaskService {
       );
     }
     const endedAt = now();
+    const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
+    const violation =
+      modifiedFiles.length > 0
+        ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
+        : [];
     if (outcome.status === "failed") {
       this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
         detail: outcome.detail ? JSON.stringify(outcome.detail) : null,
         error: JSON.stringify({
-          message: outcome.message,
+          message: [outcome.message, ...violation].join(" "),
           ...(outcome.action ? { action: outcome.action } : {}),
+          ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
         }),
         ended_at: endedAt,
       });
       return;
     }
-    const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
-    const parsed = structuredResult.safeParse(outcome.structured);
+    const parsed = reportedResult.safeParse(outcome.structured);
     const reported = parsed.success
       ? parsed.data
       : { summary: outcome.text, evidence: [], failures: [], remainingWork: [] };
+    // Claude can read configured credentials; they must not reach Codex through results.
+    const clean = (text: string) => redact(text, secrets);
     const result = {
-      ...reported,
-      failures: [
-        ...reported.failures,
-        ...(modifiedFiles.length > 0
-          ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
-          : []),
-      ],
+      summary: clean(reported.summary),
+      evidence: reported.evidence.map(clean),
+      failures: [...reported.failures.map(clean), ...violation],
+      remainingWork: reported.remainingWork.map(clean),
       workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles },
     };
     this.update(executionId, {

@@ -100,22 +100,22 @@ describe("read-only delegated tasks", () => {
     for (const tool of ["Edit", "Write", "NotebookEdit", "Agent"]) expect(args).toContain(tool);
   });
 
-  it("returns the same task for a retried start, across reconnects, and rejects conflicting reuse", async () => {
+  it("returns the same task when a start response is lost, and rejects conflicting reuse", async () => {
     const fixture = bridge({
       scenario: { turns: [{ steps: [{ waitFor: "go" }, finished("Summarized.")] }] },
     });
     const project = fixture.createRepository();
     const first = await fixture.connect();
-    const original = await start(first, assignment(project));
+    // The caller gives up on the call: the task is accepted and launched, but the response is never read.
+    void first.call("start_task", assignment(project)).catch(() => {});
+    await waitFor(() => fixture.launches().length === 1 || undefined);
     await first.close();
 
     const second = await fixture.connect();
     const retried = await start(second, assignment(project));
-    expect(retried).toMatchObject({
-      taskId: original.taskId,
-      executionId: original.executionId,
-      created: false,
-    });
+    expect(retried).toMatchObject({ created: false });
+    const again = await start(second, assignment(project));
+    expect(again).toEqual(retried);
     const conflict = await second.call(
       "start_task",
       assignment(project, { assignment: "Something else." }),
@@ -124,9 +124,28 @@ describe("read-only delegated tasks", () => {
     expect(conflict.text).toContain("review-1");
 
     fixture.release("go");
-    await statusWhen(second, project, original.taskId, terminal);
+    await statusWhen(second, project, retried.taskId, terminal);
     expect(fixture.prompts()).toHaveLength(1);
     expect(fixture.launches()).toHaveLength(1);
+  });
+
+  it("persists accepted intent before Claude Code answers, and keeps it after the service dies", async () => {
+    const fixture = bridge({ scenario: { initializeWaitFor: "never" } });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+    await waitFor(() => fixture.launches().length === 1 || undefined);
+
+    const pid = fixture.servicePid()!;
+    process.kill(pid, "SIGKILL");
+    await waitFor(() => !isAlive(pid) || undefined);
+    const reconnected = await fixture.connect();
+    const status = (await reconnected.call("task_status", { project, taskId })).data;
+    expect(status).toMatchObject({
+      status: "interrupted",
+      request: { assignment: "Summarize the README.", expectedResult: "A one-line summary." },
+    });
+    expect(fixture.prompts()).toEqual([]);
   });
 
   it("creates one task for concurrent submissions of the same request", async () => {
@@ -174,6 +193,57 @@ describe("read-only delegated tasks", () => {
     expect((await stranger.call("task_status", { project, taskId })).isError).toBe(true);
     expect((await codex.call("task_result", { project: other, taskId })).isError).toBe(true);
     expect((await codex.call("list_tasks", { project })).data.tasks).toHaveLength(1);
+  });
+
+  it("keeps configured credentials out of task results", async () => {
+    const fixture = bridge({
+      config: {
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-RESULTSECRET" } } },
+      },
+      scenario: {
+        turns: [
+          {
+            steps: [
+              {
+                result: {
+                  structured: {
+                    summary: "The token is tok-RESULTSECRET.",
+                    evidence: ["env TOKEN=tok-RESULTSECRET"],
+                    failures: [],
+                    remainingWork: [],
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+    await statusWhen(client, project, taskId, terminal);
+
+    const result = await client.call("task_result", { project, taskId });
+    expect(result.data.result.summary).toContain("[REDACTED]");
+    expect(result.text).not.toContain("RESULTSECRET");
+  });
+
+  it("reports checkout changes when the execution fails", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          { steps: [{ writeFile: { path: "notes.txt", content: "x" } }, { exit: { code: 1 } }] },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+
+    const status = await statusWhen(client, project, taskId, terminal);
+    expect(status).toMatchObject({ status: "failed", error: { modifiedFiles: ["notes.txt"] } });
+    expect(status.error.message).toContain("notes.txt");
   });
 
   it("reports files a read-only task changed in the shared checkout", async () => {
@@ -297,7 +367,7 @@ describe("read-only delegated tasks", () => {
     const project = fixture.createRepository();
     const client = await fixture.connect();
     const { taskId } = await start(client, assignment(project));
-    await statusWhen(client, project, taskId, (status) => status.status === "running");
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
 
     const pid = fixture.servicePid()!;
     process.kill(pid, "SIGKILL");
