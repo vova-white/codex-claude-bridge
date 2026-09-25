@@ -1708,6 +1708,19 @@ export class TaskService {
       );
     }
     const answers = asked.map((question) => response.answers[question]!);
+    // Claude Code looks answers up by the original question text, so one text gets one answer.
+    const texts = (
+      (JSON.parse(request.payload) as { questions?: { question?: unknown }[] }).questions ?? []
+    ).map((item) => item.question);
+    texts.forEach((text, index) => {
+      const earlier = texts.indexOf(text);
+      if (earlier < index && answers[earlier] !== answers[index]) {
+        throw new ServiceError(
+          "conflicting_answers",
+          `${JSON.stringify(asked[earlier])} and ${JSON.stringify(asked[index])} are the same question to Claude Code, which takes one answer per question text; give both the same answer.`,
+        );
+      }
+    });
     return {
       given: {
         answers: Object.fromEntries(asked.map((question, index) => [question, answers[index]])),
