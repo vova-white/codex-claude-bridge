@@ -158,7 +158,7 @@ describe("readiness", () => {
           },
           tracker: {
             type: "http",
-            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
+            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
             headers: { Authorization: "Bearer hdr-secret-123" },
           },
         },
@@ -168,7 +168,7 @@ describe("readiness", () => {
           tracker: {
             status: "failed",
             error:
-              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456",
+              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
           },
         },
         settingsMcpServers: [{ name: "docs", status: "connected", scope: "user" }],
@@ -190,6 +190,10 @@ describe("readiness", () => {
       "hdr-secret-123",
       "url-password-1",
       "url-token-456",
+      "private+sig",
+      "private sig",
+      "key%2fvalue",
+      "key/value",
     ]) {
       expect(JSON.stringify(report)).not.toContain(secret);
       expect(fixture.serviceLog()).not.toContain(secret);

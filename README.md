@@ -36,11 +36,11 @@ Codex launches `node dist/cli.mjs mcp` from the plugin. That MCP entry point kee
 
 The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (redacted diagnostics, rotated at 1 MB), and the optional `config.json`:
 
-| Key                | Meaning                                                                               |
-| ------------------ | ------------------------------------------------------------------------------------- |
-| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`               |
-| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`           |
-| `mcpServers`       | MCP servers Claude may use, in Claude Code's format; `env` and `headers` stay private |
+| Key                | Meaning                                                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`                                         |
+| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`                                     |
+| `mcpServers`       | MCP servers Claude may use, in Claude Code's format; `env`, `headers`, `args`, and URL credentials stay private |
 
 The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
 

@@ -33,6 +33,6 @@ When readiness fails, report the problems and their actions to the user instead 
 
 - `claudeExecutable`: absolute path to Claude Code when `claude` is not on the service `PATH`.
 - `claudeConfigDir`: a separate Claude Code configuration directory (sets `CLAUDE_CONFIG_DIR`).
-- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. The bridge never echoes their `env` or `headers` values.
+- `mcpServers`: MCP servers Claude may use, in Claude Code's `mcpServers` format. The bridge never echoes their `env`, `headers`, or `args` values or the credentials and query strings of their URLs.
 
 The service reads the file on every check, so edits apply without a restart.
