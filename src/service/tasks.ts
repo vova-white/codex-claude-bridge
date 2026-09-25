@@ -1737,7 +1737,12 @@ function shownChecks(page: ShownPart[], stored: Check[]) {
   });
 }
 
-/** Reads parts from a position, returning at most `budget` characters and where to continue. */
+/**
+ * Reads parts from a position, returning at most `budget` characters and where
+ * to continue. A part's SHA and outcome count against the budget too, so many
+ * short parts, such as commits with one-word subjects, cannot overflow a page.
+ * A page always holds at least one character, so reading always advances.
+ */
 function readParts(parts: ResultPart[], start: number, offset: number, budget: number) {
   const page: ShownPart[] = [];
   let remaining = budget;
@@ -1745,8 +1750,12 @@ function readParts(parts: ResultPart[], start: number, offset: number, budget: n
     const from = part === start ? offset : 0;
     const whole = parts[part]!;
     const text = whole.text.slice(from);
-    if (remaining === 0) return { parts: page, next: { part, offset: from } };
-    const shown = text.slice(0, remaining);
+    const extra = (whole.sha?.length ?? 0) + (whole.outcome?.length ?? 0);
+    if (remaining === 0 || (page.length > 0 && remaining <= extra)) {
+      return { parts: page, next: { part, offset: from } };
+    }
+    remaining = Math.max(0, remaining - extra);
+    const shown = text.slice(0, Math.max(remaining, page.length === 0 ? 1 : 0));
     page.push({
       ...whole,
       text: shown,

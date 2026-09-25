@@ -239,6 +239,47 @@ describe("writing tasks", () => {
     await expectPaged(started.data.taskId, cancelled.text);
   });
 
+  it("count commit SHAs against the page size of a failed execution's changes", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            {
+              exec: [
+                "sh",
+                "-c",
+                `for i in $(seq 1 120); do
+                   git -c user.name=Child -c user.email=child@example.invalid commit -q --allow-empty -m x
+                 done`,
+              ],
+            },
+            { exit: { code: 1 } },
+          ],
+        },
+      ],
+    });
+    const failed = await run(client, writeTask(project));
+    expect(failed.status.status).toBe("failed");
+
+    const shas: string[] = [];
+    let next: object | undefined = {};
+    while (next) {
+      const page = await client.call("task_result", {
+        project,
+        taskId: failed.taskId,
+        maxChars: 200,
+        ...next,
+      });
+      expect(page.text.length).toBeLessThan(2_500);
+      const items: { sha?: string; field?: string }[] =
+        page.data.workspace?.commits ??
+        page.data.parts.filter((part: { field: string }) => part.field === "commits");
+      shas.push(...items.map((item) => item.sha!));
+      next = page.data.truncated?.next;
+    }
+    expect(new Set(shas).size).toBe(120);
+  });
+
   it("refuse writing options on read-only tasks", async () => {
     const { project, client } = await setUp({ turns: [{ steps: [finished("Done.")] }] });
     const refused = await client.call("start_task", {
