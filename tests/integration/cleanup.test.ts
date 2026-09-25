@@ -227,6 +227,83 @@ describe("task cleanup", () => {
     expect(branchExists(project, workspace.branch)).toBe(false);
   });
 
+  it("refuses to drop commits the worktree holds on a detached HEAD", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        {
+          steps: [
+            { exec: ["git", "checkout", "--quiet", "--detach"] },
+            ...commit("detached.txt"),
+            finished("Done."),
+          ],
+        },
+      ],
+    });
+    const { taskId, workspace } = await run(client, project, "Commit detached.");
+    const detached = git(workspace.path, "rev-parse", "HEAD");
+
+    for (const scope of ["all", "worktree"]) {
+      const refused = await cleanup(client, project, taskId, { scope });
+      expect(refused).toMatchObject({
+        outcome: "refused",
+        worktree: { action: "keep", uncommittedChanges: false, unintegratedCommits: 1 },
+        refusals: [{ code: "unintegrated_commits" }],
+      });
+      expect(refused.refusals[0].message).toContain("detached HEAD");
+    }
+    expect(existsSync(workspace.path)).toBe(true);
+
+    git(project, "branch", "keep-detached", detached);
+    expect(await cleanup(client, project, taskId)).toMatchObject({
+      outcome: "cleaned",
+      worktree: { action: "removed", unintegratedCommits: 0 },
+    });
+  });
+
+  it("keeps a commit that two task branches share, whether cleaned up one after another or at once", async () => {
+    const { project, client } = await setUp({
+      turns: [
+        { match: "Share one", steps: [...commit("one.txt"), finished("Shared.")] },
+        { match: "Share two", steps: [...commit("two.txt"), finished("Shared.")] },
+        { steps: [finished("Reused.")] },
+      ],
+    });
+    const pair = async (name: string) => {
+      const owner = await run(client, project, `Share ${name}.`);
+      const started = await client.call("start_task", {
+        project,
+        requestKey: `reuse-${name}`,
+        mode: "write",
+        assignment: `Reuse ${name}.`,
+        expectedResult: "Nothing.",
+        baseline: owner.workspace.branch,
+      });
+      await client.call("wait_task", { project, taskId: started.data.taskId, timeoutSeconds: 30 });
+      const { workspace } = (
+        await client.call("task_status", { project, taskId: started.data.taskId })
+      ).data;
+      const shared = git(project, "rev-parse", owner.workspace.branch);
+      expect(git(project, "rev-parse", workspace.branch)).toBe(shared);
+      return { shared, tasks: [owner.taskId, started.data.taskId as string] };
+    };
+
+    const sequential = await pair("one");
+    const first = await cleanup(client, project, sequential.tasks[0]!);
+    const second = await cleanup(client, project, sequential.tasks[1]!);
+    expect([first.outcome, second.outcome]).toEqual(["cleaned", "refused"]);
+    expect(second.refusals).toMatchObject([{ code: "unintegrated_commits" }]);
+
+    const concurrent = await pair("two");
+    const reports = await Promise.all(
+      concurrent.tasks.map((taskId) => cleanup(client, project, taskId)),
+    );
+    expect(reports.map((report) => report.outcome).toSorted()).toEqual(["cleaned", "refused"]);
+
+    for (const { shared } of [sequential, concurrent]) {
+      expect(git(project, "branch", "--contains", shared)).not.toBe("");
+    }
+  });
+
   it("refuses while an execution is active, whatever the caller decides", async () => {
     const { fixture, project, client } = await setUp({
       turns: [{ steps: [{ waitFor: "never" }] }],

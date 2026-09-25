@@ -45,7 +45,7 @@ Call `cleanup_task` with `project`, `taskId`, and `scope`: `all` (default) remov
 
 `outcome` is one of:
 
-- `refused`: nothing was removed. `refusals` gives each reason: `active_execution` (wait for or cancel the task first), `uncommitted_changes` in the worktree, or `unintegrated_commits` on the branch with scope `all`. Integrate the work (merge or push the branch, commit the changes), use scope `worktree` to keep the branch, or, only when the user has decided the work is not wanted, repeat with `discardUnintegrated: true` to delete it. Never pass that on your own judgment.
+- `refused`: nothing was removed. `refusals` gives each reason: `active_execution` (wait for or cancel the task first), `uncommitted_changes` in the worktree, or `unintegrated_commits`: commits no other branch, tag, remote-tracking ref, or your checkout's HEAD contains, either at the worktree's HEAD (for example a detached HEAD, reported as `worktree.unintegratedCommits`) or, with scope `all`, on the task branch. Another task branch at the same commits counts only while it exists: cleanups of one repository run one at a time, so the last branch holding them is refused. Integrate the work (merge or push the branch, commit the changes), use scope `worktree` to keep the branch, or, only when the user has decided the work is not wanted, repeat with `discardUnintegrated: true` to delete it. Never pass that on your own judgment.
 - `planned`: a dry run found nothing blocking.
 - `cleaned`: every planned resource is gone.
 - `partial`: some removals failed; `failures` names each resource and how Git failed. Call `cleanup_task` again later; resources already gone are reported as `already_removed`.

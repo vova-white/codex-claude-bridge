@@ -171,18 +171,32 @@ export async function registeredWorktrees(root: string): Promise<string[]> {
     .map((line) => line.slice("worktree ".length));
 }
 
+/** The commit a checkout's HEAD names, and its branch unless HEAD is detached. */
+export async function checkoutHead(path: string): Promise<{ commit: string; branch?: string }> {
+  const commit = (await git(path, "rev-parse", "--verify", "HEAD")).trim();
+  const branch = (
+    await git(path, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "")
+  ).trim();
+  return { commit, ...(branch ? { branch } : {}) };
+}
+
 /**
- * How many commits of a branch no other branch, tag, remote-tracking ref, or
- * the checkout's HEAD contains: the work that deleting the branch would lose.
+ * How many commits reachable from `tip` no branch, tag, remote-tracking ref, or
+ * the checkout's HEAD contains, leaving out the branch `deleting`: the work that
+ * removing `tip` and deleting that branch would lose.
  */
-export async function unintegratedCommits(root: string, branch: string): Promise<number> {
+export async function unintegratedCommits(
+  root: string,
+  tip: string,
+  deleting?: string,
+): Promise<number> {
   const count = await git(
     root,
     "rev-list",
     "--count",
-    `refs/heads/${branch}`,
+    tip,
     "--not",
-    `--exclude=${branch}`,
+    ...(deleting ? [`--exclude=${deleting}`] : []),
     "--branches",
     "--remotes",
     "--tags",

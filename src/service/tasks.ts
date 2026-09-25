@@ -19,6 +19,7 @@ import {
   addWorktree,
   branchTypes,
   changedPaths,
+  checkoutHead,
   checkoutState,
   deleteBranch,
   hasUncommittedChanges,
@@ -188,7 +189,7 @@ export const cleanupSchema = z.object({
     .boolean()
     .default(false)
     .describe(
-      "Explicit decision to discard the worktree's uncommitted and untracked changes and, with scope all, task-branch commits no other branch, tag, or remote-tracking ref contains. Without it, cleanup refuses rather than lose them.",
+      "Explicit decision to discard the worktree's uncommitted and untracked changes, and commits no ref that cleanup keeps contains: at the worktree's HEAD (such as a detached HEAD) and, with scope all, on the task branch. Without it, cleanup refuses rather than lose them.",
     ),
 });
 /** Workspace states after cleanup removed the worktree; follow-ups cannot run in them. */
@@ -333,6 +334,8 @@ export class TaskService {
   private readonly launching = new Set<string>();
   /** Tasks whose worktree or branch cleanup_task is removing. */
   private readonly cleaning = new Set<string>();
+  /** The latest cleanup of each project, which the next one waits for. */
+  private readonly cleanups = new Map<string, Promise<void>>();
 
   constructor(
     db: DatabaseSync,
@@ -756,8 +759,8 @@ export class TaskService {
    * reports resources that are already gone.
    */
   async cleanup(caller: string, params: unknown) {
-    const { project, taskId, scope, dryRun, discardUnintegrated } = parse(cleanupSchema, params);
-    const task = await this.task(caller, project, taskId);
+    const request = parse(cleanupSchema, params);
+    const task = await this.task(caller, request.project, request.taskId);
     const workspace = this.workspace(task.id);
     if (!workspace) {
       throw new ServiceError(
@@ -765,17 +768,51 @@ export class TaskService {
         `Task ${task.id} is a read-only task on the shared checkout; it owns no worktree or branch to clean up.`,
       );
     }
+    // One cleanup per repository at a time: task branches may contain each
+    // other's commits, so each decision must see the refs earlier ones removed.
+    const previous = this.cleanups.get(task.project) ?? Promise.resolve();
+    const current = previous.then(() => this.cleanWorkspace(task, workspace, request));
+    const settled = current.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.cleanups.set(task.project, settled);
+    void settled.then(() => {
+      if (this.cleanups.get(task.project) === settled) this.cleanups.delete(task.project);
+    });
+    return current;
+  }
+
+  private async cleanWorkspace(
+    task: TaskRow,
+    workspace: WorkspaceRow,
+    { scope, dryRun, discardUnintegrated }: z.infer<typeof cleanupSchema>,
+  ) {
     const root = task.project;
     const { path, branch } = workspace;
     const worktreePresent = await this.worktreeRegistered(root, path);
+    const worktreeFiles = worktreePresent && existsSync(path);
     // undefined: Git could not tell, which counts as work that might be lost.
-    const uncommittedChanges =
-      worktreePresent && existsSync(path)
-        ? await hasUncommittedChanges(path).catch(() => undefined)
-        : false;
+    const uncommittedChanges = worktreeFiles
+      ? await hasUncommittedChanges(path).catch(() => undefined)
+      : false;
+    const head = worktreeFiles ? await checkoutHead(path).catch(() => undefined) : undefined;
+    // Commits only the worktree's HEAD holds, as on a detached HEAD, go with the
+    // worktree. The task branch counts as keeping them only if cleanup keeps it.
+    const headUnintegrated = !worktreeFiles
+      ? 0
+      : head === undefined
+        ? undefined
+        : head.branch === branch
+          ? 0
+          : await unintegratedCommits(
+              root,
+              head.commit,
+              scope === "all" ? branch : undefined,
+            ).catch(() => undefined);
     const branchPresent = (await resolveCommit(root, `refs/heads/${branch}`)) !== undefined;
     const unintegrated = branchPresent
-      ? await unintegratedCommits(root, branch).catch(() => undefined)
+      ? await unintegratedCommits(root, `refs/heads/${branch}`, branch).catch(() => undefined)
       : 0;
 
     // Checked after inspecting Git, together with claiming the task, so no execution starts in between.
@@ -791,16 +828,18 @@ export class TaskService {
         message: `Execution ${execution.id} of the task is ${execution.status}. Wait for it to finish or cancel it with cancel_task first.`,
       });
     }
-    if (this.cleaning.has(task.id)) {
-      refusals.push({
-        code: "cleanup_in_progress",
-        message: "Another cleanup of this task is in progress; call cleanup_task again after it.",
-      });
-    }
     if (worktreePresent && uncommittedChanges !== false && !discardUnintegrated) {
       refusals.push({
         code: "uncommitted_changes",
         message: `${uncommittedChanges ? `The worktree at ${path} has` : `Git could not check the worktree at ${path} for`} uncommitted or untracked changes. Commit what should be kept to ${branch} or copy it elsewhere, or pass discardUnintegrated: true to delete the changes.`,
+      });
+    }
+    if (headUnintegrated !== 0 && !discardUnintegrated) {
+      refusals.push({
+        code: "unintegrated_commits",
+        message: head
+          ? `${headUnintegrated ?? "Some"} commit(s) at the ${head.branch ? "HEAD" : "detached HEAD"} ${head.commit} of the worktree at ${path} are not contained in any branch, tag, remote-tracking ref, or the checkout's HEAD that cleanup keeps. Create a branch or tag at ${head.commit}, or pass discardUnintegrated: true to delete them.`
+          : `Git could not read the HEAD of the worktree at ${path}, so commits only it holds could be lost. Pass discardUnintegrated: true to remove the worktree anyway.`,
       });
     }
     if (scope === "all" && branchPresent && unintegrated !== 0 && !discardUnintegrated) {
@@ -827,6 +866,7 @@ export class TaskService {
         path,
         action: worktreeAction,
         ...(worktreePresent ? { uncommittedChanges } : {}),
+        ...(worktreeFiles ? { unintegratedCommits: headUnintegrated } : {}),
       },
       branch: {
         name: branch,
