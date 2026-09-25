@@ -35,7 +35,15 @@ test("the plugin copied into a Codex cache reaches the service through its MCP e
     expect(result.isError).toBe(false);
     expect(result.data).toMatchObject({
       ready: true,
-      operations: ["readiness", "start_task", "list_tasks", "task_status", "task_result"],
+      operations: [
+        "readiness",
+        "start_task",
+        "list_tasks",
+        "task_status",
+        "task_result",
+        "wait_task",
+        "read_output",
+      ],
     });
   } finally {
     await fixture.cleanup();

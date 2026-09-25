@@ -1,6 +1,6 @@
 # Codex to Claude bridge
 
-A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout; writing tasks, waits, follow-ups, cancellation, and nested agents are not implemented yet.
+A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout, with bounded waits and cursor-based progress reads; writing tasks, follow-ups, cancellation, and nested agents are not implemented yet.
 
 ## Setup
 
@@ -45,6 +45,8 @@ The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-cl
 The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
 
 Delegated tasks are stored in `state.db` with their executions, provider session references, and results. Each task belongs to a project (the Git root realpath) and a logical caller: `$CODEX_CLAUDE_BRIDGE_CALLER`, default `codex`, which the plugin forwards from Codex's environment. A request key identifies a start request within that scope, so retries return the existing task. A task runs in the service, not the MCP connection, and continues when Codex disconnects. Before sending the brief, the service checks that the Claude Code session uses a verified subscription login and offers the requested model. When a new service starts, executions left running by its predecessor are reported as `interrupted`.
+
+Each execution's progress (status changes, Claude's messages, tool calls, and the final summary) is stored as numbered events for `read_output`. Diagnostics retention is bounded separately from results: an event keeps at most 16,000 characters, and an execution keeps its newest 2,000 events. A `wait_task` call lasts at most 300 s, below the plugin's 600 s MCP tool timeout.
 
 To stop the service, send `SIGTERM` to the PID in `service.json`. Running tasks are then reported as interrupted.
 
