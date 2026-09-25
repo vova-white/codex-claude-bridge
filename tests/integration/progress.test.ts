@@ -325,11 +325,14 @@ describe("waiting and progress", () => {
     const page = (await client.call("read_output", { project, taskId, limit: 1 })).data;
     expect(page.retention.prunedEvents).toBeGreaterThan(0);
     expect(page.events[0].seq).toBe(page.retention.firstAvailableSeq);
-    const notes = (await readAll(client, { project, taskId }, 200))
-      .map((event) => event.text)
-      .filter((text) => /^note \d+$/.test(text));
-    // The 2,000 kept events are the result event and the 1,999 notes before it.
-    expect(notes).toEqual(Array.from({ length: 1_999 }, (_, index) => `note ${51 + index}`));
+    const kept = (await readAll(client, { project, taskId }, 200)).map((event) => [
+      event.kind,
+      event.text,
+    ]);
+    expect(kept).toEqual([
+      ...Array.from({ length: 1_999 }, (_, index) => ["assistant", `note ${51 + index}`]),
+      ["result", "Survived."],
+    ]);
     const result = await client.call("task_result", { project, taskId });
     expect(result.data.result.summary).toBe("Survived.");
   });
