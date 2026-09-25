@@ -328,8 +328,8 @@ describe("waiting and progress", () => {
     const notes = (await readAll(client, { project, taskId }, 200))
       .map((event) => event.text)
       .filter((text) => /^note \d+$/.test(text));
-    expect(notes.length).toBeGreaterThan(1_900);
-    expect(notes).toEqual(notes.map((_, index) => `note ${2_050 - notes.length + index}`));
+    // The 2,000 kept events are the result event and the 1,999 notes before it.
+    expect(notes).toEqual(Array.from({ length: 1_999 }, (_, index) => `note ${51 + index}`));
     const result = await client.call("task_result", { project, taskId });
     expect(result.data.result.summary).toBe("Survived.");
   });
