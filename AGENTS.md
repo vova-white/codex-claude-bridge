@@ -42,8 +42,9 @@ The most common defect is a change that works on the path you tested and is miss
 - Comments describe how a thing is used and move with the code. They describe functions rather than annotate lines.
 - Claude's own content (assistant text, tool inputs, requests, nested summaries, commits, file names, results) passes through unchanged; diagnostics the bridge composes (readiness problems, execution `error`, `service.log`) use only known fields and never copy external text, secrets stay out of argv, and MCP responses never echo configured credentials. Masking Claude's content protects nothing on this single-user machine, where every agent can already read the same files.
 
-## Pull requests
+## Commits and pull requests
 
+- Add `Co-authored-by: Codex <codex@users.noreply.github.com>` after a blank line in commit messages for changes made by Codex. Preserve this trailer when squashing commits.
 - Make a PR only when the developer asks for one.
 - Conventional Commits titles in plain language: `fix(service): report interrupted executions after restart`.
 - Body: the problem in a sentence or two, then how you fixed it.
