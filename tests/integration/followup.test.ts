@@ -288,6 +288,28 @@ describe("cancellation", () => {
     expect(result.data.result.summary).toBe("Done.");
   }, 30_000);
 
+  it("reports a failed turn as cancelled when cancellation arrives before its process exits", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        {
+          steps: [
+            { ignoreTermination: true },
+            { result: { isError: true, subtype: "error_during_execution", errors: ["boom"] } },
+            { signal: "answered" },
+          ],
+        },
+      ],
+    });
+    await waitFor(() => fixture.signalled("answered") || undefined);
+
+    const cancelled = (await client.call("cancel_task", { project, taskId })).data;
+    expect(isAlive(fixture.launches()[0]!.pid)).toBe(false);
+    expect(cancelled).toMatchObject({
+      cancellation: "confirmed",
+      executions: [{ executionId: first, status: "cancelled", detail: { processExited: true } }],
+    });
+  }, 30_000);
+
   it("leaves a finished execution completed when cancellation arrives late", async () => {
     const { project, client, taskId, first } = await setUp({
       turns: [{ steps: [finished("Done.")] }],

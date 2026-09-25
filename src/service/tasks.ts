@@ -880,6 +880,10 @@ export class TaskService {
       modifiedFiles.length > 0
         ? [`The read-only task changed the shared checkout: ${modifiedFiles.join(", ")}.`]
         : [];
+    // Cancellation wins over a failure it raced, even after Claude Code has returned.
+    if (outcome.status === "failed" && signal.aborted) {
+      outcome = { status: "cancelled", processExited: outcome.processExited };
+    }
     if (outcome.status === "cancelled") {
       const cancelled = this.update(executionId, {
         status: "cancelled",
@@ -906,19 +910,19 @@ export class TaskService {
         status: "failed",
         reason: outcome.reason,
         detail:
-          outcome.detail || !outcome.processExited
+          outcome.detail || !outcome.processExited || modifiedFiles.length > 0
             ? JSON.stringify({
                 ...outcome.detail,
                 ...(outcome.processExited ? {} : { processExited: false }),
+                ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
               })
             : null,
         error: JSON.stringify({
           message:
             modifiedFiles.length > 0
-              ? `${outcome.message} The read-only task changed ${modifiedFiles.length} ${modifiedFiles.length === 1 ? "file" : "files"} in the shared checkout (see error.modifiedFiles).`
+              ? `${outcome.message} The read-only task changed ${modifiedFiles.length} ${modifiedFiles.length === 1 ? "file" : "files"} in the shared checkout (see detail.modifiedFiles).`
               : outcome.message,
           action: outcome.action,
-          ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
         }),
         ended_at: endedAt,
       });

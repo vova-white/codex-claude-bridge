@@ -198,10 +198,15 @@ export async function runExecution(
     action,
     ...(detail ? { detail } : {}),
   });
-  // The bridge keeps none of Claude Code's output; the user can read it in Claude Code itself.
+  // Failure diagnostics keep none of Claude Code's output; once a session exists,
+  // the user can read that output in Claude Code itself.
+  const fullOutput = () =>
+    `To see Claude Code's full output, run \`claude\` in ${request.cwd} and enter ${sessionId ? `\`/resume ${sessionId}\`` : "`/resume` and pick the task's session"}`;
+  const withFullOutput = (action: string) =>
+    sessionStarted ? `${action} ${fullOutput()}.` : action;
   const inspect = () =>
     sessionStarted
-      ? `Run \`claude\` in ${request.cwd} and enter ${sessionId ? `\`/resume ${sessionId}\`` : "`/resume` and pick the task's session"} to see Claude Code's full output, then start a new task with a new request key once the problem is fixed.`
+      ? `${fullOutput()}, then start a new task with a new request key once the problem is fixed.`
       : `Run \`claude\` in ${request.cwd} to see whether Claude Code starts and is signed in, then start a new task with a new request key.`;
   const session = query({
     prompt: input,
@@ -314,14 +319,16 @@ export async function runExecution(
             return failed(
               reason,
               description,
-              "Run `claude`, then `/login` with your Claude subscription account.",
+              withFullOutput("Run `claude`, then `/login` with your Claude subscription account."),
             );
           }
           if (reason === "subscription_limit") {
             return failed(
               reason,
               description,
-              "Wait until subscription capacity resets, then start a new task with a new request key.",
+              withFullOutput(
+                "Wait until subscription capacity resets, then start a new task with a new request key.",
+              ),
               typeof resetsAt === "number" && !Number.isNaN(new Date(resetsAt * 1000).getTime())
                 ? { resetsAt }
                 : undefined,
@@ -347,10 +354,14 @@ export async function runExecution(
       request.signal.removeEventListener("abort", cancel);
     }
   };
-  const outcome = await turn();
+  const settled = await turn();
   input.close();
   session.close();
   const processExited = await claude.stop();
   abort.abort();
+  // A cancellation that arrives while the bridge waits for Claude Code to exit
+  // still ends the execution as cancelled; a completed turn stays completed.
+  const outcome: TurnOutcome =
+    settled.status === "failed" && request.signal.aborted ? { status: "cancelled" } : settled;
   return { ...outcome, processExited };
 }

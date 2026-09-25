@@ -319,10 +319,10 @@ describe("read-only delegated tasks", () => {
     const status = await statusWhen(client, project, taskId, terminal);
     expect(status).toMatchObject({
       status: "failed",
-      error: { modifiedFiles: ["notes-[REDACTED].txt"] },
+      detail: { modifiedFiles: ["notes-[REDACTED].txt"] },
     });
     expect(status.error.message).toContain("changed 1 file");
-    expect(status.error.message).not.toContain("notes-");
+    expect(JSON.stringify(status.error)).not.toContain("notes-");
     expect(JSON.stringify(status)).not.toContain("FILESECRET");
   });
 
@@ -368,6 +368,7 @@ describe("read-only delegated tasks", () => {
     const status = await statusWhen(client, project, taskId, terminal);
     expect(status).toMatchObject({ status: "failed", reason: "authentication" });
     expect(status.error.action).toContain("ANTHROPIC_API_KEY");
+    expect(status.error.action).not.toContain("/resume");
     expect(fixture.prompts()).toEqual([]);
   });
 
@@ -460,10 +461,9 @@ describe("read-only delegated tasks", () => {
       expect(status.error.message).toContain(category);
       if (resets) expect(status.error.message).toContain(resets);
       expect(status.error.action).toContain(action);
-      if (action === "/resume") {
-        expect(status.error.action).toContain(`/resume ${status.sessionId}`);
-        expect(status.error.action).toContain(project);
-      }
+      // Claude Code started the session, so every action shows where to read its full output.
+      expect(status.error.action).toContain(`/resume ${status.sessionId}`);
+      expect(status.error.action).toContain(project);
       const result = await client.call("task_result", { project, taskId });
       expect(result.data).toMatchObject({ status: "failed", reason, result: null });
       for (const text of [
