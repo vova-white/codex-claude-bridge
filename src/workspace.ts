@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
@@ -41,22 +41,40 @@ export async function checkoutState(root: string): Promise<Map<string, string>> 
     const code = entry.slice(0, 2);
     const path = entry.slice(3);
     state.set(`worktree:${path}`, code);
-    if (existsSync(join(root, path))) changed.push(path);
+    // Directories (such as nested repositories) and symlinks are compared by status only.
+    if (isRegularFile(join(root, path))) changed.push(path);
     // Renames and copies are followed by their source path.
     if (code.includes("R") || code.includes("C")) index++;
   }
-  if (changed.length > 0) {
-    // Content hashes catch further edits to files that were already modified.
-    const hashes = await git(root, "hash-object", "--", ...changed).catch(() => "");
-    hashes
-      .trim()
-      .split("\n")
-      .forEach((hash, index) => {
-        const path = changed[index];
-        if (path) state.set(`worktree:${path}`, `${state.get(`worktree:${path}`)} ${hash}`);
-      });
+  // Content hashes catch further edits to files that were already modified.
+  for (const [path, hash] of await hashFiles(root, changed)) {
+    state.set(`worktree:${path}`, `${state.get(`worktree:${path}`)} ${hash}`);
   }
   return state;
+}
+
+function isRegularFile(path: string): boolean {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Hashes files in one batch, or one by one when a file cannot be read, skipping those. */
+async function hashFiles(root: string, paths: string[]): Promise<Map<string, string>> {
+  const hashes = new Map<string, string>();
+  if (paths.length === 0) return hashes;
+  try {
+    const output = (await git(root, "hash-object", "--", ...paths)).trim().split("\n");
+    paths.forEach((path, index) => hashes.set(path, output[index] ?? ""));
+  } catch {
+    for (const path of paths) {
+      const hash = await git(root, "hash-object", "--", path).catch(() => undefined);
+      if (hash !== undefined) hashes.set(path, hash.trim());
+    }
+  }
+  return hashes;
 }
 
 /** Paths whose index or working state differs between two snapshots, and HEAD if it moved. */

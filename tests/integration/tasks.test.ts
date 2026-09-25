@@ -271,6 +271,31 @@ describe("read-only delegated tasks", () => {
     expect(result.workspace.modifiedFiles).toEqual(["README.md"]);
   });
 
+  it("detects edits to modified files next to a nested repository", async () => {
+    const fixture = bridge({
+      scenario: {
+        turns: [
+          {
+            steps: [
+              { writeFile: { path: "README.md", content: "edited by the task\n" } },
+              finished("Done."),
+            ],
+          },
+        ],
+      },
+    });
+    const project = fixture.createRepository();
+    // An untracked nested repository shows as a directory in git status.
+    fixture.createRepository("repo/nested");
+    writeFileSync(join(project, "README.md"), "edited by the parent\n");
+    const client = await fixture.connect();
+    const { taskId } = await start(client, assignment(project));
+    await statusWhen(client, project, taskId, terminal);
+
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    expect(result.workspace.modifiedFiles).toEqual(["README.md"]);
+  });
+
   it("reports checkout changes when the execution fails", async () => {
     const fixture = bridge({
       scenario: {

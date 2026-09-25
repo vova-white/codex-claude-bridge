@@ -29,6 +29,7 @@ const migrations: string[] = [
     ended_at TEXT,
     UNIQUE (task_id, ordinal)
   )`,
+  "ALTER TABLE tasks RENAME COLUMN assignment TO request",
 ];
 
 export class StoreLockedError extends Error {}
