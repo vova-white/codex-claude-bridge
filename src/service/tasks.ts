@@ -688,10 +688,29 @@ export class TaskService {
       const { request, project } = this.db
         .prepare("SELECT request, project FROM tasks WHERE id = ?")
         .get(taskId) as { request: string; project: string };
+      const unreadable = (path: string) => {
+        this.log(`reconciling ${id}: Git could not read its worktree`);
+        const report = { ...done, recovery: { ...done.recovery, worktree: "unreadable" } };
+        this.update(id, { detail: JSON.stringify(report) }, "interrupted");
+        this.record(
+          id,
+          "status",
+          `Could not read the worktree at ${path} after the restart; inspect it with git directly.`,
+        );
+      };
       let workspace = this.workspace(taskId);
       if (workspace?.state === "pending") {
         const { path, branch } = workspace;
-        if (await this.registeredWorktree(project, path).catch(() => undefined)) {
+        // null: Git listed the project's worktrees without this one; undefined: Git failed.
+        const registered = await this.registeredWorktree(project, path).then(
+          (found) => found ?? null,
+          () => undefined,
+        );
+        if (registered === undefined) {
+          unreadable(path);
+          continue;
+        }
+        if (registered) {
           this.db
             .prepare(
               "UPDATE workspaces SET state = 'ready' WHERE task_id = ? AND state = 'pending'",
@@ -717,14 +736,7 @@ export class TaskService {
       }
       const changes = await listedChanges(workspace.path, workspace.baseline);
       if (!changes) {
-        this.log(`reconciling ${id}: Git could not read its worktree`);
-        const unreadable = { ...done, recovery: { ...done.recovery, worktree: "unreadable" } };
-        this.update(id, { detail: JSON.stringify(unreadable) }, "interrupted");
-        this.record(
-          id,
-          "status",
-          `Could not read the worktree at ${workspace.path} after the restart; inspect it with git directly.`,
-        );
+        unreadable(workspace.path);
         continue;
       }
       const publication =
