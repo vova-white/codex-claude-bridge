@@ -89,15 +89,12 @@ export function redactContent(text: string, secrets: readonly string[] = []): st
 }
 
 /**
- * An error's type, code, and stack frames without its message, for the service
- * log: a message can quote output of Claude Code, the SDK, or an MCP server.
+ * An error's type and code, for the service log. Neither its message nor its
+ * stack is used: both can quote output of Claude Code, the SDK, or an MCP server.
  */
 export function errorOrigin(error: unknown): string {
   if (!(error instanceof Error)) return `non-error value (${typeof error})`;
   const code = (error as NodeJS.ErrnoException).code;
-  const frames = (error.stack ?? "")
-    .split("\n")
-    .filter((line) => line.trimStart().startsWith("at "))
-    .slice(0, 12);
-  return [`${error.name}${code ? ` (${code})` : ""}`, ...frames].join("\n");
+  const name = /^\w{1,64}$/.test(error.name) ? error.name : "Error";
+  return typeof code === "string" && /^[A-Z0-9_]{1,64}$/.test(code) ? `${name} (${code})` : name;
 }

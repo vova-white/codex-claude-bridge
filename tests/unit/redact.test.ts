@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import { configSecrets, type BridgeConfig } from "../../src/config.ts";
-import { redact, redactContent } from "../../src/redact.ts";
+import { errorOrigin, redact, redactContent } from "../../src/redact.ts";
 
 function redactFor(url: string, message: string): string {
   const config: BridgeConfig = { mcpServers: { tracker: { type: "http", url } } };
@@ -63,5 +63,17 @@ describe("task result redaction", () => {
     expect(redactContent("Clone https://me:pw-123@host.invalid/repo", secrets)).toBe(
       "Clone https://[REDACTED]@host.invalid/repo",
     );
+  });
+});
+
+describe("service log error origin", () => {
+  it("records the error type and code without message or stack text", () => {
+    const error = Object.assign(
+      new Error("SDK failure red+blue\n    at MCP-ERROR-MARKER (x:1:1)"),
+      {
+        code: "ECONNRESET",
+      },
+    );
+    expect(errorOrigin(error)).toBe("Error (ECONNRESET)");
   });
 });

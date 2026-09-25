@@ -54,6 +54,8 @@ Read the report:
 - `git`: Git availability and, for `project`, the repository root.
 - `integrations`: MCP servers configured for Claude in the bridge's `config.json` (`configured`) and those Claude Code loads from its own settings (`fromClaudeSettings`). Codex's own tools, connectors, credentials, and approvals are never inherited by Claude (`codexTools.inherited: false`); a capability Claude needs must be configured for it explicitly.
 
+Readiness reports and the service log contain only diagnostics the bridge composes itself: problem codes, configured MCP server names and their statuses, start-up failure categories (timeout, executable not runnable, exit code), known account values, and actions. They never contain error text or stderr from Claude Code, the Agent SDK, or MCP servers. When the user needs the full error, tell them to run `claude` in a terminal and inspect `/mcp`.
+
 When readiness fails, report the problems and their actions to the user instead of retrying in a loop. Re-run `readiness` after the user says the problem is fixed.
 
 ## Configuration

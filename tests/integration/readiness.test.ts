@@ -96,6 +96,23 @@ describe("readiness", () => {
     expect(problem.action).toContain(action);
   });
 
+  it("reports only known account values from Claude Code", async () => {
+    const report = await readiness(
+      bridge({
+        scenario: {
+          account: { apiKeySource: "helper red+blue", apiProvider: "vendor SECRET-X" },
+        },
+      }),
+    );
+
+    expect(report.credentials).toMatchObject({
+      source: "third-party-provider",
+      apiProvider: "other",
+      apiKeySource: "other",
+    });
+    expect(JSON.stringify(report)).not.toMatch(/red\+blue|SECRET-X/);
+  });
+
   it("reports Claude Code versions older than the SDK supports", async () => {
     const report = await readiness(bridge({ scenario: { version: "2.0.9" } }));
 

@@ -246,11 +246,44 @@ export function mcpConfigArgs(paths: StatePaths, config: BridgeConfig): Record<s
   return { "mcp-config": paths.claudeMcpConfig };
 }
 
+const apiKeySources = new Set([
+  "ANTHROPIC_API_KEY",
+  "apiKeyHelper",
+  "/login managed key",
+  "none",
+  "user",
+  "project",
+  "org",
+  "temporary",
+  "oauth",
+]);
+const apiProviders = new Set([
+  "firstParty",
+  "bedrock",
+  "vertex",
+  "foundry",
+  "anthropicAws",
+  "anthropicGoogleCloud",
+  "mantle",
+  "gateway",
+]);
+
+/** Keeps an account field only when it has one of the values the bridge knows. */
+function known(value: string | undefined, allowed: Set<string> | RegExp): string | undefined {
+  if (value === undefined) return undefined;
+  const ok = allowed instanceof Set ? allowed.has(value) : allowed.test(value);
+  return ok ? value : "other";
+}
+
 export function classifyCredentials(account: AccountInfo): ReadinessReport["credentials"] {
+  // Account fields come from Claude Code, so only known values are reported.
+  const subscriptionType = known(account.subscriptionType, /^Claude [A-Za-z]{2,20}$/);
+  const apiProvider = known(account.apiProvider, apiProviders);
+  const apiKeySource = known(account.apiKeySource, apiKeySources);
   const details = {
-    ...(account.subscriptionType ? { subscriptionType: account.subscriptionType } : {}),
-    ...(account.apiProvider ? { apiProvider: account.apiProvider } : {}),
-    ...(account.apiKeySource ? { apiKeySource: account.apiKeySource } : {}),
+    ...(subscriptionType ? { subscriptionType } : {}),
+    ...(apiProvider ? { apiProvider } : {}),
+    ...(apiKeySource ? { apiKeySource } : {}),
   };
   if (account.apiProvider && account.apiProvider !== "firstParty") {
     return { source: "third-party-provider", verified: false, ...details };
