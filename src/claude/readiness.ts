@@ -58,7 +58,7 @@ export interface ReadinessReport {
   models: Pick<ModelInfo, "value" | "displayName" | "description" | "supportedEffortLevels">[];
   git: { version?: string; supported: boolean; project?: { path: string; root?: string } };
   integrations: {
-    configured: { name: string; status: string; error?: string }[];
+    configured: { name: string; status: string }[];
     fromClaudeSettings: { name: string; status: string; scope?: string }[];
     codexTools: { inherited: false; note: string };
   };
@@ -76,6 +76,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   const { paths, config } = input;
   const secrets = configSecrets(config);
   const problems: Problem[] = [];
+  // Messages are composed here from known fields only; redact() is a backstop.
   const problem = (code: string, message: string, action: string, blocking = true) => {
     problems.push({ code, message: redact(message, secrets), action, blocking });
   };
@@ -120,7 +121,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   if (version.error !== undefined) {
     problem(
       "claude_missing",
-      `Cannot run ${executable} --version: ${version.error}`,
+      `Cannot run ${executable} --version: ${version.error}.`,
       `Install Claude Code, or set "claudeExecutable" in ${paths.config} to its absolute path.`,
     );
     return finish(report);
@@ -135,7 +136,6 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     );
   }
 
-  const stderr: string[] = [];
   const abort = new AbortController();
   const session = query({
     prompt: withoutPrompt(abort.signal),
@@ -145,7 +145,8 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       env: claudeEnvironment(config),
       extraArgs: mcpConfigArgs(paths, config),
       abortController: abort,
-      stderr: (data) => stderr.push(data),
+      // Claude Code's own error output never reaches readiness results or the log.
+      stderr: () => {},
     },
   });
   try {
@@ -168,18 +169,17 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       );
     }
     const statuses = await settledIntegrations(() => session.mcpServerStatus(), config);
+    // Only configured names and known statuses are reported: error text from an
+    // MCP server can quote its credentials in forms no filter recognizes.
     for (const status of statuses) {
-      if (status.name in config.mcpServers) {
-        report.integrations.configured.push({
-          name: status.name,
-          status: status.status,
-          ...(status.error ? { error: redact(status.error, secrets) } : {}),
-        });
+      const state = knownServerStatuses.has(status.status) ? status.status : "unknown";
+      if (Object.hasOwn(config.mcpServers, status.name)) {
+        report.integrations.configured.push({ name: status.name, status: state });
       } else {
         report.integrations.fromClaudeSettings.push({
           name: status.name,
-          status: status.status,
-          ...(status.scope ? { scope: status.scope } : {}),
+          status: state,
+          ...(status.scope && knownScopes.has(status.scope) ? { scope: status.scope } : {}),
         });
       }
     }
@@ -187,20 +187,20 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       if (server.status !== "connected") {
         problem(
           "integration_unavailable",
-          `MCP server "${server.name}" is ${server.status}${server.error ? `: ${server.error}` : ""}.`,
-          `Check the "${server.name}" entry under "mcpServers" in ${paths.config}; Claude cannot use its tools until it connects.`,
+          `MCP server "${server.name}" is ${server.status}.`,
+          `Run \`claude\` in a terminal and inspect \`/mcp\` for the full error, then check the "${server.name}" entry under "mcpServers" in ${paths.config}. Claude cannot use its tools until it connects.`,
           false,
         );
       }
     }
   } catch (error) {
-    const detail = [(error as Error).message, stderr.join("").trim()].filter(Boolean).join(" — ");
+    const stage = startFailure(error);
     problem(
       "claude_start",
-      `Claude Code could not start a session: ${detail}`,
-      "Run `claude` in a terminal to check that it starts and is signed in, then retry.",
+      `Claude Code could not start a session (${stage}).`,
+      "Run `claude` in a terminal to see the full error and check that it starts and is signed in, then retry.",
     );
-    input.log(`readiness: Claude Code start failed: ${redact(detail, secrets)}`);
+    input.log(`readiness: Claude Code could not start a session (${stage})`);
   } finally {
     session.close();
     abort.abort();
@@ -296,17 +296,52 @@ async function settledIntegrations(
   }
 }
 
+const knownServerStatuses = new Set(["connected", "failed", "needs-auth", "pending", "disabled"]);
+const knownScopes = new Set([
+  "user",
+  "project",
+  "local",
+  "dynamic",
+  "claudeai",
+  "enterprise",
+  "managed",
+]);
+
+class TimeoutError extends Error {}
+
+/** Why a process could not be used, determined by the bridge rather than quoted from its output. */
+function processFailure(error: unknown, timeoutSeconds: number): string {
+  const failure = error as NodeJS.ErrnoException & { killed?: boolean; code?: unknown };
+  if (error instanceof TimeoutError || failure.killed) {
+    return `no response within ${timeoutSeconds} s`;
+  }
+  if (failure.code === "ENOENT") return "the executable was not found";
+  if (failure.code === "EACCES") return "the executable is not permitted to run";
+  if (typeof failure.code === "number") return `it exited with code ${failure.code}`;
+  return "it could not be run";
+}
+
+/** The start-up stage that failed; the SDK's message is matched, never copied. */
+function startFailure(error: unknown): string {
+  if (error instanceof TimeoutError) return `no response within ${initializeTimeoutMs / 1000} s`;
+  const exit = /exited with code (\d+)/.exec((error as Error).message ?? "");
+  if (exit) return `Claude Code exited with code ${exit[1]}`;
+  if (/signal/i.test((error as Error).message ?? ""))
+    return "Claude Code was terminated by a signal";
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOENT" || code === "EACCES") return processFailure(error, 0);
+  return "Claude Code ended before answering";
+}
+
 async function claudeVersion(
   executable: string,
 ): Promise<{ value: string; error?: undefined } | { error: string }> {
   try {
     const { stdout } = await run(executable, ["--version"], { timeout: 15_000 });
     const match = /\d+\.\d+\.\d+/.exec(stdout);
-    return match
-      ? { value: match[0] }
-      : { error: `unrecognized output ${JSON.stringify(stdout.trim())}` };
+    return match ? { value: match[0] } : { error: "it printed no recognizable version" };
   } catch (error) {
-    return { error: (error as Error).message };
+    return { error: processFailure(error, 15) };
   }
 }
 
@@ -380,7 +415,7 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`no response within ${ms / 1000} s`)), ms);
+      timer = setTimeout(() => reject(new TimeoutError(`no response within ${ms / 1000} s`)), ms);
     }),
   ]).finally(() => clearTimeout(timer));
 }

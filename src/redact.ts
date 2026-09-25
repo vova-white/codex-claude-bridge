@@ -87,3 +87,17 @@ export function redactContent(text: string, secrets: readonly string[] = []): st
   );
   return replace(withUrls, secrets, credentialPatterns);
 }
+
+/**
+ * An error's type, code, and stack frames without its message, for the service
+ * log: a message can quote output of Claude Code, the SDK, or an MCP server.
+ */
+export function errorOrigin(error: unknown): string {
+  if (!(error instanceof Error)) return `non-error value (${typeof error})`;
+  const code = (error as NodeJS.ErrnoException).code;
+  const frames = (error.stack ?? "")
+    .split("\n")
+    .filter((line) => line.trimStart().startsWith("at "))
+    .slice(0, 12);
+  return [`${error.name}${code ? ` (${code})` : ""}`, ...frames].join("\n");
+}

@@ -115,18 +115,6 @@ describe("readiness", () => {
     expect(problem.action).toContain(join(fixture.stateDir, "config.json"));
   });
 
-  it("reports Claude Code start-up failures without exposing credentials", async () => {
-    const fixture = bridge({
-      scenario: { startupError: "Invalid token sk-ant-oat01-SECRETSECRET for this organization" },
-    });
-    const report = await readiness(fixture);
-
-    expect(report.ready).toBe(false);
-    expect(problemCodes(report)).toContain("claude_start");
-    expect(JSON.stringify(report)).not.toContain("SECRETSECRET");
-    expect(fixture.serviceLog()).not.toContain("SECRETSECRET");
-  });
-
   it("reports missing Git and non-repository projects", async () => {
     const withoutGit = bridge();
     const bin = join(withoutGit.root, "bin");
@@ -153,23 +141,34 @@ describe("readiness", () => {
     expect(fixture.serviceLog()).not.toContain("LEAKEDVALUE");
   });
 
-  it("keeps MCP URL credentials out of the service log when Claude Code fails to start", async () => {
-    const url = "https://user:url-password-1@tracker.invalid/mcp?sig=my+private+sig";
+  it("records a start-up failure without any of Claude Code's error output", async () => {
+    const url = "https://user:url-password-1@tracker.invalid/mcp?sig=red%20blue";
     const fixture = bridge({
-      config: { mcpServers: { tracker: { type: "http", url } } },
-      scenario: { startupError: `cannot reach ${url.replace("+", "%20").replace("+", "%20")}` },
+      config: {
+        mcpServers: {
+          tracker: { type: "http", url },
+          github: { command: "github-mcp", env: { GITHUB_TOKEN: "ghp_TOPSECRETVALUE" } },
+        },
+      },
+      scenario: {
+        startupError: `STDERR-MARKER cannot reach ${url} (sig red+blue) with ghp_TOPSECRETVALUE`,
+      },
     });
     const report = await readiness(fixture);
 
-    expect(problemCodes(report)).toContain("claude_start");
-    expect(fixture.serviceLog()).toContain("tracker.invalid");
-    for (const secret of ["url-password-1", "private", "sig%20"]) {
-      expect(JSON.stringify(report)).not.toContain(secret);
-      expect(fixture.serviceLog()).not.toContain(secret);
+    const problem = report.problems.find((item: { code: string }) => item.code === "claude_start");
+    expect(problem.message).toContain("exited with code 1");
+    expect(problem.action).toContain("claude");
+    expect(fixture.serviceLog()).toContain(
+      "could not start a session (Claude Code exited with code 1)",
+    );
+    for (const text of ["STDERR-MARKER", "url-password-1", "red+blue", "red%20blue", "TOPSECRET"]) {
+      expect(JSON.stringify(report)).not.toContain(text);
+      expect(fixture.serviceLog()).not.toContain(text);
     }
   });
 
-  it("distinguishes configured MCP integrations from Codex tools and redacts their secrets", async () => {
+  it("reports MCP integrations from known fields only, never their error text", async () => {
     const fixture = bridge({
       config: {
         mcpServers: {
@@ -180,7 +179,7 @@ describe("readiness", () => {
           },
           tracker: {
             type: "http",
-            url: "https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
+            url: "https://user:url-password-1@tracker.invalid/mcp?token=red%20blue&key=a%2fkey%2fvalue",
             headers: { Authorization: "Bearer hdr-secret-123" },
           },
         },
@@ -190,7 +189,7 @@ describe("readiness", () => {
           tracker: {
             status: "failed",
             error:
-              "401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=url-token-456&sig=my+private+sig&key=a%2fkey%2fvalue",
+              "MCP-ERROR-MARKER 401 for Bearer hdr-secret-123 at https://user:url-password-1@tracker.invalid/mcp?token=RED%20BLUE&key=a%2Fkey%2Fvalue; token red+blue, key a/key/value",
           },
         },
         settingsMcpServers: [{ name: "docs", status: "connected", scope: "user" }],
@@ -200,25 +199,30 @@ describe("readiness", () => {
 
     expect(report.integrations.configured).toEqual([
       { name: "github", status: "connected" },
-      expect.objectContaining({ name: "tracker", status: "failed" }),
+      { name: "tracker", status: "failed" },
     ]);
     expect(report.integrations.fromClaudeSettings).toEqual([
       { name: "docs", status: "connected", scope: "user" },
     ]);
     expect(report.integrations.codexTools).toMatchObject({ inherited: false });
-    expect(problemCodes(report)).toContain("integration_unavailable");
-    for (const secret of [
+    const problem = report.problems.find(
+      (item: { code: string }) => item.code === "integration_unavailable",
+    );
+    expect(problem).toMatchObject({ blocking: false, message: 'MCP server "tracker" is failed.' });
+    expect(problem.action).toContain("/mcp");
+    for (const text of [
+      "MCP-ERROR-MARKER",
       "ghp_TOPSECRETVALUE",
       "hdr-secret-123",
       "url-password-1",
-      "url-token-456",
-      "private+sig",
-      "private sig",
-      "key%2fvalue",
-      "key/value",
+      "red+blue",
+      "RED%20BLUE",
+      "red%20blue",
+      "a/key/value",
+      "a%2Fkey",
     ]) {
-      expect(JSON.stringify(report)).not.toContain(secret);
-      expect(fixture.serviceLog()).not.toContain(secret);
+      expect(JSON.stringify(report)).not.toContain(text);
+      expect(fixture.serviceLog()).not.toContain(text);
     }
   });
 });
