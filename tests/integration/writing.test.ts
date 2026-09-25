@@ -338,6 +338,7 @@ describe("writing tasks", () => {
 
     const { taskId, status } = await run(client, writeTask(project));
     expect(status).toMatchObject({ status: "failed", reason: "workspace_error", terminal: true });
+    expect(status.error.message).toMatch(/^Execution failed with workspace_error: /);
     expect(fixture.launches()).toEqual([]);
     expect(
       git(project, "worktree", "list", "--porcelain")
@@ -368,8 +369,11 @@ describe("writing tasks", () => {
       writeTask(project, { requestKey: "fail", assignment: "Fail midway." }),
     );
     expect(failed.status.status).toBe("failed");
-    expect(failed.status.error.workspace).toMatchObject({ changedFiles: ["partial.txt"] });
-    expect(existsSync(join(failed.status.error.workspace.path, "partial.txt"))).toBe(true);
+    // File names and commit subjects are Claude's text: only their counts reach `error`.
+    expect(failed.status.detail.workspace).toMatchObject({ changedFiles: ["partial.txt"] });
+    expect(failed.status.error.message).toContain("0 commits and 1 changed file");
+    expect(JSON.stringify(failed.status.error)).not.toContain("partial");
+    expect(existsSync(join(failed.status.detail.workspace.path, "partial.txt"))).toBe(true);
 
     const started = await client.call(
       "start_task",

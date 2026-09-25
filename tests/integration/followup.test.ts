@@ -193,6 +193,7 @@ describe("follow-ups", () => {
     const sent = await followUp(client, project, taskId, "more-1", "Continue.");
     const outcome = await finish(client, project, taskId, sent.executionId);
     expect(outcome).toMatchObject({ status: "failed", reason: "session_unavailable" });
+    expect(outcome.error.message).toMatch(/^Execution failed with session_unavailable: /);
     expect(fixture.launches()).toHaveLength(1);
   });
 });
@@ -285,6 +286,28 @@ describe("cancellation", () => {
     });
     const result = await client.call("task_result", { project, taskId });
     expect(result.data.result.summary).toBe("Done.");
+  }, 30_000);
+
+  it("reports a failed turn as cancelled when cancellation arrives before its process exits", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        {
+          steps: [
+            { ignoreTermination: true },
+            { result: { isError: true, subtype: "error_during_execution", errors: ["boom"] } },
+            { signal: "answered" },
+          ],
+        },
+      ],
+    });
+    await waitFor(() => fixture.signalled("answered") || undefined);
+
+    const cancelled = (await client.call("cancel_task", { project, taskId })).data;
+    expect(isAlive(fixture.launches()[0]!.pid)).toBe(false);
+    expect(cancelled).toMatchObject({
+      cancellation: "confirmed",
+      executions: [{ executionId: first, status: "cancelled", detail: { processExited: true } }],
+    });
   }, 30_000);
 
   it("leaves a finished execution completed when cancellation arrives late", async () => {
