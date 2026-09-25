@@ -46,23 +46,32 @@ describe("background service", () => {
       { stdio: ["pipe", "pipe", "inherit"] },
     );
     const exited = new Promise((resolve) => contender.once("exit", resolve));
-    await new Promise((resolve) => contender.stdout.once("data", resolve));
-    const client = await fixture.connect();
-    // New readers are refused once the starting service has claimed the lock and waits for the contender.
-    const probe = new DatabaseSync(database, { timeout: 0 });
-    await waitFor(() => {
-      try {
-        probe.exec("BEGIN; SELECT count(*) FROM sqlite_master; COMMIT;");
-        return undefined;
-      } catch {
-        return true;
-      }
-    });
-    probe.close();
-    contender.stdin.end();
-    await exited;
+    let probe: DatabaseSync | undefined;
+    try {
+      await new Promise((resolve) => contender.stdout.once("data", resolve));
+      const client = await fixture.connect();
+      // New readers are refused once the starting service has claimed the lock and waits for the contender.
+      probe = new DatabaseSync(database, { timeout: 0 });
+      const reader = probe;
+      await waitFor(() => {
+        try {
+          reader.exec("BEGIN; SELECT count(*) FROM sqlite_master; COMMIT;");
+          return undefined;
+        } catch {
+          return true;
+        }
+      });
+      probe.close();
+      probe = undefined;
+      contender.stdin.end();
+      await exited;
 
-    expect(await servicePidFrom(client)).toBe(fixture.servicePid());
+      expect(await servicePidFrom(client)).toBe(fixture.servicePid());
+    } finally {
+      // A failed step must not leave the contender, whose PID this test captured, waiting on stdin.
+      probe?.close();
+      if (contender.exitCode === null && contender.signalCode === null) contender.kill("SIGKILL");
+    }
   });
 
   it("keeps running after the MCP client exits and serves the next client", async () => {
