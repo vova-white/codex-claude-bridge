@@ -325,6 +325,36 @@ describe("responses", () => {
   });
 });
 
+describe("waiting in the start call", () => {
+  it("returns as soon as Claude asks a question", async () => {
+    const fixture = new BridgeFixture({
+      scenario: {
+        turns: [{ steps: [{ canUseTool: { name: "AskUserQuestion", input: question } }] }],
+      },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+
+    const began = Date.now();
+    const started = await client.call("start_task", {
+      project,
+      requestKey: "task-1",
+      assignment: "Review the README.",
+      expectedResult: "Findings.",
+      waitSeconds: 30,
+    });
+    expect(started.data).toMatchObject({
+      created: true,
+      status: "running",
+      reason: "needs_input",
+      timedOut: false,
+    });
+    expect(started.data.detail.requestId).toMatch(/^req_/);
+    expect(Date.now() - began).toBeLessThan(15_000);
+  });
+});
+
 describe("stale requests", () => {
   it("expire when Claude Code exits while the request is pending", async () => {
     const { fixture, client, project, taskId } = await startTask(

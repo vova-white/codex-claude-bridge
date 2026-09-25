@@ -51,6 +51,20 @@ import {
 
 export const effortLevels = ["low", "medium", "high", "xhigh", "max"] as const;
 
+/** Upper bound of one wait, below the plugin's MCP tool timeout. */
+const maxWaitSeconds = 300;
+
+/** Optional wait of start_task and send_followup on the execution they accepted. */
+const waitSecondsSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(maxWaitSeconds)
+  .default(0)
+  .describe(
+    `After acceptance, wait up to this many seconds (at most ${maxWaitSeconds}) for the accepted execution as wait_task does; 0 (default) returns at once. Timing out does not stop the task.`,
+  );
+
 /** Arguments of start_task, shared by the MCP tool definition and the service. */
 export const startSchema = z.object({
   project: z.string().min(1).describe("Absolute path of the Git checkout the task belongs to."),
@@ -94,11 +108,10 @@ export const startSchema = z.object({
     .describe(
       "Write mode: pull_request authorizes Claude to push the task branch and create or update its pull request, never merging it; none (default) keeps the commits in the worktree.",
     ),
+  waitSeconds: waitSecondsSchema,
 });
-export type StartRequest = z.infer<typeof startSchema>;
-
-/** Upper bound of one wait_task call, below the plugin's MCP tool timeout. */
-const maxWaitSeconds = 300;
+/** A task's request as stored; waitSeconds shapes only the call, not the task. */
+export type StartRequest = Omit<z.infer<typeof startSchema>, "waitSeconds">;
 /** Diagnostics retention per execution, independent of the durable result. */
 const maxEventsPerExecution = 2000;
 const maxStoredEventChars = 16_000;
@@ -135,6 +148,7 @@ export const followUpSchema = z.object({
     .max(200)
     .describe("Caller-chosen key for this follow-up; reuse it to retry safely."),
   message: z.string().min(1).describe("The follow-up instruction or question for Claude."),
+  waitSeconds: waitSecondsSchema,
 });
 
 /** Arguments of read_output. */
@@ -727,8 +741,17 @@ export class TaskService {
     }
   }
 
+  /**
+   * Accepts a task, then, when waitSeconds is given, waits on its first
+   * execution as wait_task does. A retry with the same request key returns the
+   * same task and waits again.
+   */
   async start(caller: string, params: unknown) {
-    const request = parse(startSchema, params);
+    const { waitSeconds, ...request } = parse(startSchema, params);
+    return this.waitAfter(await this.accept(caller, request), waitSeconds);
+  }
+
+  private async accept(caller: string, request: StartRequest) {
     const project = await this.projectRoot(request.project);
     this.config(); // Fail before accepting work that could not run.
     const { requestKey, project: _path, ...intent } = request;
@@ -1061,7 +1084,14 @@ export class TaskService {
    * returns the same execution.
    */
   async followUp(caller: string, params: unknown) {
-    const { project, taskId, requestKey, message } = parse(followUpSchema, params);
+    const { waitSeconds, ...request } = parse(followUpSchema, params);
+    return this.waitAfter(await this.acceptFollowUp(caller, request), waitSeconds);
+  }
+
+  private async acceptFollowUp(
+    caller: string,
+    { project, taskId, requestKey, message }: Omit<z.infer<typeof followUpSchema>, "waitSeconds">,
+  ) {
     const task = await this.task(caller, project, taskId);
     // A cleanup decides on the worktree's commits, so none may appear until it finishes.
     while (this.cleaning.has(task.id)) await this.cleaning.get(task.id);
@@ -1490,10 +1520,34 @@ export class TaskService {
     const pinned = executionId
       ? this.executionById(task.id, executionId)
       : this.latestExecution(task.id);
+    return this.waitOn(task.id, pinned.id, timeoutSeconds);
+  }
+
+  /**
+   * Continues an accepted start_task or send_followup response with a wait on
+   * its execution; the state fields then describe the end of the wait.
+   */
+  private async waitAfter<
+    Accepted extends { taskId: string; executionId: string } & ReturnType<typeof executionState>,
+  >(accepted: Accepted, waitSeconds: number) {
+    if (waitSeconds === 0) return accepted;
+    const {
+      status: _status,
+      reason: _reason,
+      detail: _detail,
+      error: _error,
+      terminal: _terminal,
+      ...rest
+    } = accepted;
+    return { ...rest, ...(await this.waitOn(accepted.taskId, accepted.executionId, waitSeconds)) };
+  }
+
+  private async waitOn(taskId: string, executionId: string, timeoutSeconds: number) {
+    const pinned = this.executionById(taskId, executionId);
     const initialReason = pinned.reason;
     const deadline = Date.now() + timeoutSeconds * 1000;
     for (;;) {
-      const current = this.executionById(task.id, pinned.id);
+      const current = this.executionById(taskId, pinned.id);
       // A pending request needs the caller's answer, so it ends a wait at once;
       // a capacity wait ends a wait only when it begins.
       const blocked =
@@ -1502,7 +1556,7 @@ export class TaskService {
       const remaining = deadline - Date.now();
       if (terminalStatuses.includes(current.status) || blocked || remaining <= 0) {
         return {
-          taskId: task.id,
+          taskId,
           executionId: current.id,
           timedOut: !terminalStatuses.includes(current.status) && !blocked,
           ...executionState(current),

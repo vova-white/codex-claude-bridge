@@ -146,6 +146,45 @@ describe("follow-ups", () => {
     ]);
   });
 
+  it("wait in the follow-up call for their own execution, queued behind active work", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        { match: "Check the tests too", steps: [finished("Tests reviewed.")] },
+        { steps: [{ waitFor: "go" }, finished("README reviewed.")] },
+      ],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+
+    const sent = client.call("send_followup", {
+      project,
+      taskId,
+      requestKey: "more-1",
+      message: "Check the tests too.",
+      waitSeconds: 30,
+    });
+    await waitFor(async () => {
+      const status = (await client.call("task_status", { project, taskId })).data;
+      return status.executions.length === 2 || undefined;
+    });
+    fixture.release("go");
+    const waited = await sent;
+    expect(waited.isError, waited.text).toBe(false);
+    expect(waited.data).toMatchObject({
+      created: true,
+      delivery: "queued",
+      queuedBehind: first,
+      status: "completed",
+      timedOut: false,
+    });
+    expect(waited.data.executionId).not.toBe(first);
+    const result = await client.call("task_result", {
+      project,
+      taskId,
+      executionId: waited.data.executionId,
+    });
+    expect(result.data.result.summary).toBe("Tests reviewed.");
+  });
+
   it("run exactly once, after the original, when sent as it finishes", async () => {
     const { fixture, project, client, taskId, first } = await setUp({
       turns: [
