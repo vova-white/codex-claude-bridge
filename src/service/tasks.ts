@@ -10,6 +10,7 @@ import {
   writingResult,
   type ExecutionObserver,
   type ExecutionOutcome,
+  type ExecutionUsage,
   type PendingRequest,
   type RequestResponse,
 } from "../claude/execution.ts";
@@ -292,6 +293,8 @@ interface NestedWriterRow {
   process_exited: number | null;
   /** The ProcessIdentity of its Claude Code process, once spawned. */
   process: string | null;
+  /** The ExecutionUsage its final result reported, if a result ended it. */
+  usage: string | null;
   created_at: string;
   ended_at: string | null;
   /** What cleanup_task left of the writer's worktree and branch: removed or branch_kept. */
@@ -376,6 +379,8 @@ interface ExecutionRow {
   request_hash: string | null;
   /** The ProcessIdentity of its Claude Code process, once spawned. */
   process: string | null;
+  /** The ExecutionUsage its final result reported, if a result ended it. */
+  usage: string | null;
   created_at: string;
   started_at: string | null;
   ended_at: string | null;
@@ -983,7 +988,9 @@ export class TaskService {
     const execution = executionId
       ? this.executionById(task.id, executionId)
       : this.execution(task.id, 1);
-    const state = { taskId: task.id, executionId: execution.id, ...executionState(execution) };
+    // Usage is a bridge-recorded fact about the run, not part of its result.
+    const { usage: _usage, ...shownState } = executionState(execution);
+    const state = { taskId: task.id, executionId: execution.id, ...shownState };
     const retained = (JSON.parse(execution.detail ?? "{}") as Pick<StoredResult, "workspace">)
       .workspace;
     const stored: (Record<string, unknown> & Partial<StoredResult>) | undefined = execution.result
@@ -1556,10 +1563,11 @@ export class TaskService {
     const first = this.db
       .prepare("SELECT MIN(seq) AS seq FROM events WHERE execution_id = ?")
       .get(execution.id) as { seq: number | null };
+    const { usage: _usage, ...state } = executionState(execution);
     return {
       taskId: task.id,
       executionId: execution.id,
-      ...executionState(execution),
+      ...state,
       events,
       nextCursor,
       hasMore: rows.some((row) => row.seq > nextCursor),
@@ -2286,6 +2294,7 @@ export class TaskService {
         reason,
         { result, ...retained },
         outcome.processExited,
+        outcome.usage,
       );
     } else if (outcome.status === "failed") {
       status = "failed";
@@ -2308,6 +2317,7 @@ export class TaskService {
         reason,
         { error, ...retained },
         outcome.processExited,
+        outcome.usage,
       );
     } else {
       status = "cancelled";
@@ -2324,10 +2334,11 @@ export class TaskService {
     reason: string | null,
     outcome: object,
     processExited: boolean | null,
+    usage?: ExecutionUsage,
   ): void {
     this.db
       .prepare(
-        `UPDATE nested_writers SET status = ?, reason = ?, outcome = ?, process_exited = ?, ended_at = ?
+        `UPDATE nested_writers SET status = ?, reason = ?, outcome = ?, process_exited = ?, usage = ?, ended_at = ?
          WHERE id = ? AND status = 'running'`,
       )
       .run(
@@ -2335,6 +2346,7 @@ export class TaskService {
         reason,
         JSON.stringify(outcome),
         processExited === null ? null : processExited ? 1 : 0,
+        usage ? JSON.stringify(usage) : null,
         now(),
         id,
       );
@@ -2738,6 +2750,7 @@ export class TaskService {
           ].join(" "),
           action: outcome.action,
         }),
+        ...(outcome.usage ? { usage: JSON.stringify(outcome.usage) } : {}),
         ended_at: endedAt,
       });
       if (failed) this.record(executionId, "status", `Failed (${outcome.reason}).`);
@@ -2765,6 +2778,7 @@ export class TaskService {
       reason: null,
       detail: outcome.processExited ? null : JSON.stringify({ processExited: false }),
       result: JSON.stringify(result),
+      ...(outcome.usage ? { usage: JSON.stringify(outcome.usage) } : {}),
       ended_at: endedAt,
     });
     if (completed) this.record(executionId, "result", result.summary);
@@ -3088,6 +3102,7 @@ function nestedWriterState(row: NestedWriterRow) {
     ...report,
     assignment: assignment.length > 200 ? `${assignment.slice(0, 200)}…` : assignment,
     workspace: counts,
+    ...(row.usage ? { usage: JSON.parse(row.usage) as ExecutionUsage } : {}),
   };
 }
 
@@ -3121,6 +3136,7 @@ function executionState(execution: ExecutionRow) {
     ...(execution.reason ? { reason: execution.reason } : {}),
     ...(execution.detail ? { detail: shownDetail(JSON.parse(execution.detail)) } : {}),
     ...(execution.error ? { error: JSON.parse(execution.error) } : {}),
+    ...(execution.usage ? { usage: JSON.parse(execution.usage) as ExecutionUsage } : {}),
     terminal: terminalStatuses.includes(execution.status),
   };
 }
