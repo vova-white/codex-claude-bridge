@@ -20,7 +20,7 @@ import {
 } from "../claude/nested-writers.ts";
 import { claudeEnvironment, claudeExecutable, mcpConfigArgs } from "../claude/readiness.ts";
 import { type BridgeConfig, configSecrets } from "../config.ts";
-import { errorOrigin, redactContent } from "../redact.ts";
+import { errorOrigin } from "../redact.ts";
 import { ServiceError } from "../ipc.ts";
 import type { StatePaths } from "../state.ts";
 import {
@@ -331,7 +331,7 @@ interface RequestRow {
   payload: string;
   response_shape: string;
   state: "pending" | "answered" | "expired";
-  /** The response as the parent sees it, redacted. */
+  /** The response as the parent gave it. */
   response: string | null;
   /** Identifies the response as given, so a repeat can be recognized. */
   response_hash: string | null;
@@ -491,10 +491,7 @@ export class TaskService {
   /** Requests Claude is waiting on in this process, with the means to answer them. */
   /** What each execution running in this process waits for; its reason is derived from it. */
   private readonly waits = new Map<string, Waits>();
-  private readonly live = new Map<
-    string,
-    { resolve: (response: RequestResponse | undefined) => void; secrets: readonly string[] }
-  >();
+  private readonly live = new Map<string, (response: RequestResponse | undefined) => void>();
   /** Tasks cleanup_task is checking or cleaning up, settled when it finishes. */
   private readonly cleaning = new Map<string, Promise<void>>();
   /** The latest cleanup of each repository, by common Git directory, which the next one waits for. */
@@ -768,18 +765,17 @@ export class TaskService {
       }
       return { taskId: task.id, ...this.requestView(request), repeated: true };
     }
-    const live = this.live.get(requestId);
-    if (!live) {
+    const resolve = this.live.get(requestId);
+    if (!resolve) {
       this.expire(requestId);
       throw new ServiceError("request_expired", `Request ${requestId} has expired: ${expiredNote}`);
     }
     const { given, answer } = this.checkResponse(request, response);
-    const shown = redactStrings(given, (text) => redactContent(text, live.secrets));
     this.db
       .prepare(
         "UPDATE requests SET state = 'answered', response = ?, response_hash = ?, resolved_at = ? WHERE id = ? AND state = 'pending'",
       )
-      .run(JSON.stringify(shown), responseHash(given), now(), requestId);
+      .run(JSON.stringify(given), responseHash(given), now(), requestId);
     this.live.delete(requestId);
     this.record(
       request.execution_id,
@@ -787,7 +783,7 @@ export class TaskService {
       `Request ${requestId} answered${"decision" in answer ? ` (${answer.decision})` : ""}.`,
     );
     this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
-    live.resolve(answer);
+    resolve(answer);
     const answered = this.db
       .prepare("SELECT * FROM requests WHERE id = ?")
       .get(requestId) as unknown as RequestRow;
@@ -1298,7 +1294,7 @@ export class TaskService {
   /**
    * Checks that a response fits the request. Returns it as given, in a stable
    * form, and as Claude receives it: answers go by question position, because
-   * the parent answers the question texts as displayed, possibly redacted.
+   * the parent answers the question texts as displayed, which tell duplicates apart.
    */
   private checkResponse(
     request: RequestRow,
@@ -1367,12 +1363,10 @@ export class TaskService {
     executionId: string,
     request: PendingRequest,
     signal: AbortSignal,
-    secrets: readonly string[],
     writerId?: string,
   ): Promise<RequestResponse | undefined> {
-    const clean = (value: unknown) => redactStrings(value, (text) => redactContent(text, secrets));
     const { kind, toolName, sessionId, ...content } = request;
-    const payload = clean(kind === "question" ? content : { toolName, ...content });
+    const payload = kind === "question" ? content : { toolName, ...content };
     const questions = kind === "question" ? questionTexts(payload) : [];
     const responseShape =
       kind === "question"
@@ -1404,7 +1398,7 @@ export class TaskService {
         now(),
       );
     return new Promise((resolve) => {
-      this.live.set(id, { resolve, secrets });
+      this.live.set(id, resolve);
       const asker = writerId ? ` from nested writer ${writerId}` : "";
       this.record(
         executionId,
@@ -1436,7 +1430,7 @@ export class TaskService {
       this.record(request.execution_id, "status", `Request ${requestId} expired unanswered.`);
       this.block(request.execution_id, (waits) => waits.requests.delete(requestId));
     }
-    live?.resolve(undefined);
+    live?.(undefined);
   }
 
   /**
@@ -1740,12 +1734,10 @@ export class TaskService {
         }
         const baseline = await resolveCommit(executor.path, "HEAD");
         if (!baseline) throw new NestedWriterRefusal(`HEAD names no commit in ${executor.path}.`);
-        const secrets = configSecrets(this.config());
-        const clean = (text: string) => redactContent(text, secrets);
         const stored: NestedWriterBrief = {
-          assignment: clean(brief.assignment),
-          ...(brief.context ? { context: clean(brief.context) } : {}),
-          expectedResult: clean(brief.expectedResult),
+          assignment: brief.assignment,
+          ...(brief.context ? { context: brief.context } : {}),
+          expectedResult: brief.expectedResult,
         };
         const uuid = randomUUID();
         const id = `writer_${uuid}`;
@@ -1858,7 +1850,6 @@ export class TaskService {
     const config = this.config();
     const secrets = configSecrets(config);
     const executable = claudeExecutable(config);
-    const clean = (text: string) => redactContent(text, secrets);
     const event = (text: string) =>
       this.record(writer.execution_id, "nested", `${writer.id}${text}`);
     const observer: ExecutionObserver = {
@@ -1869,11 +1860,10 @@ export class TaskService {
       },
       capacity: (waiting) =>
         event(waiting ? " is waiting for subscription capacity." : " continues."),
-      message: (text) => event(`: ${clean(text)}`),
-      // Strings are redacted before serialization, which would escape them.
-      toolCall: (name, input) => event(`: ${name} ${JSON.stringify(redactStrings(input, clean))}`),
+      message: (text) => event(`: ${text}`),
+      toolCall: (name, input) => event(`: ${name} ${JSON.stringify(input)}`),
       request: (pending, requestSignal) =>
-        this.raise(writer.execution_id, pending, requestSignal, secrets, writer.id),
+        this.raise(writer.execution_id, pending, requestSignal, writer.id),
       // Without the Agent tool, Claude Code reports no nested agents of a nested writer.
       nestedStarted: () => {},
       nestedProgress: () => {},
@@ -1907,7 +1897,7 @@ export class TaskService {
           processExited: true,
         };
     // The writer's changes stay in its worktree whatever the outcome.
-    const changes = await listedChanges(writer.path, writer.baseline, secrets);
+    const changes = await listedChanges(writer.path, writer.baseline);
     const retained = changes ? { changes } : {};
     // Cancellation wins over a failure it raced, even after Claude Code has returned.
     if (outcome.status === "failed" && signal.aborted) {
@@ -1921,11 +1911,11 @@ export class TaskService {
         ? parsed.data
         : { summary: outcome.text, evidence: [], failures: [], remainingWork: [], checks: [] };
       const result = {
-        summary: clean(reported.summary),
-        evidence: reported.evidence.map(clean),
-        failures: reported.failures.map(clean),
-        remainingWork: reported.remainingWork.map(clean),
-        checks: reported.checks.map((check) => redactStrings(check, clean)),
+        summary: reported.summary,
+        evidence: reported.evidence,
+        failures: reported.failures,
+        remainingWork: reported.remainingWork,
+        checks: reported.checks,
       };
       status = "completed";
       this.endNestedWriter(
@@ -2217,18 +2207,16 @@ export class TaskService {
                 : "Subscription capacity is available again.",
             );
           },
-          message: (text) => this.record(executionId, "assistant", redactContent(text, secrets)),
-          // Strings are redacted before serialization, which would escape them.
+          message: (text) => this.record(executionId, "assistant", text),
           toolCall: (name, input, nestedTaskId) =>
             this.record(
               executionId,
               nestedTaskId ? "nested" : "tool",
-              `${nestedTaskId ? `${nestedTaskId}: ` : ""}${name} ${JSON.stringify(redactStrings(input, (text) => redactContent(text, secrets)))}`,
+              `${nestedTaskId ? `${nestedTaskId}: ` : ""}${name} ${JSON.stringify(input)}`,
             ),
-          request: (pending, requestSignal) =>
-            this.raise(executionId, pending, requestSignal, secrets),
+          request: (pending, requestSignal) => this.raise(executionId, pending, requestSignal),
           nestedStarted: (nested) => {
-            const description = redactContent(nested.description, secrets);
+            const { description } = nested;
             this.db
               .prepare(
                 `INSERT OR IGNORE INTO nested_tasks (execution_id, task_id, tool_use_id, parent_tool_use_id,
@@ -2253,9 +2241,9 @@ export class TaskService {
             );
           },
           nestedProgress: (taskId, summary) =>
-            this.record(executionId, "nested", `${taskId}: ${redactContent(summary, secrets)}`),
+            this.record(executionId, "nested", `${taskId}: ${summary}`),
           nestedEnded: (taskId, end) => {
-            const summary = end.summary === undefined ? null : redactContent(end.summary, secrets);
+            const summary = end.summary ?? null;
             this.db
               .prepare(
                 `UPDATE nested_tasks SET status = ?, summary = ?, termination = ?, ended_at = ?
@@ -2289,14 +2277,11 @@ export class TaskService {
     // The execution ends only once the nested writers it started have stopped.
     await writers?.stopAll();
     const endedAt = now();
-    // Claude chooses file names; redaction is a backstop for credentials in them.
-    const modifiedFiles = (before ? changedPaths(before, await checkoutState(root)) : []).map(
-      (path) => redactContent(path, secrets),
-    );
+    const modifiedFiles = before ? changedPaths(before, await checkoutState(root)) : [];
     // A writing task's changes stay in its worktree whatever the outcome.
     const changes =
       workspace && this.workspace(task.id)?.state === "ready"
-        ? await listedChanges(workspace.path, workspace.baseline, secrets)
+        ? await listedChanges(workspace.path, workspace.baseline)
         : undefined;
     // Cancellation is confirmed without waiting for the remote; the next follow-up checks it.
     const publication =
@@ -2378,22 +2363,17 @@ export class TaskService {
     const reported = parsed.success
       ? parsed.data
       : { summary: outcome.text, evidence: [], failures: [], remainingWork: [] };
-    // Claude can read configured credentials; they must not reach Codex through results.
-    const clean = (text: string) => redactContent(text, secrets);
     const checks =
       parsed.success && "checks" in parsed.data
         ? (parsed.data as z.infer<typeof writingResult>).checks
         : [];
     const result = {
-      summary: clean(reported.summary),
-      evidence: reported.evidence.map(clean),
-      failures: [...reported.failures.map(clean), ...violation],
-      remainingWork: reported.remainingWork.map(clean),
+      summary: reported.summary,
+      evidence: reported.evidence,
+      failures: [...reported.failures, ...violation],
+      remainingWork: reported.remainingWork,
       ...(workspace
-        ? {
-            checks: checks.map((check) => redactStrings(check, clean)),
-            ...retained,
-          }
+        ? { checks, ...retained }
         : { workspace: { kind: "shared-checkout", path: root, readOnly: true, modifiedFiles } }),
     };
     const completed = this.update(executionId, {
@@ -2624,7 +2604,7 @@ function questionTexts(payload: unknown): string[] {
   if (!Array.isArray(questions)) return [];
   const keys = new Set<string>();
   return questions.map((item: { question?: unknown }, index) => {
-    // Redaction can make questions look alike; later ones are told apart by position.
+    // Claude may ask the same question twice; later ones are told apart by position.
     let key = typeof item.question === "string" ? item.question : `Question ${index + 1}`;
     while (keys.has(key)) key = `${key} (question ${index + 1})`;
     keys.add(key);
@@ -2634,28 +2614,6 @@ function questionTexts(payload: unknown): string[] {
 
 function responseHash(response: object): string {
   return createHash("sha256").update(JSON.stringify(response)).digest("hex");
-}
-
-/**
- * Applies `clean` to every string inside a JSON-like value, object keys
- * included. A key that cleaning makes equal to an earlier one gets
- * " (key N)" appended, N being its position, so no entry is lost.
- */
-function redactStrings(value: unknown, clean: (text: string) => string): unknown {
-  if (typeof value === "string") return clean(value);
-  if (Array.isArray(value)) return value.map((item) => redactStrings(item, clean));
-  if (value && typeof value === "object") {
-    const keys = new Set<string>();
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item], index) => {
-        let shown = clean(key);
-        while (keys.has(shown)) shown = `${shown} (key ${index + 1})`;
-        keys.add(shown);
-        return [shown, redactStrings(item, clean)];
-      }),
-    );
-  }
-  return value;
 }
 
 /** MCP servers whose tool calls wait for the parent agent's approval. */
@@ -2685,18 +2643,16 @@ function workspaceReport(workspace: WorkspaceRow) {
   };
 }
 
-/** Commits and changed files of a worktree since its baseline, redacted, with long lists cut. */
-function listedChanges(path: string, baseline: string, secrets: readonly string[]) {
+/** Commits and changed files of a worktree since its baseline, with long lists cut. */
+function listedChanges(path: string, baseline: string) {
   return worktreeChanges(path, baseline)
     .then(({ commits, changedFiles }) => ({
       // Long lists are cut; the worktree itself holds every change.
       commits: commits.slice(0, maxListedChanges).map(({ sha, subject }) => ({
         sha,
-        subject: redactContent(subject.slice(0, maxSubjectChars), secrets),
+        subject: subject.slice(0, maxSubjectChars),
       })),
-      changedFiles: changedFiles
-        .slice(0, maxListedChanges)
-        .map((file) => redactContent(file, secrets)),
+      changedFiles: changedFiles.slice(0, maxListedChanges),
       commitCount: commits.length,
       changedFileCount: changedFiles.length,
     }))

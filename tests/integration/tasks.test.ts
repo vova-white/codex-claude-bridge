@@ -199,7 +199,7 @@ describe("read-only delegated tasks", () => {
     expect((await codex.call("list_tasks", { project })).data.tasks).toHaveLength(1);
   });
 
-  it("keeps configured credentials out of task results", async () => {
+  it("passes Claude's own content through unchanged, even configured secret values", async () => {
     const fixture = bridge({
       config: {
         mcpServers: {
@@ -211,6 +211,9 @@ describe("read-only delegated tasks", () => {
         turns: [
           {
             steps: [
+              { assistant: "Using tok-RESULTSECRET" },
+              { toolUse: { name: "Bash", input: { command: 'echo "tok-RESULTSECRET"' } } },
+              { writeFile: { path: "notes-tok-RESULTSECRET.txt", content: "x" } },
               {
                 result: {
                   structured: {
@@ -234,14 +237,22 @@ describe("read-only delegated tasks", () => {
     const { taskId } = await start(client, assignment(project));
     await statusWhen(client, project, taskId, terminal);
 
-    const result = await client.call("task_result", { project, taskId });
-    expect(result.data.result.summary).toBe(
-      "The token is [REDACTED]; see https://docs.invalid/a?page=2.",
+    const { result } = (await client.call("task_result", { project, taskId })).data;
+    expect(result).toMatchObject({
+      summary: "The token is tok-RESULTSECRET; see https://docs.invalid/a?page=2.",
+      evidence: [
+        "env TOKEN=tok-RESULTSECRET",
+        "called https://tracker.invalid/mcp?key=url%2FRESULT+KEY&page=2",
+      ],
+      workspace: { modifiedFiles: ["notes-tok-RESULTSECRET.txt"] },
+    });
+    const { events } = (await client.call("read_output", { project, taskId, limit: 200 })).data;
+    expect(events.map((event: { text: string }) => event.text)).toEqual(
+      expect.arrayContaining([
+        "Using tok-RESULTSECRET",
+        'Bash {"command":"echo \\"tok-RESULTSECRET\\""}',
+      ]),
     );
-    expect(result.data.result.evidence[1]).toBe(
-      "called https://tracker.invalid/mcp?key=[REDACTED]&page=2",
-    );
-    expect(result.text).not.toMatch(/RESULTSECRET|RESULT\+KEY/);
   });
 
   it("reports a staged change even when the working file is restored", async () => {
@@ -299,16 +310,10 @@ describe("read-only delegated tasks", () => {
 
   it("reports checkout changes when the execution fails, without file names in the message", async () => {
     const fixture = bridge({
-      config: {
-        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-FILESECRET" } } },
-      },
       scenario: {
         turns: [
           {
-            steps: [
-              { writeFile: { path: "notes-tok-FILESECRET.txt", content: "x" } },
-              { exit: { code: 1 } },
-            ],
+            steps: [{ writeFile: { path: "notes-x.txt", content: "x" } }, { exit: { code: 1 } }],
           },
         ],
       },
@@ -320,11 +325,10 @@ describe("read-only delegated tasks", () => {
     const status = await statusWhen(client, project, taskId, terminal);
     expect(status).toMatchObject({
       status: "failed",
-      detail: { modifiedFiles: ["notes-[REDACTED].txt"] },
+      detail: { modifiedFiles: ["notes-x.txt"] },
     });
     expect(status.error.message).toContain("changed 1 file");
     expect(JSON.stringify(status.error)).not.toContain("notes-");
-    expect(JSON.stringify(status)).not.toContain("FILESECRET");
   });
 
   it("never reports a session ID Claude Code sends in an unrecognized form", async () => {

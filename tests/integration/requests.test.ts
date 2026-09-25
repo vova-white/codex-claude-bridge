@@ -133,78 +133,29 @@ describe("child questions", () => {
       { requestId: request.requestId, state: "answered", live: false },
     ]);
   });
-  it("apply answers to questions whose displayed text is redacted", async () => {
-    const secret = "s3cr3t-token-value";
-    const asked = `Should I send ${secret} to the tracker?`;
-    const { client, project, taskId } = await startTask(
-      [
-        {
-          canUseTool: {
-            name: "AskUserQuestion",
-            input: {
-              questions: [
-                { ...question.questions[0], question: asked },
-                { ...question.questions[0] },
-              ],
-            },
+  it("give identical questions distinct answer keys", async () => {
+    const { client, project, taskId } = await startTask([
+      {
+        canUseTool: {
+          name: "AskUserQuestion",
+          input: {
+            questions: [
+              { ...question.questions[0], question: "Revoke the token?" },
+              { ...question.questions[0], question: "Revoke the token?" },
+              // Collides with the key the second question gets.
+              { ...question.questions[0], question: "Revoke the token? (question 2)" },
+            ],
           },
         },
-        finished("Done."),
-      ],
-      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: { TOKEN: secret } } } } },
-    );
-    const request = await pendingRequest(client, project, taskId);
-    const shown = "Should I send [REDACTED] to the tracker?";
-    expect(request.question.questions[0].question).toBe(shown);
-    expect(Object.keys(request.responseShape.answers)).toEqual([
-      shown,
-      "Which branch should I review?",
-    ]);
-
-    const answered = await client.call("respond_to_request", {
-      project,
-      taskId,
-      requestId: request.requestId,
-      response: {
-        answers: { [shown]: `No, keep ${secret} private`, "Which branch should I review?": "main" },
       },
-    });
-    expect(answered.data.response.answers[shown]).toBe("No, keep [REDACTED] private");
-    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
-    expect(await events(client, project, taskId)).toContain(
-      'AskUserQuestion answered ["No, keep [REDACTED] private","main"]',
-    );
-    const status = await client.call("task_status", { project, taskId });
-    expect(status.text).not.toContain(secret);
-  });
-
-  it("give questions that look alike after redaction distinct answer keys", async () => {
-    const secrets = { ALPHA: "token-alpha-123", BETA: "token-beta-456" };
-    const { client, project, taskId } = await startTask(
-      [
-        {
-          canUseTool: {
-            name: "AskUserQuestion",
-            input: {
-              questions: [
-                { ...question.questions[0], question: "Revoke token-alpha-123?" },
-                { ...question.questions[0], question: "Revoke token-beta-456?" },
-                // Collides with the key the second question gets.
-                { ...question.questions[0], question: "Revoke [REDACTED]? (question 2)" },
-              ],
-            },
-          },
-        },
-        finished("Done."),
-      ],
-      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: secrets } } } },
-    );
+      finished("Done."),
+    ]);
     const request = await pendingRequest(client, project, taskId);
     const keys = Object.keys(request.responseShape.answers);
     expect(keys).toEqual([
-      "Revoke [REDACTED]?",
-      "Revoke [REDACTED]? (question 2)",
-      "Revoke [REDACTED]? (question 2) (question 3)",
+      "Revoke the token?",
+      "Revoke the token? (question 2)",
+      "Revoke the token? (question 2) (question 3)",
     ]);
 
     const answered = await client.call("respond_to_request", {
@@ -216,10 +167,6 @@ describe("child questions", () => {
       },
     });
     expect(answered.isError, answered.text).toBe(false);
-    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
-    expect(await events(client, project, taskId)).toContain(
-      'AskUserQuestion answered ["answer 1","answer 2","answer 3"]',
-    );
   });
 
   it("can be answered by a new MCP client after the first disconnects", async () => {
@@ -288,39 +235,6 @@ describe("permission requests", () => {
       expect(await events(client, project, taskId)).toContain(said);
     },
   );
-
-  it("redact configured secrets used as input keys without merging entries", async () => {
-    const secrets = { ALPHA: "token-alpha-123", BETA: "token-beta-456" };
-    const input = { tokens: { "token-alpha-123": "revoke", "token-beta-456": "keep" } };
-    const shown = { tokens: { "[REDACTED]": "revoke", "[REDACTED] (key 2)": "keep" } };
-    const { client, project, taskId } = await startTask(
-      [
-        { toolUse: { name: "mcp__tracker__list_tokens", input } },
-        { canUseTool: { ...trackerCall.canUseTool, input } },
-        finished("Done."),
-      ],
-      { config: { mcpServers: { tracker: { command: "tracker-mcp", env: secrets } } } },
-    );
-
-    const request = await pendingRequest(client, project, taskId);
-    expect(request.action.input).toEqual(shown);
-    const answered = await client.call("respond_to_request", {
-      project,
-      taskId,
-      requestId: request.requestId,
-      response: { decision: "allow" },
-    });
-    expect(answered.data.action.input).toEqual(shown);
-    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
-    expect(await events(client, project, taskId)).toContain(
-      `mcp__tracker__list_tokens ${JSON.stringify(shown)}`,
-    );
-    const status = await client.call("task_status", { project, taskId });
-    const output = await client.call("read_output", { project, taskId, limit: 200 });
-    for (const text of [answered.text, status.text, output.text]) {
-      expect(text).not.toMatch(/token-(alpha|beta)/);
-    }
-  });
 
   it("let an autoApprove server and built-in tools run without a request", async () => {
     const { fixture, client, project, taskId } = await startTask(

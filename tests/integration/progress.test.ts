@@ -185,23 +185,6 @@ describe("waiting and progress", () => {
     expect(empty).toMatchObject({ events: [], hasMore: false, nextCursor: all.at(-1)!.seq });
   });
 
-  it("keeps configured secrets out of tool events even when JSON would escape them", async () => {
-    const secret = 'tok"quo\\te-SECRET';
-    const fixture = bridge({
-      config: { mcpServers: { github: { command: "github-mcp", env: { TOKEN: secret } } } },
-    });
-    const { client, project, taskId } = await startTask(fixture, [
-      { toolUse: { name: "Bash", input: { command: `echo ${secret}` } } },
-      finished("Done."),
-    ]);
-    await client.call("wait_task", { project, taskId, timeoutSeconds: 30 });
-
-    const events = await readAll(client, { project, taskId }, 50);
-    const tool = events.find((event) => event.kind === "tool");
-    expect(tool.text).toBe('Bash {"command":"echo [REDACTED]"}');
-    expect(JSON.stringify(events)).not.toContain("SECRET");
-  });
-
   it("bounds the result and serves all of it from the stored result, whatever its size", async () => {
     const summary = `${"s".repeat(17_000)}-END`;
     const evidence = Array.from({ length: 2_200 }, (_, index) => `evidence ${index}`);
