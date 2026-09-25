@@ -1678,6 +1678,8 @@ export class TaskService {
    * Checks that a response fits the request. Returns it as given, in a stable
    * form, and as Claude receives it: answers go by question position, because
    * the parent answers the question texts as displayed, which tell duplicates apart.
+   * Claude Code looks answers up by the original question text, so questions
+   * with the same original text must get the same answer.
    */
   private checkResponse(
     request: RequestRow,
@@ -1708,12 +1710,11 @@ export class TaskService {
       );
     }
     const answers = asked.map((question) => response.answers[question]!);
-    // Claude Code looks answers up by the original question text, so one text gets one answer.
-    const texts = (
+    const originals = (
       (JSON.parse(request.payload) as { questions?: { question?: unknown }[] }).questions ?? []
     ).map((item) => item.question);
-    texts.forEach((text, index) => {
-      const earlier = texts.indexOf(text);
+    originals.forEach((text, index) => {
+      const earlier = originals.indexOf(text);
       if (earlier < index && answers[earlier] !== answers[index]) {
         throw new ServiceError(
           "conflicting_answers",

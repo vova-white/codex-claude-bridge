@@ -158,7 +158,6 @@ describe("child questions", () => {
       "Revoke the token? (question 2) (question 3)",
     ]);
 
-    // Claude Code takes one answer per question text, so identical questions need the same one.
     const respond = (answers: string[]) =>
       client.call("respond_to_request", {
         project,
