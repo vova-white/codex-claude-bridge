@@ -1,0 +1,250 @@
+import { afterEach, describe, expect, it } from "vite-plus/test";
+import type { Scenario, Step } from "../fixtures/fake-claude.ts";
+import { BridgeFixture, isAlive, waitFor, type BridgeClient } from "../support/bridge.ts";
+
+const fixtures: BridgeFixture[] = [];
+
+afterEach(async () => {
+  await Promise.all(fixtures.splice(0).map((fixture) => fixture.cleanup()));
+});
+
+const finished = (summary: string): Step => ({
+  result: { text: summary, structured: { summary, evidence: [], failures: [], remainingWork: [] } },
+});
+
+async function setUp(scenario: Scenario) {
+  const fixture = new BridgeFixture({ scenario });
+  fixtures.push(fixture);
+  const project = fixture.createRepository();
+  const client = await fixture.connect();
+  const started = await client.call("start_task", {
+    project,
+    requestKey: "task-1",
+    assignment: "Review the README.",
+    expectedResult: "Findings.",
+  });
+  expect(started.isError, started.text).toBe(false);
+  return {
+    fixture,
+    project,
+    client,
+    taskId: started.data.taskId as string,
+    first: started.data.executionId as string,
+  };
+}
+
+async function followUp(
+  client: BridgeClient,
+  project: string,
+  taskId: string,
+  requestKey: string,
+  message: string,
+) {
+  const result = await client.call("send_followup", { project, taskId, requestKey, message });
+  expect(result.isError, result.text).toBe(false);
+  return result.data;
+}
+
+async function finish(client: BridgeClient, project: string, taskId: string, executionId: string) {
+  const waited = await client.call("wait_task", {
+    project,
+    taskId,
+    executionId,
+    timeoutSeconds: 30,
+  });
+  return waited.data;
+}
+
+describe("follow-ups", () => {
+  it("continue the same session as a new execution without replacing the original result", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        { match: "Check the tests too", steps: [finished("Tests reviewed.")] },
+        { steps: [finished("README reviewed.")] },
+      ],
+    });
+    await finish(client, project, taskId, first);
+    const sessionId = (await client.call("task_status", { project, taskId })).data.sessionId;
+
+    const sent = await followUp(client, project, taskId, "more-1", "Check the tests too.");
+    expect(sent).toMatchObject({ created: true, delivery: "starting" });
+    expect(sent.executionId).not.toBe(first);
+    expect((await finish(client, project, taskId, sent.executionId)).status).toBe("completed");
+
+    const original = await client.call("task_result", { project, taskId });
+    expect(original.data).toMatchObject({
+      executionId: first,
+      result: { summary: "README reviewed." },
+    });
+    const later = await client.call("task_result", {
+      project,
+      taskId,
+      executionId: sent.executionId,
+    });
+    expect(later.data.result.summary).toBe("Tests reviewed.");
+    const [, resumed] = fixture.launches();
+    expect(resumed!.args.join(" ")).toContain(`--resume=${sessionId}`);
+    expect(fixture.prompts()[1]).toContain("Check the tests too.");
+  });
+
+  it("queue behind active work, deduplicate retries, and run in order", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        { match: "second", steps: [finished("Second done.")] },
+        { steps: [{ waitFor: "go" }, finished("First done.")] },
+      ],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+
+    const queued = await followUp(client, project, taskId, "more-1", "Do the second part.");
+    expect(queued).toMatchObject({ status: "queued", delivery: "queued", queuedBehind: first });
+    const retried = await followUp(client, project, taskId, "more-1", "Do the second part.");
+    expect(retried).toMatchObject({ executionId: queued.executionId, created: false });
+    const conflict = await client.call("send_followup", {
+      project,
+      taskId,
+      requestKey: "more-1",
+      message: "Something else.",
+    });
+    expect(conflict.isError).toBe(true);
+    expect(fixture.launches()).toHaveLength(1);
+
+    fixture.release("go");
+    expect((await finish(client, project, taskId, queued.executionId)).status).toBe("completed");
+    expect(fixture.prompts()).toHaveLength(2);
+    const status = (await client.call("task_status", { project, taskId })).data;
+    expect(
+      status.executions.map((execution: { ordinal: number; status: string }) => [
+        execution.ordinal,
+        execution.status,
+      ]),
+    ).toEqual([
+      [1, "completed"],
+      [2, "completed"],
+    ]);
+  });
+
+  it("run exactly once, after the original, when sent as it finishes", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        { match: "Race", steps: [finished("Follow-up done.")] },
+        { steps: [finished("Original done.")] },
+      ],
+    });
+    const sent = await followUp(client, project, taskId, "race-1", "Race the finish.");
+    expect((await finish(client, project, taskId, sent.executionId)).status).toBe("completed");
+
+    const status = (await client.call("task_status", { project, taskId })).data;
+    expect(
+      status.executions.map((execution: { executionId: string; status: string }) => [
+        execution.executionId,
+        execution.status,
+      ]),
+    ).toEqual([
+      [first, "completed"],
+      [sent.executionId, "completed"],
+    ]);
+    expect(fixture.launches()).toHaveLength(2);
+    expect(fixture.prompts()[0]).toContain("Review the README.");
+  });
+
+  it("report a lost session instead of starting an unrelated conversation", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [{ steps: [finished("Done.")] }],
+    });
+    await finish(client, project, taskId, first);
+    fixture.scenario({ lostSessions: true });
+
+    const sent = await followUp(client, project, taskId, "more-1", "Continue.");
+    const outcome = await finish(client, project, taskId, sent.executionId);
+    expect(outcome).toMatchObject({ status: "failed", reason: "session_unavailable" });
+    expect(outcome.error.action).toContain("new task");
+    expect(fixture.prompts()).toHaveLength(1);
+  });
+
+  it("report a missing session when the first execution never reached Claude", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      account: { tokenSource: "none", apiProvider: "firstParty" },
+    });
+    await finish(client, project, taskId, first);
+
+    const sent = await followUp(client, project, taskId, "more-1", "Continue.");
+    const outcome = await finish(client, project, taskId, sent.executionId);
+    expect(outcome).toMatchObject({ status: "failed", reason: "session_unavailable" });
+    expect(fixture.launches()).toHaveLength(1);
+  });
+});
+
+describe("cancellation", () => {
+  it("stops running work, cancels queued follow-ups, confirms termination, and is idempotent", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [{ steps: [{ waitFor: "never" }] }],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+    const queued = await followUp(client, project, taskId, "more-1", "Then this.");
+
+    const cancelled = await client.call("cancel_task", { project, taskId });
+    expect(cancelled.data).toMatchObject({
+      cancellation: "confirmed",
+      executions: [
+        { executionId: first, status: "cancelled", detail: { processExited: true } },
+        { executionId: queued.executionId, status: "cancelled" },
+      ],
+    });
+    const pids = fixture.launches().map((launch) => launch.pid);
+    expect(pids).toHaveLength(1);
+    expect(isAlive(pids[0]!)).toBe(false);
+
+    const again = await client.call("cancel_task", { project, taskId });
+    expect(again.data).toMatchObject({ cancellation: "none_active" });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(fixture.launches()).toHaveLength(1);
+    const status = (await client.call("task_status", { project, taskId })).data;
+    expect(status.executions.map((execution: { status: string }) => execution.status)).toEqual([
+      "cancelled",
+      "cancelled",
+    ]);
+  });
+
+  it("leaves a finished execution completed when cancellation arrives late", async () => {
+    const { project, client, taskId, first } = await setUp({
+      turns: [{ steps: [finished("Done.")] }],
+    });
+    await finish(client, project, taskId, first);
+
+    const cancelled = await client.call("cancel_task", { project, taskId });
+    expect(cancelled.data).toMatchObject({ cancellation: "none_active", executions: [] });
+    const result = await client.call("task_result", { project, taskId });
+    expect(result.data).toMatchObject({ status: "completed", result: { summary: "Done." } });
+  });
+
+  it("settles a cancellation racing completion in exactly one consistent state", async () => {
+    const { project, client, taskId, first } = await setUp({
+      turns: [{ steps: [{ assistant: "Almost there." }, finished("Done.")] }],
+    });
+    const cancelled = (await client.call("cancel_task", { project, taskId })).data;
+    const settled = await finish(client, project, taskId, first);
+    const result = (await client.call("task_result", { project, taskId })).data;
+
+    expect(["completed", "cancelled"]).toContain(settled.status);
+    if (settled.status === "completed") {
+      expect(result.result.summary).toBe("Done.");
+    } else {
+      expect(result.result).toBeNull();
+      expect(cancelled.cancellation).toBe("confirmed");
+    }
+    const again = (await client.call("task_status", { project, taskId })).data;
+    expect(again.status).toBe(settled.status);
+  });
+
+  it("lets a new follow-up continue the session after cancellation", async () => {
+    const { fixture, project, client, taskId } = await setUp({
+      turns: [{ match: "again", steps: [finished("Resumed.")] }, { steps: [{ waitFor: "never" }] }],
+    });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
+    await client.call("cancel_task", { project, taskId });
+
+    const sent = await followUp(client, project, taskId, "more-2", "Try again.");
+    expect((await finish(client, project, taskId, sent.executionId)).status).toBe("completed");
+  });
+});

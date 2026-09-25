@@ -3,6 +3,7 @@ import {
   type SDKAssistantMessageError,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
+import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { redact } from "../redact.ts";
 import { classifyCredentials, credentialAction, withTimeout } from "./readiness.ts";
@@ -14,6 +15,7 @@ export type FailureReason =
   | "authentication"
   | "subscription_limit"
   | "invalid_request"
+  | "session_unavailable"
   | "provider_error";
 
 export interface ExecutionRequest {
@@ -27,10 +29,16 @@ export interface ExecutionRequest {
   disallowedTools: string[];
   model?: string;
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /** Session to continue; the prompt is sent only if Claude Code can resume it. */
+  resume?: string;
+  /** Aborting stops Claude Code; the outcome is then `cancelled`. */
+  signal: AbortSignal;
   secrets: readonly string[];
 }
 
 export interface ExecutionObserver {
+  /** The operating-system process of Claude Code, known once it has started. */
+  process(pid: number): void;
   session(id: string): void;
   /** Called with the reset time while Claude Code waits for subscription capacity, and with undefined once it proceeds. */
   capacity(waiting: { resetsAt?: number } | undefined): void;
@@ -42,6 +50,8 @@ export interface ExecutionObserver {
 
 export type ExecutionOutcome =
   | { status: "completed"; text: string; structured?: unknown }
+  /** `processExited` confirms that the Claude Code process is gone. */
+  | { status: "cancelled"; processExited: boolean }
   | {
       status: "failed";
       reason: FailureReason;
@@ -108,6 +118,14 @@ class Input implements AsyncIterable<SDKUserMessage> {
   }
 }
 
+/** Whether `event` settles within `ms`. */
+function within(event: Promise<void>, ms: number): Promise<boolean> {
+  return Promise.race([
+    event.then(() => true),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
+  ]);
+}
+
 /**
  * Runs one prompt through Claude Code. The session's credential source and the
  * requested model are checked before the prompt is sent, so a rejected
@@ -120,6 +138,11 @@ export async function runExecution(
   const stderr: string[] = [];
   const input = new Input();
   const abort = new AbortController();
+  if (request.signal.aborted) return { status: "cancelled", processExited: true };
+  const cancel = () => abort.abort();
+  request.signal.addEventListener("abort", cancel, { once: true });
+  let child: ChildProcess | undefined;
+  let exited: Promise<void> = Promise.resolve();
   const failed = (
     reason: FailureReason,
     message: string,
@@ -138,12 +161,29 @@ export async function runExecution(
       env: request.env,
       extraArgs: request.extraArgs,
       abortController: abort,
-      stderr: (data) => {
-        stderr.push(data);
-        if (stderr.length > 50) stderr.shift();
+      // Spawning here gives the bridge the process itself, so termination can be confirmed.
+      spawnClaudeCodeProcess: (options) => {
+        const process = spawn(options.command, options.args, {
+          cwd: options.cwd,
+          env: options.env as NodeJS.ProcessEnv,
+          stdio: ["pipe", "pipe", "pipe"],
+          signal: options.signal,
+        });
+        child = process;
+        exited = new Promise((resolve) => {
+          process.once("exit", () => resolve());
+          process.once("error", () => resolve());
+        });
+        process.stderr.on("data", (data: Buffer) => {
+          stderr.push(data.toString());
+          if (stderr.length > 50) stderr.shift();
+        });
+        if (process.pid) observer.process(process.pid);
+        return process;
       },
       ...(request.model ? { model: request.model } : {}),
       ...(request.effort ? { effort: request.effort } : {}),
+      ...(request.resume ? { resume: request.resume } : {}),
       permissionMode: "default",
       disallowedTools: request.disallowedTools,
       canUseTool: async (tool, toolInput) =>
@@ -159,8 +199,32 @@ export async function runExecution(
     },
   });
   const diagnostics = () => stderr.join("").trim();
+  const cancelled = async (): Promise<ExecutionOutcome> => {
+    session.close();
+    let processExited = await within(exited, 10_000);
+    if (!processExited && child) {
+      child.kill("SIGKILL");
+      processExited = await within(exited, 5_000);
+    }
+    return { status: "cancelled", processExited };
+  };
   try {
-    const init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
+    let init;
+    try {
+      init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
+    } catch (error) {
+      if (request.resume && /no conversation found/i.test((error as Error).message)) {
+        return failed(
+          "session_unavailable",
+          `Claude Code cannot resume session ${request.resume}; the message was not sent.`,
+          {
+            action:
+              "Start a new task with the context the follow-up needs; the earlier results stay available.",
+          },
+        );
+      }
+      throw error;
+    }
     const credentials = classifyCredentials(init.account);
     if (!credentials.verified) {
       return failed(
@@ -181,6 +245,7 @@ export async function runExecution(
       );
     }
 
+    if (request.signal.aborted) return await cancelled();
     input.push(request.prompt);
     let lastError: SDKAssistantMessageError | undefined;
     let resetsAt: number | undefined;
@@ -227,13 +292,16 @@ export async function runExecution(
         });
       }
     }
+    if (request.signal.aborted) return await cancelled();
     return failed("provider_error", `Claude Code exited without a result. ${diagnostics()}`.trim());
   } catch (error) {
+    if (request.signal.aborted) return await cancelled();
     return failed(
       "provider_error",
       [(error as Error).message, diagnostics()].filter(Boolean).join(" — "),
     );
   } finally {
+    request.signal.removeEventListener("abort", cancel);
     input.close();
     session.close();
     abort.abort();

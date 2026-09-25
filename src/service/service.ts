@@ -21,6 +21,8 @@ export const operations = [
   "task_result",
   "wait_task",
   "read_output",
+  "send_followup",
+  "cancel_task",
 ];
 
 function writePrivate(path: string, content: string): void {
@@ -101,6 +103,8 @@ async function start(
       task_result: (params, { caller }) => tasks.result(caller, params),
       wait_task: (params, { caller }) => tasks.wait(caller, params),
       read_output: (params, { caller }) => tasks.readOutput(caller, params),
+      send_followup: (params, { caller }) => tasks.followUp(caller, params),
+      cancel_task: (params, { caller }) => tasks.cancel(caller, params),
     },
     (error) => log(`request failed: ${(error as Error).stack ?? String(error)}`),
   );

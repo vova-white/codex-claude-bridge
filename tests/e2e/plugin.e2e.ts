@@ -43,6 +43,8 @@ test("the plugin copied into a Codex cache reaches the service through its MCP e
         "task_result",
         "wait_task",
         "read_output",
+        "send_followup",
+        "cancel_task",
       ],
     });
   } finally {

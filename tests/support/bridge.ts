@@ -128,7 +128,7 @@ export class BridgeFixture {
   }
 
   /** Arguments and working directory of each scripted Claude Code process. */
-  launches(): { args: string[]; cwd: string }[] {
+  launches(): { args: string[]; cwd: string; pid: number }[] {
     return readLines(this.launchLog)
       .map((line) => JSON.parse(line))
       .filter((launch) => !launch.args.includes("--version"));

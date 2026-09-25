@@ -39,6 +39,14 @@ const migrations: string[] = [
   );
   CREATE INDEX events_by_execution ON events (execution_id, seq);
   ALTER TABLE executions ADD COLUMN events_pruned INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE executions ADD COLUMN kind TEXT NOT NULL DEFAULT 'start';
+  ALTER TABLE executions ADD COLUMN input TEXT;
+  ALTER TABLE executions ADD COLUMN request_key TEXT;
+  ALTER TABLE executions ADD COLUMN request_hash TEXT;
+  ALTER TABLE executions ADD COLUMN provider_pid INTEGER;
+  ALTER TABLE executions ADD COLUMN cancel_requested_at TEXT;
+  CREATE UNIQUE INDEX executions_by_request_key ON executions (task_id, request_key)
+    WHERE request_key IS NOT NULL`,
 ];
 
 export class StoreLockedError extends Error {}
