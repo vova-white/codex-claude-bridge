@@ -1,0 +1,3 @@
+# Use node:sqlite and an exclusive database lock for service ownership
+
+The bridge stores its state with Node's built-in `node:sqlite` module, which completes the binding choice left open by ADR 0003. It needs no native addon or install script, so the plugin bundle runs from Codex's plugin cache without `node_modules`. The service opens the database in exclusive locking mode and holds the lock for its lifetime; a second service started for the same state directory fails to lock it and exits, and the operating system releases the lock when the owner dies, so a crashed service never blocks its replacement. Nothing else reads the database while the service runs: diagnostics and tests go through the service interface.

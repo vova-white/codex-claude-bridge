@@ -5,13 +5,19 @@ export default defineConfig({
     ignorePatterns: [
       "bun.lock",
       "dist/**",
+      "plugins/claude-bridge/dist/**",
       "test-results/**",
       "playwright-report/**",
       ".vite-hooks/_/**",
     ],
   },
   lint: {
-    ignorePatterns: ["dist/**", "test-results/**", "playwright-report/**"],
+    ignorePatterns: [
+      "dist/**",
+      "plugins/claude-bridge/dist/**",
+      "test-results/**",
+      "playwright-report/**",
+    ],
     categories: { correctness: "error", suspicious: "warn" },
     rules: { "no-debugger": "error" },
   },
@@ -24,6 +30,8 @@ export default defineConfig({
     dts: false,
     sourcemap: true,
     clean: true,
+    // The plugin runs from Codex's plugin cache without node_modules.
+    deps: { alwaysBundle: [/.*/], onlyBundle: false },
   },
   test: {
     environment: "node",

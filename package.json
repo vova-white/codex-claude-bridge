@@ -12,6 +12,7 @@
     "format": "vp fmt --write",
     "format:check": "vp fmt --check",
     "build": "vp pack",
+    "build:plugin": "node scripts/build-plugin.ts",
     "build:check": "node scripts/build-check.ts",
     "test": "vp test run",
     "test:unit": "vp test run tests/unit",
@@ -21,6 +22,11 @@
     "hooks:install": "vp config --no-agent",
     "hooks:check": "node scripts/verify-hooks.ts",
     "prepare": "vp config --no-agent"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.282",
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",

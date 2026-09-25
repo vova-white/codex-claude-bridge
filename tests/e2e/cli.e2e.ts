@@ -26,7 +26,7 @@ test("help explains the available commands", () => {
   const result = invoke("--help");
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("--version");
-  expect(result.stdout).toContain("Delegation is not implemented yet");
+  expect(result.stdout).toContain("mcp");
   expect(result.stderr).toBe("");
 });
 
