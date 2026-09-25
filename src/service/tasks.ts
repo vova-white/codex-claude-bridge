@@ -609,7 +609,9 @@ export class TaskService {
       this.record(
         execution.id,
         "status",
-        "Interrupted: the bridge service stopped while this execution ran.",
+        execution.status === "queued"
+          ? "Interrupted: the machine restarted, and whether this execution had started is unknown."
+          : "Interrupted: the bridge service stopped while this execution ran.",
       );
       // Nested agents run inside the Claude Code process, so they ended with it.
       const exited = recovery === "ended" || recovery === "stopped";
