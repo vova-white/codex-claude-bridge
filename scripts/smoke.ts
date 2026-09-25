@@ -81,8 +81,13 @@ function failure(status: Status): string {
     .join(" | ");
 }
 
+/** MCP clients still open, closed on the way out so a failure cannot keep the process alive. */
+const clients = new Set<Client>();
+
+/** Connects as Codex does; calls may take up to 3 minutes, longer than any wait_task below. */
 async function connect() {
   const client = new Client({ name: "bridge-smoke", version: "0.0.0" });
+  clients.add(client);
   await client.connect(
     new StdioClientTransport({
       command: process.execPath,
@@ -92,14 +97,20 @@ async function connect() {
     }),
   );
   const call = async <T>(tool: string, args: Record<string, unknown>): Promise<T> => {
-    const result = await client.callTool({ name: tool, arguments: args });
+    const result = await client.callTool({ name: tool, arguments: args }, undefined, {
+      timeout: 180_000,
+    });
     const content = result.content as { type: string; text?: string }[];
     if (result.isError) {
       throw new Error(`${tool} failed: ${content.map((part) => part.text ?? "").join(" ")}`);
     }
     return (result.structuredContent ?? JSON.parse(content[0]?.text ?? "null")) as T;
   };
-  return { call, close: () => client.close() };
+  const close = async () => {
+    clients.delete(client);
+    await client.close();
+  };
+  return { call, close };
 }
 
 type Connection = Awaited<ReturnType<typeof connect>>;
@@ -280,6 +291,7 @@ try {
 } catch (error) {
   check("run", false, error instanceof Error ? error.message : String(error));
 } finally {
+  for (const client of clients) await client.close().catch(() => undefined);
   // Without a readiness report, the PID the service recorded in this run's own state directory.
   servicePid ??= recordedPid();
   if (servicePid !== undefined) await stopService(servicePid);
