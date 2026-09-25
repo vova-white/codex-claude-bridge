@@ -1,5 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -117,6 +125,11 @@ export class BridgeFixture {
     writeFileSync(join(this.root, name), "");
   }
 
+  /** Whether a scripted `signal` step with this name has run. */
+  signalled(name: string): boolean {
+    return existsSync(join(this.root, name));
+  }
+
   /** Prompts the scripted Claude Code received, in order. */
   prompts(): string[] {
     return readLines(this.promptLog).map((line) => {
@@ -159,6 +172,8 @@ export class BridgeFixture {
     await Promise.all([...this.clients].map((client) => client.close()));
     this.servicePid();
     await Promise.all([...this.servicePids].map((pid) => stopProcess(pid)));
+    // Scripted Claude Code processes this fixture launched, such as ones told to ignore termination.
+    await Promise.all(this.launches().map((launch) => stopProcess(launch.pid)));
     rmSync(this.root, { recursive: true, force: true });
   }
 }

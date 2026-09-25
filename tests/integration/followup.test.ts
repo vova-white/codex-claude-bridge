@@ -126,7 +126,13 @@ describe("follow-ups", () => {
     expect((await finish(reconnected, project, taskId, second.executionId)).status).toBe(
       "completed",
     );
-    expect(fixture.prompts()).toHaveLength(3);
+    expect(fixture.prompts().map((prompt) => prompt.split("\n").find(Boolean))).toEqual([
+      "<assignment>",
+      "<follow-up>",
+      "<follow-up>",
+    ]);
+    expect(fixture.prompts()[1]).toContain("Do the second part.");
+    expect(fixture.prompts()[2]).toContain("Then a second part.");
     const status = (await reconnected.call("task_status", { project, taskId })).data;
     expect(
       status.executions.map((execution: { ordinal: number; status: string }) => [
@@ -261,6 +267,26 @@ describe("cancellation", () => {
     expect(isAlive(fixture.launches()[0]!.pid)).toBe(false);
   }, 30_000);
 
+  it("does not confirm cancellation while a finished turn's process is still running", async () => {
+    const { fixture, project, client, taskId, first } = await setUp({
+      turns: [
+        {
+          steps: [{ ignoreTermination: true }, finished("Done."), { signal: "answered" }],
+        },
+      ],
+    });
+    await waitFor(() => fixture.signalled("answered") || undefined);
+
+    const cancelled = (await client.call("cancel_task", { project, taskId })).data;
+    expect(isAlive(fixture.launches()[0]!.pid)).toBe(false);
+    expect(cancelled).toMatchObject({
+      cancellation: "confirmed",
+      executions: [{ executionId: first, status: "completed" }],
+    });
+    const result = await client.call("task_result", { project, taskId });
+    expect(result.data.result.summary).toBe("Done.");
+  }, 30_000);
+
   it("leaves a finished execution completed when cancellation arrives late", async () => {
     const { project, client, taskId, first } = await setUp({
       turns: [{ steps: [finished("Done.")] }],
@@ -274,9 +300,10 @@ describe("cancellation", () => {
   });
 
   it("settles a cancellation racing completion in exactly one consistent state", async () => {
-    const { project, client, taskId, first } = await setUp({
+    const { fixture, project, client, taskId, first } = await setUp({
       turns: [{ steps: [{ assistant: "Almost there." }, finished("Done.")] }],
     });
+    await waitFor(() => fixture.prompts().length === 1 || undefined);
     const cancelled = (await client.call("cancel_task", { project, taskId })).data;
     const settled = await finish(client, project, taskId, first);
     const result = (await client.call("task_result", { project, taskId })).data;

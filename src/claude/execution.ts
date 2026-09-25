@@ -46,10 +46,9 @@ export interface ExecutionObserver {
   toolCall(name: string, input: unknown): void;
 }
 
-export type ExecutionOutcome =
+type TurnOutcome =
   | { status: "completed"; text: string; structured?: unknown }
-  /** `processExited` confirms that the Claude Code process is gone. */
-  | { status: "cancelled"; processExited: boolean }
+  | { status: "cancelled" }
   | {
       status: "failed";
       reason: FailureReason;
@@ -57,6 +56,9 @@ export type ExecutionOutcome =
       action?: string;
       detail?: { resetsAt?: number };
     };
+
+/** `processExited` confirms that the Claude Code process is gone, whatever the outcome. */
+export type ExecutionOutcome = TurnOutcome & { processExited: boolean };
 
 /** The shape Claude Code must return its final answer in. */
 export const reportedResult = z.object({
@@ -137,15 +139,20 @@ export async function runExecution(
   const input = new Input();
   const abort = new AbortController();
   if (request.signal.aborted) return { status: "cancelled", processExited: true };
+  // Stops Claude Code and reports whether its process has really exited.
+  const shutdown = async (): Promise<boolean> => {
+    input.close();
+    session.close();
+    if (!child) return true;
+    if (await within(exited, 10_000)) return true;
+    child.kill("SIGKILL");
+    return within(exited, 5_000);
+  };
   const cancel = () => abort.abort();
   request.signal.addEventListener("abort", cancel, { once: true });
   let child: ChildProcess | undefined;
   let exited: Promise<void> = Promise.resolve();
-  const failed = (
-    reason: FailureReason,
-    message: string,
-    extra: object = {},
-  ): ExecutionOutcome => ({
+  const failed = (reason: FailureReason, message: string, extra: object = {}): TurnOutcome => ({
     status: "failed",
     reason,
     message: redact(message, request.secrets),
@@ -200,111 +207,108 @@ export async function runExecution(
     },
   });
   const diagnostics = () => stderr.join("").trim();
-  const cancelled = async (): Promise<ExecutionOutcome> => {
-    session.close();
-    let processExited = await within(exited, 10_000);
-    if (!processExited && child) {
-      child.kill("SIGKILL");
-      processExited = await within(exited, 5_000);
-    }
-    return { status: "cancelled", processExited };
-  };
-  try {
-    let init;
+  const turn = async (): Promise<TurnOutcome> => {
     try {
-      init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
-    } catch (error) {
-      if (request.resume && /no conversation found/i.test((error as Error).message)) {
+      let init;
+      try {
+        init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
+      } catch (error) {
+        if (request.resume && /no conversation found/i.test((error as Error).message)) {
+          return failed(
+            "session_unavailable",
+            `Claude Code cannot resume session ${request.resume}; the message was not sent.`,
+            {
+              action:
+                "Start a new task with the context the follow-up needs; the earlier results stay available.",
+            },
+          );
+        }
+        throw error;
+      }
+      const credentials = classifyCredentials(init.account);
+      if (!credentials.verified) {
         return failed(
-          "session_unavailable",
-          `Claude Code cannot resume session ${request.resume}; the message was not sent.`,
-          {
-            action:
-              "Start a new task with the context the follow-up needs; the earlier results stay available.",
-          },
+          "authentication",
+          `Claude Code is not using a verified subscription login (source: ${credentials.source}); the brief was not sent.`,
+          { action: credentialAction(credentials) },
         );
       }
-      throw error;
-    }
-    const credentials = classifyCredentials(init.account);
-    if (!credentials.verified) {
-      return failed(
-        "authentication",
-        `Claude Code is not using a verified subscription login (source: ${credentials.source}); the brief was not sent.`,
-        { action: credentialAction(credentials) },
-      );
-    }
-    if (
-      request.model &&
-      !init.models.some(
-        (model) => model.value === request.model || model.resolvedModel === request.model,
-      )
-    ) {
-      return failed(
-        "invalid_request",
-        `Model ${request.model} is not available in Claude Code; the brief was not sent. Available: ${init.models.map((model) => model.value).join(", ")}.`,
-      );
-    }
-
-    if (request.signal.aborted) return await cancelled();
-    input.push(request.prompt);
-    let lastError: SDKAssistantMessageError | undefined;
-    let resetsAt: number | undefined;
-    for await (const message of session) {
-      if (message.type === "system" && message.subtype === "init") {
-        observer.session(message.session_id);
-      } else if (message.type === "rate_limit_event") {
-        const info = message.rate_limit_info;
-        if (info.status === "rejected") {
-          resetsAt = info.resetsAt;
-          observer.capacity(resetsAt === undefined ? {} : { resetsAt });
-        } else {
-          observer.capacity(undefined);
-        }
-      } else if (message.type === "assistant") {
-        if (message.error) lastError = message.error;
-        for (const block of message.message.content) {
-          if (block.type === "text" && block.text.trim()) {
-            observer.message(block.text);
-          } else if (block.type === "tool_use") {
-            observer.toolCall(block.name, block.input);
-          }
-        }
-      } else if (message.type === "result") {
-        if (message.subtype === "success" && !message.is_error) {
-          return {
-            status: "completed",
-            text: message.result,
-            ...(message.structured_output === undefined
-              ? {}
-              : { structured: message.structured_output }),
-          };
-        }
-        const reason = failureReason(lastError);
-        const text =
-          message.subtype === "success" ? message.result : message.errors?.join("; ") || "";
-        return failed(reason, text || `Claude Code ended the turn with ${message.subtype}.`, {
-          ...(reason === "subscription_limit" && resetsAt !== undefined
-            ? { detail: { resetsAt } }
-            : {}),
-          ...(reason === "authentication"
-            ? { action: "Run `claude`, then `/login` with your Claude subscription account." }
-            : {}),
-        });
+      if (
+        request.model &&
+        !init.models.some(
+          (model) => model.value === request.model || model.resolvedModel === request.model,
+        )
+      ) {
+        return failed(
+          "invalid_request",
+          `Model ${request.model} is not available in Claude Code; the brief was not sent. Available: ${init.models.map((model) => model.value).join(", ")}.`,
+        );
       }
+
+      if (request.signal.aborted) return { status: "cancelled" };
+      input.push(request.prompt);
+      let lastError: SDKAssistantMessageError | undefined;
+      let resetsAt: number | undefined;
+      for await (const message of session) {
+        if (message.type === "system" && message.subtype === "init") {
+          observer.session(message.session_id);
+        } else if (message.type === "rate_limit_event") {
+          const info = message.rate_limit_info;
+          if (info.status === "rejected") {
+            resetsAt = info.resetsAt;
+            observer.capacity(resetsAt === undefined ? {} : { resetsAt });
+          } else {
+            observer.capacity(undefined);
+          }
+        } else if (message.type === "assistant") {
+          if (message.error) lastError = message.error;
+          for (const block of message.message.content) {
+            if (block.type === "text" && block.text.trim()) {
+              observer.message(block.text);
+            } else if (block.type === "tool_use") {
+              observer.toolCall(block.name, block.input);
+            }
+          }
+        } else if (message.type === "result") {
+          if (message.subtype === "success" && !message.is_error) {
+            return {
+              status: "completed",
+              text: message.result,
+              ...(message.structured_output === undefined
+                ? {}
+                : { structured: message.structured_output }),
+            };
+          }
+          const reason = failureReason(lastError);
+          const text =
+            message.subtype === "success" ? message.result : message.errors?.join("; ") || "";
+          return failed(reason, text || `Claude Code ended the turn with ${message.subtype}.`, {
+            ...(reason === "subscription_limit" && resetsAt !== undefined
+              ? { detail: { resetsAt } }
+              : {}),
+            ...(reason === "authentication"
+              ? { action: "Run `claude`, then `/login` with your Claude subscription account." }
+              : {}),
+          });
+        }
+      }
+      if (request.signal.aborted) return { status: "cancelled" };
+      return failed(
+        "provider_error",
+        `Claude Code exited without a result. ${diagnostics()}`.trim(),
+      );
+    } catch (error) {
+      if (request.signal.aborted) return { status: "cancelled" };
+      return failed(
+        "provider_error",
+        [(error as Error).message, diagnostics()].filter(Boolean).join(" — "),
+      );
+    } finally {
+      request.signal.removeEventListener("abort", cancel);
     }
-    if (request.signal.aborted) return await cancelled();
-    return failed("provider_error", `Claude Code exited without a result. ${diagnostics()}`.trim());
-  } catch (error) {
-    if (request.signal.aborted) return await cancelled();
-    return failed(
-      "provider_error",
-      [(error as Error).message, diagnostics()].filter(Boolean).join(" — "),
-    );
-  } finally {
-    request.signal.removeEventListener("abort", cancel);
-    input.close();
-    session.close();
-    abort.abort();
-  }
+  };
+  const outcome = await turn();
+  const processExited = await shutdown();
+  abort.abort();
+  return { ...outcome, processExited };
 }

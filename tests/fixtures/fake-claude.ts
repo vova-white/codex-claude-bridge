@@ -16,6 +16,8 @@ export type Step =
   | { rateLimit: { status: "allowed" | "allowed_warning" | "rejected"; resetsAt?: number } }
   /** Waits until the named file exists, relative to the scenario file. */
   | { waitFor: string }
+  /** Creates the named file next to the scenario file, so a test can wait for this point. */
+  | { signal: string }
   /** Writes a file relative to the working directory, as a shell command could. */
   | { writeFile: { path: string; content: string } }
   /** Runs a command in the working directory, as the Bash tool could. */
@@ -187,6 +189,8 @@ async function answer(prompt: string): Promise<void> {
         uuid: randomUUID(),
         session_id: sessionId,
       });
+    } else if ("signal" in step) {
+      writeFileSync(resolve(scenarioDir, step.signal), "");
     } else if ("waitFor" in step) {
       await waitForFile(resolve(scenarioDir, step.waitFor));
     } else if ("writeFile" in step) {
@@ -194,6 +198,8 @@ async function answer(prompt: string): Promise<void> {
     } else if ("ignoreTermination" in step) {
       ignoreTermination = true;
       process.on("SIGTERM", () => {});
+      // Stay alive after stdin closes, as a hung process would.
+      setInterval(() => {}, 60_000);
     } else if ("exec" in step) {
       const [command = "true", ...commandArgs] = step.exec;
       execFileSync(command, commandArgs, { cwd: process.cwd() });

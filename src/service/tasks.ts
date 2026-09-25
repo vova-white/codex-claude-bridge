@@ -524,12 +524,13 @@ export class TaskService {
       new Promise((resolve) => setTimeout(resolve, cancelConfirmationMs)),
     ]);
     const executions = active.map((execution) => this.executionById(task.id, execution.id));
+    // Every terminal state is written after Claude Code's process exited, or
+    // records processExited: false when it could not be confirmed.
     const confirmed = executions.every(
       (execution) =>
         terminalStatuses.includes(execution.status) &&
-        (execution.status !== "cancelled" ||
-          (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
-            false),
+        (JSON.parse(execution.detail ?? "{}") as { processExited?: boolean }).processExited !==
+          false,
     );
     return {
       taskId: task.id,
@@ -792,6 +793,7 @@ export class TaskService {
         reason: "provider_error",
         message: "Claude Code was not found.",
         action: `Install Claude Code, or set "claudeExecutable" in ${this.paths.config}.`,
+        processExited: true,
       };
     } else if (followUp && !task.session_id) {
       // Never answer a follow-up in a new, unrelated conversation.
@@ -801,6 +803,7 @@ export class TaskService {
         message: "The task has no Claude session to continue; the follow-up was not sent.",
         action:
           "Start a new task with the context the follow-up needs; the earlier results stay available.",
+        processExited: true,
       };
     } else {
       before = await checkoutState(root);
@@ -891,7 +894,13 @@ export class TaskService {
       const failed = this.update(executionId, {
         status: "failed",
         reason: outcome.reason,
-        detail: outcome.detail ? JSON.stringify(outcome.detail) : null,
+        detail:
+          outcome.detail || !outcome.processExited
+            ? JSON.stringify({
+                ...outcome.detail,
+                ...(outcome.processExited ? {} : { processExited: false }),
+              })
+            : null,
         error: JSON.stringify({
           message: [outcome.message, ...violation].join(" "),
           ...(outcome.action ? { action: outcome.action } : {}),
@@ -918,7 +927,7 @@ export class TaskService {
     const completed = this.update(executionId, {
       status: "completed",
       reason: null,
-      detail: null,
+      detail: outcome.processExited ? null : JSON.stringify({ processExited: false }),
       result: JSON.stringify(result),
       ended_at: endedAt,
     });
