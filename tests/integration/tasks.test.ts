@@ -352,50 +352,104 @@ describe("read-only delegated tasks", () => {
     const status = await statusWhen(client, project, taskId, terminal);
     expect(status).toMatchObject({ status: "failed", reason: "invalid_request" });
     expect(status.error.message).toContain("gpt-imaginary");
+    expect(status.error.action).toContain("readiness");
     expect(fixture.prompts()).toEqual([]);
   });
 
-  it.each<{ name: string; steps: Step[]; reason: string; detail?: object }>([
+  // Text Claude Code, the SDK, or an MCP server might produce, quoting configured credentials.
+  const trackerUrl = "https://user:url-password-1@tracker.invalid/mcp?key=red%20blue";
+  const leaked = `LEAK-MARKER Bearer tok-FAILSECRET at ${trackerUrl} (red+blue)`;
+  it.each<{
+    name: string;
+    steps: Step[];
+    reason: string;
+    category: string;
+    action: string;
+    resets?: string;
+    detail?: object;
+  }>([
     {
       name: "an authentication failure",
       steps: [
-        { assistantError: "authentication_failed", text: "Please run /login" },
-        { result: { isError: true, text: "Please run /login" } },
+        { assistantError: "authentication_failed", text: leaked },
+        { result: { isError: true, text: leaked } },
       ],
       reason: "authentication",
+      category: "authentication_failed",
+      action: "/login",
     },
     {
       name: "an exhausted subscription limit",
       steps: [
         { rateLimit: { status: "rejected", resetsAt: 1_900_000_000 } },
-        { assistantError: "rate_limit", text: "Limit reached" },
-        { result: { isError: true, text: "Limit reached" } },
+        { assistantError: "rate_limit", text: leaked },
+        { result: { isError: true, text: leaked } },
       ],
       reason: "subscription_limit",
+      category: "rate_limit",
+      resets: "2030-03-17T17:46:40.000Z",
+      action: "new request key",
       detail: { resetsAt: 1_900_000_000 },
     },
     {
       name: "a provider error",
-      steps: [{ result: { isError: true, subtype: "error_during_execution", errors: ["boom"] } }],
+      steps: [
+        { result: { isError: true, subtype: "error_during_execution", errors: [leaked, leaked] } },
+      ],
       reason: "provider_error",
+      category: "error_during_execution",
+      action: "/resume",
     },
     {
       name: "a crashed Claude Code process",
-      steps: [{ exit: { code: 1, stderr: "fatal: token sk-ant-oat01-CRASHSECRET rejected" } }],
+      steps: [{ exit: { code: 3, stderr: leaked } }],
       reason: "provider_error",
+      category: "exited with code 3",
+      action: "/resume",
     },
-  ])("reports $name as a failed execution", async ({ steps, reason, detail }) => {
-    const fixture = bridge({ scenario: { turns: [{ steps }] } });
-    const project = fixture.createRepository();
-    const client = await fixture.connect();
-    const { taskId } = await start(client, assignment(project));
+  ])(
+    "reports $name as a failed execution without Claude Code's text",
+    async ({ steps, reason, category, action, resets, detail }) => {
+      const fixture = bridge({
+        config: {
+          mcpServers: {
+            tracker: {
+              type: "http",
+              url: trackerUrl,
+              headers: { Authorization: "Bearer tok-FAILSECRET" },
+            },
+          },
+        },
+        scenario: { turns: [{ steps }] },
+      });
+      const project = fixture.createRepository();
+      const client = await fixture.connect();
+      const { taskId } = await start(client, assignment(project));
 
-    const status = await statusWhen(client, project, taskId, terminal);
-    expect(status).toMatchObject({ status: "failed", reason, ...(detail ? { detail } : {}) });
-    expect(JSON.stringify(status)).not.toContain("CRASHSECRET");
-    const result = await client.call("task_result", { project, taskId });
-    expect(result.data).toMatchObject({ status: "failed", reason, result: null });
-  });
+      const status = await statusWhen(client, project, taskId, terminal);
+      expect(status).toMatchObject({ status: "failed", reason, ...(detail ? { detail } : {}) });
+      expect(status.error.message).toContain(reason);
+      expect(status.error.message).toContain(category);
+      if (resets) expect(status.error.message).toContain(resets);
+      expect(status.error.action).toContain(action);
+      if (action === "/resume") {
+        expect(status.error.action).toContain(`/resume ${status.sessionId}`);
+        expect(status.error.action).toContain(project);
+      }
+      const result = await client.call("task_result", { project, taskId });
+      expect(result.data).toMatchObject({ status: "failed", reason, result: null });
+      for (const text of [
+        "LEAK-MARKER",
+        "FAILSECRET",
+        "url-password-1",
+        "red+blue",
+        "red%20blue",
+      ]) {
+        expect(JSON.stringify(status)).not.toContain(text);
+        expect(result.text).not.toContain(text);
+      }
+    },
+  );
 
   it("shows a running task waiting for subscription capacity", async () => {
     const fixture = bridge({

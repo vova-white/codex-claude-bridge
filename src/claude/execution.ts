@@ -3,10 +3,16 @@ import {
   type SDKAssistantMessageError,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import { spawn, type ChildProcess } from "node:child_process";
 import { z } from "zod";
 import { redact } from "../redact.ts";
-import { classifyCredentials, credentialAction, withTimeout } from "./readiness.ts";
+import {
+  claudeFailure,
+  claudeProcess,
+  classifyCredentials,
+  credentialAction,
+  modelIdentifier,
+  withTimeout,
+} from "./readiness.ts";
 
 const initializeTimeoutMs = 60_000;
 
@@ -53,7 +59,7 @@ type TurnOutcome =
       status: "failed";
       reason: FailureReason;
       message: string;
-      action?: string;
+      action: string;
       detail?: { resetsAt?: number };
     };
 
@@ -78,6 +84,42 @@ const accountErrors = new Set<SDKAssistantMessageError>([
   "billing_error",
   "cloud_credential_error",
 ]);
+
+const assistantErrors = new Set<SDKAssistantMessageError>([
+  ...accountErrors,
+  "rate_limit",
+  "overloaded",
+  "invalid_request",
+  "model_not_found",
+  "server_error",
+  "unknown",
+  "max_output_tokens",
+]);
+const resultSubtypes = new Set([
+  "success",
+  "error_during_execution",
+  "error_max_turns",
+  "error_max_budget_usd",
+  "error_max_structured_output_retries",
+]);
+const sessionIdentifier = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** How a turn ended, from the assistant error code and result subtype the bridge knows. */
+function turnFailure(error: string | undefined, subtype: string): string {
+  const reported =
+    error === undefined
+      ? ""
+      : assistantErrors.has(error as SDKAssistantMessageError)
+        ? `reported ${error} and `
+        : "reported an unrecognized error and ";
+  const ending =
+    subtype === "success"
+      ? "an error result"
+      : resultSubtypes.has(subtype)
+        ? subtype
+        : "an unrecognized result";
+  return `Claude Code ${reported}ended the turn with ${ending}`;
+}
 
 function failureReason(error: SDKAssistantMessageError | undefined): FailureReason {
   if (error && accountErrors.has(error)) return "authentication";
@@ -119,46 +161,46 @@ class Input implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-/** Whether `event` settles within `ms`. */
-function within(event: Promise<void>, ms: number): Promise<boolean> {
-  return Promise.race([
-    event.then(() => true),
-    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ms)),
-  ]);
-}
-
 /**
  * Runs one prompt through Claude Code. The session's credential source and the
  * requested model are checked before the prompt is sent, so a rejected
- * execution never reaches a model.
+ * execution never reaches a model. A failure is described only by values the
+ * bridge knows (the reason, an assistant error code, a result subtype, the
+ * process's exit, a timeout, a reset time): text from Claude Code, the SDK, or
+ * an MCP server can quote credentials in forms no filter recognizes. Every
+ * outcome is returned only after Claude Code's process has exited.
  */
 export async function runExecution(
   request: ExecutionRequest,
   observer: ExecutionObserver,
 ): Promise<ExecutionOutcome> {
-  const stderr: string[] = [];
   const input = new Input();
   const abort = new AbortController();
   if (request.signal.aborted) return { status: "cancelled", processExited: true };
-  // Stops Claude Code and reports whether its process has really exited.
-  const shutdown = async (): Promise<boolean> => {
-    input.close();
-    session.close();
-    if (!child) return true;
-    if (await within(exited, 10_000)) return true;
-    child.kill("SIGKILL");
-    return within(exited, 5_000);
-  };
+  const claude = claudeProcess();
   const cancel = () => abort.abort();
   request.signal.addEventListener("abort", cancel, { once: true });
-  let child: ChildProcess | undefined;
-  let exited: Promise<void> = Promise.resolve();
-  const failed = (reason: FailureReason, message: string, extra: object = {}): TurnOutcome => ({
+  let sessionId: string | undefined;
+  const failed = (
+    reason: FailureReason,
+    description: string,
+    action: string,
+    detail?: { resetsAt: number },
+  ): TurnOutcome => ({
     status: "failed",
     reason,
-    message: redact(message, request.secrets),
-    ...extra,
+    message: redact(
+      `Execution failed with ${reason}: ${description}.${detail ? ` Subscription capacity resets at ${new Date(detail.resetsAt * 1000).toISOString()}.` : ""}`,
+      request.secrets,
+    ),
+    action,
+    ...(detail ? { detail } : {}),
   });
+  // Claude Code's full output stays on the user's screen instead of in the bridge.
+  const inspect = () =>
+    sessionId
+      ? `Run \`claude\` in ${request.cwd} and enter \`/resume ${sessionId}\` to see Claude Code's full output, then start a new task with a new request key once the problem is fixed.`
+      : `Run \`claude\` in ${request.cwd} to see whether Claude Code starts and is signed in, then start a new task with a new request key.`;
   const session = query({
     prompt: input,
     options: {
@@ -167,29 +209,9 @@ export async function runExecution(
       env: request.env,
       extraArgs: request.extraArgs,
       abortController: abort,
-      // Spawning here gives the bridge the process itself, so termination can be confirmed.
-      spawnClaudeCodeProcess: (options) => {
-        const process = spawn(options.command, options.args, {
-          cwd: options.cwd,
-          env: options.env as NodeJS.ProcessEnv,
-          stdio: ["pipe", "pipe", "pipe"],
-          signal: options.signal,
-        });
-        child = process;
-        // Only the exit event proves the process is gone: an abort also emits
-        // "error" while the process may still run. A spawn failure has no process.
-        exited = new Promise((resolve) => {
-          process.once("exit", () => resolve());
-          process.once("error", () => {
-            if (process.pid === undefined) resolve();
-          });
-        });
-        process.stderr.on("data", (data: Buffer) => {
-          stderr.push(data.toString());
-          if (stderr.length > 50) stderr.shift();
-        });
-        return process;
-      },
+      // Spawning here gives the bridge the process itself, so its exit can be
+      // confirmed and a failure described by it rather than by its output.
+      spawnClaudeCodeProcess: claude.spawn,
       ...(request.model ? { model: request.model } : {}),
       ...(request.effort ? { effort: request.effort } : {}),
       ...(request.resume ? { resume: request.resume } : {}),
@@ -207,7 +229,6 @@ export async function runExecution(
       systemPrompt: { type: "preset", preset: "claude_code", append: request.guidance },
     },
   });
-  const diagnostics = () => stderr.join("").trim();
   const turn = async (): Promise<TurnOutcome> => {
     try {
       let init;
@@ -217,11 +238,8 @@ export async function runExecution(
         if (request.resume && /no conversation found/i.test((error as Error).message)) {
           return failed(
             "session_unavailable",
-            `Claude Code cannot resume session ${request.resume}; the message was not sent.`,
-            {
-              action:
-                "Start a new task with the context the follow-up needs; the earlier results stay available.",
-            },
+            `Claude Code cannot resume session ${request.resume}; the message was not sent`,
+            "Start a new task with the context the follow-up needs; the earlier results stay available.",
           );
         }
         throw error;
@@ -230,8 +248,8 @@ export async function runExecution(
       if (!credentials.verified) {
         return failed(
           "authentication",
-          `Claude Code is not using a verified subscription login (source: ${credentials.source}); the brief was not sent.`,
-          { action: credentialAction(credentials) },
+          `Claude Code is not using a verified subscription login (source: ${credentials.source}); the brief was not sent`,
+          credentialAction(credentials) ?? inspect(),
         );
       }
       if (
@@ -240,9 +258,13 @@ export async function runExecution(
           (model) => model.value === request.model || model.resolvedModel === request.model,
         )
       ) {
+        const available = init.models
+          .map((model) => model.value)
+          .filter((value) => modelIdentifier.test(value));
         return failed(
           "invalid_request",
-          `Model ${request.model} is not available in Claude Code; the brief was not sent. Available: ${init.models.map((model) => model.value).join(", ")}.`,
+          `model ${request.model} is not available in Claude Code (available: ${available.join(", ")}); the brief was not sent`,
+          "Choose a model from the readiness `models`, or omit `model` to use Claude Code's default.",
         );
       }
 
@@ -252,6 +274,7 @@ export async function runExecution(
       let resetsAt: number | undefined;
       for await (const message of session) {
         if (message.type === "system" && message.subtype === "init") {
+          if (sessionIdentifier.test(message.session_id)) sessionId = message.session_id;
           observer.session(message.session_id);
         } else if (message.type === "rate_limit_event") {
           const info = message.rate_limit_info;
@@ -281,35 +304,48 @@ export async function runExecution(
             };
           }
           const reason = failureReason(lastError);
-          const text =
-            message.subtype === "success" ? message.result : message.errors?.join("; ") || "";
-          return failed(reason, text || `Claude Code ended the turn with ${message.subtype}.`, {
-            ...(reason === "subscription_limit" && resetsAt !== undefined
-              ? { detail: { resetsAt } }
-              : {}),
-            ...(reason === "authentication"
-              ? { action: "Run `claude`, then `/login` with your Claude subscription account." }
-              : {}),
-          });
+          const description = turnFailure(lastError, message.subtype);
+          if (reason === "authentication") {
+            return failed(
+              reason,
+              description,
+              "Run `claude`, then `/login` with your Claude subscription account.",
+            );
+          }
+          if (reason === "subscription_limit") {
+            return failed(
+              reason,
+              description,
+              "Wait until subscription capacity resets, then start a new task with a new request key.",
+              typeof resetsAt === "number" && !Number.isNaN(new Date(resetsAt * 1000).getTime())
+                ? { resetsAt }
+                : undefined,
+            );
+          }
+          return failed(reason, description, inspect());
         }
       }
       if (request.signal.aborted) return { status: "cancelled" };
       return failed(
         "provider_error",
-        `Claude Code exited without a result. ${diagnostics()}`.trim(),
+        claudeFailure(undefined, await claude.exit(), initializeTimeoutMs),
+        inspect(),
       );
     } catch (error) {
       if (request.signal.aborted) return { status: "cancelled" };
       return failed(
         "provider_error",
-        [(error as Error).message, diagnostics()].filter(Boolean).join(" — "),
+        claudeFailure(error, await claude.exit(), initializeTimeoutMs),
+        inspect(),
       );
     } finally {
       request.signal.removeEventListener("abort", cancel);
     }
   };
   const outcome = await turn();
-  const processExited = await shutdown();
+  input.close();
+  session.close();
+  const processExited = await claude.stop();
   abort.abort();
   return { ...outcome, processExited };
 }

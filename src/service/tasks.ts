@@ -759,7 +759,12 @@ export class TaskService {
         this.update(executionId, {
           status: "failed",
           reason: "provider_error",
-          error: JSON.stringify({ message: "The bridge could not run this execution." }),
+          // The error's own text can carry Claude Code's output; only its type is reported.
+          error: JSON.stringify({
+            message: `Execution failed with provider_error: the bridge service could not run it (${errorOrigin(error)}).`,
+            action:
+              "Call readiness for the project and fix any problem it reports, then start a new task with a new request key.",
+          }),
           ended_at: now(),
         });
       })
@@ -905,7 +910,7 @@ export class TaskService {
             : null,
         error: JSON.stringify({
           message: [outcome.message, ...violation].join(" "),
-          ...(outcome.action ? { action: outcome.action } : {}),
+          action: outcome.action,
           ...(modifiedFiles.length > 0 ? { modifiedFiles } : {}),
         }),
         ended_at: endedAt,
