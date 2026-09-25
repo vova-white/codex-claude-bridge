@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { checkReadiness } from "../claude/readiness.ts";
 import { ConfigError, configSecrets, loadConfig } from "../config.ts";
 import { serve, ServiceError } from "../ipc.ts";
-import { redact } from "../redact.ts";
+import { errorOrigin, redact } from "../redact.ts";
 import { secureStateDir, type StatePaths } from "../state.ts";
 import { openStore, StoreLockedError } from "./store.ts";
 import { TaskService } from "./tasks.ts";
@@ -59,7 +59,7 @@ export async function runService(paths: StatePaths): Promise<void> {
     await start(paths, log, config);
   } catch (error) {
     if (error instanceof StoreLockedError) return;
-    log(`service failed to start: ${(error as Error).stack ?? String(error)}`);
+    log(`service failed to start: ${errorOrigin(error)}`);
     throw error;
   }
 }
@@ -106,7 +106,7 @@ async function start(
       send_followup: (params, { caller }) => tasks.followUp(caller, params),
       cancel_task: (params, { caller }) => tasks.cancel(caller, params),
     },
-    (error) => log(`request failed: ${(error as Error).stack ?? String(error)}`),
+    (error) => log(`request failed: ${errorOrigin(error)}`),
   );
   writePrivate(paths.info, JSON.stringify(service));
   log(`service ${metadata.version} started (pid ${process.pid})`);
@@ -121,7 +121,7 @@ async function start(
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
   process.on("uncaughtException", (error) => {
-    log(`uncaught: ${error.stack ?? String(error)}`);
+    log(`uncaught: ${errorOrigin(error)}`);
     process.exit(1);
   });
 }

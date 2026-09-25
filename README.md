@@ -34,15 +34,17 @@ Codex copies the plugin, including the bundle in `plugins/claude-bridge/dist/`, 
 
 Codex launches `node dist/cli.mjs mcp` from the plugin. That MCP entry point keeps no state: it connects to the bridge service over a Unix socket in the state directory, starting `cli.mjs service` as a detached process when none is running. Every connection must present the random token the service writes to `service.token`. The state directory is private to the user (mode 0700), and the service holds an exclusive lock on its SQLite database ([ADR 0004](docs/adr/0004-node-sqlite-and-exclusive-state-ownership.md)), so concurrent MCP clients share one service per state directory. The service keeps running when Codex exits.
 
-The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (redacted diagnostics, rotated at 1 MB), and the optional `config.json`:
+The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (bridge-composed diagnostics, rotated at 1 MB), and the optional `config.json`:
 
-| Key                | Meaning                                                                                                         |
-| ------------------ | --------------------------------------------------------------------------------------------------------------- |
-| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`                                         |
-| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`                                     |
-| `mcpServers`       | MCP servers Claude may use, in Claude Code's format; `env`, `headers`, `args`, and URL credentials stay private |
+| Key                | Meaning                                                                     |
+| ------------------ | --------------------------------------------------------------------------- |
+| `claudeExecutable` | Absolute path to Claude Code when `claude` is not on the service `PATH`     |
+| `claudeConfigDir`  | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR` |
+| `mcpServers`       | MCP servers Claude may use, in Claude Code's format                         |
 
 The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
+
+Readiness results and `service.log` contain only diagnostics the bridge composes from known fields: problem codes, configured MCP server names, the statuses Claude Code reports for them, start-up failure categories the bridge determines itself (timeout, executable not runnable, the exit code or signal of the Claude Code process it spawned), known account values, model identifiers, and actions. Error text from Claude Code, the Agent SDK, or MCP servers, including stderr and MCP connection errors, is never copied there, so credentials it may quote cannot leak in any encoding. To see a full error, run `claude` in a terminal and inspect `/mcp`. Pattern-based redaction remains only as a backstop for the bridge's own messages and for task results; it carries no guarantee.
 
 Delegated tasks are stored in `state.db` with their executions, provider session references, and results. Each task belongs to a project (the Git root realpath) and a logical caller: `$CODEX_CLAUDE_BRIDGE_CALLER`, default `codex`, which the plugin forwards from Codex's environment. A request key identifies a start request within that scope, so retries return the existing task. A task runs in the service, not the MCP connection, and continues when Codex disconnects. Before sending the brief, the service checks that the Claude Code session uses a verified subscription login and offers the requested model. When a new service starts, executions left running by its predecessor are reported as `interrupted`.
 

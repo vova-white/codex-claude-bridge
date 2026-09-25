@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
+import { Ajv } from "ajv";
 
 /** One scripted action taken while answering a prompt. */
 export type Step =
@@ -75,6 +76,16 @@ if (process.env.FAKE_CLAUDE_LAUNCH_LOG) {
     process.env.FAKE_CLAUDE_LAUNCH_LOG,
     `${JSON.stringify({ args, cwd: process.cwd(), pid: process.pid })}\n`,
   );
+}
+// Claude Code refuses to start with a structured-output schema its validator rejects.
+const schemaIndex = args.indexOf("--json-schema");
+if (schemaIndex >= 0) {
+  try {
+    new Ajv().compile(JSON.parse(args[schemaIndex + 1] ?? ""));
+  } catch (error) {
+    console.error(`Error: --json-schema is not a valid JSON Schema: ${(error as Error).message}`);
+    process.exit(1);
+  }
 }
 if (scenario.startupError) {
   console.error(scenario.startupError);

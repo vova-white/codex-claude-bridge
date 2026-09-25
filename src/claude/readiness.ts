@@ -1,5 +1,6 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { realpathSync, writeFileSync } from "node:fs";
+import { constants } from "node:os";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import {
@@ -55,11 +56,12 @@ export interface ReadinessReport {
     apiProvider?: string;
     apiKeySource?: string;
   };
-  models: Pick<ModelInfo, "value" | "displayName" | "description" | "supportedEffortLevels">[];
+  models: Pick<ModelInfo, "value" | "supportedEffortLevels">[];
   git: { version?: string; supported: boolean; project?: { path: string; root?: string } };
   integrations: {
-    configured: { name: string; status: string; error?: string }[];
-    fromClaudeSettings: { name: string; status: string; scope?: string }[];
+    configured: { name: string; status: string }[];
+    /** Number of MCP servers from Claude Code's own settings, by status. */
+    fromClaudeSettings: Record<string, number>;
     codexTools: { inherited: false; note: string };
   };
   problems: Problem[];
@@ -76,6 +78,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   const { paths, config } = input;
   const secrets = configSecrets(config);
   const problems: Problem[] = [];
+  // Messages are composed here from known fields only; redact() is a backstop.
   const problem = (code: string, message: string, action: string, blocking = true) => {
     problems.push({ code, message: redact(message, secrets), action, blocking });
   };
@@ -96,7 +99,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     git,
     integrations: {
       configured: [],
-      fromClaudeSettings: [],
+      fromClaudeSettings: {},
       codexTools: {
         inherited: false,
         note: `Codex built-in tools, connectors, credentials, and approval policies are not available to Claude. Configure compatible MCP servers for Claude explicitly under "mcpServers" in ${paths.config}.`,
@@ -120,7 +123,7 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
   if (version.error !== undefined) {
     problem(
       "claude_missing",
-      `Cannot run ${executable} --version: ${version.error}`,
+      `Cannot run ${executable} --version: ${version.error}.`,
       `Install Claude Code, or set "claudeExecutable" in ${paths.config} to its absolute path.`,
     );
     return finish(report);
@@ -135,8 +138,9 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
     );
   }
 
-  const stderr: string[] = [];
   const abort = new AbortController();
+  const exit: ProcessExit = {};
+  let exited = Promise.resolve();
   const session = query({
     prompt: withoutPrompt(abort.signal),
     options: {
@@ -145,19 +149,40 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       env: claudeEnvironment(config),
       extraArgs: mcpConfigArgs(paths, config),
       abortController: abort,
-      stderr: (data) => stderr.push(data),
+      // The bridge spawns Claude Code itself so a failed start is described by the
+      // process's exit, not by text; its stderr is never read.
+      spawnClaudeCodeProcess: (options) => {
+        const child = spawn(options.command, options.args, {
+          cwd: options.cwd,
+          env: options.env as NodeJS.ProcessEnv,
+          stdio: ["pipe", "pipe", "ignore"],
+          signal: options.signal,
+        });
+        exited = new Promise((resolve) => {
+          child.once("exit", (code, signal) => resolve(void Object.assign(exit, { code, signal })));
+          child.once("error", (error: NodeJS.ErrnoException) =>
+            resolve(void Object.assign(exit, { spawnError: error.code })),
+          );
+        });
+        return child;
+      },
     },
   });
   try {
     const init = await withTimeout(session.initializationResult(), initializeTimeoutMs);
-    report.models = init.models.map(
-      ({ value, displayName, description, supportedEffortLevels }) => ({
+    // Model identifiers and effort levels only: descriptions are Claude Code's text.
+    report.models = init.models
+      .filter(({ value }) => modelIdentifier.test(value))
+      .map(({ value, supportedEffortLevels }) => ({
         value,
-        displayName,
-        description,
-        ...(supportedEffortLevels ? { supportedEffortLevels } : {}),
-      }),
-    );
+        ...(supportedEffortLevels
+          ? {
+              supportedEffortLevels: supportedEffortLevels.filter((level) =>
+                effortLevels.has(level),
+              ),
+            }
+          : {}),
+      }));
     report.credentials = classifyCredentials(init.account);
     const action = credentialAction(report.credentials);
     if (action) {
@@ -168,39 +193,44 @@ export async function checkReadiness(input: ReadinessInput): Promise<ReadinessRe
       );
     }
     const statuses = await settledIntegrations(() => session.mcpServerStatus(), config);
-    for (const status of statuses) {
-      if (status.name in config.mcpServers) {
-        report.integrations.configured.push({
-          name: status.name,
-          status: status.status,
-          ...(status.error ? { error: redact(status.error, secrets) } : {}),
-        });
-      } else {
-        report.integrations.fromClaudeSettings.push({
-          name: status.name,
-          status: status.status,
-          ...(status.scope ? { scope: status.scope } : {}),
-        });
-      }
+    // Only configured names and known statuses are reported: error text from an
+    // MCP server can quote its credentials in forms no filter recognizes.
+    // Servers from Claude's own settings are counted by status: their names are
+    // Claude Code's text, not keys of the bridge configuration.
+    const fromSettings: Record<string, number> = {};
+    for (const name of Object.keys(config.mcpServers)) {
+      const status = statuses.find((candidate) => candidate.name === name);
+      report.integrations.configured.push({
+        name,
+        status: status && knownServerStatuses.has(status.status) ? status.status : "unknown",
+      });
     }
+    for (const status of statuses) {
+      if (Object.hasOwn(config.mcpServers, status.name)) continue;
+      const state = knownServerStatuses.has(status.status) ? status.status : "unknown";
+      fromSettings[state] = (fromSettings[state] ?? 0) + 1;
+    }
+    report.integrations.fromClaudeSettings = fromSettings;
     for (const server of report.integrations.configured) {
       if (server.status !== "connected") {
         problem(
           "integration_unavailable",
-          `MCP server "${server.name}" is ${server.status}${server.error ? `: ${server.error}` : ""}.`,
-          `Check the "${server.name}" entry under "mcpServers" in ${paths.config}; Claude cannot use its tools until it connects.`,
+          `MCP server "${server.name}" is ${server.status}.`,
+          `Run \`claude\` in a terminal and inspect \`/mcp\` for the full error, then check the "${server.name}" entry under "mcpServers" in ${paths.config}. Claude cannot use its tools until it connects.`,
           false,
         );
       }
     }
   } catch (error) {
-    const detail = [(error as Error).message, stderr.join("").trim()].filter(Boolean).join(" — ");
+    // The SDK can report the failure before the process's exit event arrives.
+    await Promise.race([exited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+    const stage = startFailure(error, exit);
     problem(
       "claude_start",
-      `Claude Code could not start a session: ${detail}`,
-      "Run `claude` in a terminal to check that it starts and is signed in, then retry.",
+      `Claude Code could not start a session (${stage}).`,
+      "Run `claude` in a terminal to see the full error and check that it starts and is signed in, then retry.",
     );
-    input.log(`readiness: Claude Code start failed: ${redact(detail, secrets)}`);
+    input.log(`readiness: Claude Code could not start a session (${stage})`);
   } finally {
     session.close();
     abort.abort();
@@ -246,11 +276,54 @@ export function mcpConfigArgs(paths: StatePaths, config: BridgeConfig): Record<s
   return { "mcp-config": paths.claudeMcpConfig };
 }
 
+const apiKeySources = new Set([
+  "ANTHROPIC_API_KEY",
+  "apiKeyHelper",
+  "/login managed key",
+  "none",
+  "user",
+  "project",
+  "org",
+  "temporary",
+  "oauth",
+]);
+const apiProviders = new Set([
+  "firstParty",
+  "bedrock",
+  "vertex",
+  "foundry",
+  "anthropicAws",
+  "anthropicGoogleCloud",
+  "mantle",
+  "gateway",
+]);
+
+const subscriptionTypes = new Set([
+  "Claude Pro",
+  "Claude Max",
+  "Claude Team",
+  "Claude Enterprise",
+  "pro",
+  "max",
+  "team",
+  "enterprise",
+]);
+
+/** Keeps an account field only when it has one of the values the bridge knows. */
+function known(value: string | undefined, allowed: Set<string>): string | undefined {
+  if (value === undefined) return undefined;
+  return allowed.has(value) ? value : "other";
+}
+
 export function classifyCredentials(account: AccountInfo): ReadinessReport["credentials"] {
+  // Account fields come from Claude Code, so only known values are reported.
+  const subscriptionType = known(account.subscriptionType, subscriptionTypes);
+  const apiProvider = known(account.apiProvider, apiProviders);
+  const apiKeySource = known(account.apiKeySource, apiKeySources);
   const details = {
-    ...(account.subscriptionType ? { subscriptionType: account.subscriptionType } : {}),
-    ...(account.apiProvider ? { apiProvider: account.apiProvider } : {}),
-    ...(account.apiKeySource ? { apiKeySource: account.apiKeySource } : {}),
+    ...(subscriptionType ? { subscriptionType } : {}),
+    ...(apiProvider ? { apiProvider } : {}),
+    ...(apiKeySource ? { apiKeySource } : {}),
   };
   if (account.apiProvider && account.apiProvider !== "firstParty") {
     return { source: "third-party-provider", verified: false, ...details };
@@ -296,17 +369,53 @@ async function settledIntegrations(
   }
 }
 
+const knownServerStatuses = new Set(["connected", "failed", "needs-auth", "pending", "disabled"]);
+const knownSignals = new Set(Object.keys(constants.signals));
+const effortLevels = new Set(["low", "medium", "high", "xhigh", "max"]);
+/** Model values Claude Code accepts as identifiers, such as `sonnet` or `claude-opus-5[1m]`. */
+const modelIdentifier = /^[a-z][a-z0-9.-]{0,62}(\[[0-9a-z]{1,8}\])?$/;
+
+class TimeoutError extends Error {}
+
+/** Why a process could not be used, determined by the bridge rather than quoted from its output. */
+function processFailure(error: unknown, timeoutSeconds: number): string {
+  const failure = error as NodeJS.ErrnoException & { killed?: boolean; code?: unknown };
+  if (error instanceof TimeoutError || failure.killed) {
+    return `no response within ${timeoutSeconds} s`;
+  }
+  if (failure.code === "ENOENT") return "the executable was not found";
+  if (failure.code === "EACCES") return "the executable is not permitted to run";
+  if (typeof failure.code === "number") return `it exited with code ${failure.code}`;
+  return "it could not be run";
+}
+
+interface ProcessExit {
+  code?: number | null;
+  signal?: NodeJS.Signals | null;
+  spawnError?: string | undefined;
+}
+
+/** The start-up stage that failed, from the timeout or the process's own exit. */
+function startFailure(error: unknown, exit: ProcessExit): string {
+  if (error instanceof TimeoutError) return `no response within ${initializeTimeoutMs / 1000} s`;
+  if (exit.spawnError === "ENOENT") return "the executable was not found";
+  if (exit.spawnError === "EACCES") return "the executable is not permitted to run";
+  if (typeof exit.code === "number") return `Claude Code exited with code ${exit.code}`;
+  if (exit.signal && knownSignals.has(exit.signal)) {
+    return `Claude Code was terminated by ${exit.signal}`;
+  }
+  return "Claude Code ended before answering";
+}
+
 async function claudeVersion(
   executable: string,
 ): Promise<{ value: string; error?: undefined } | { error: string }> {
   try {
     const { stdout } = await run(executable, ["--version"], { timeout: 15_000 });
     const match = /\d+\.\d+\.\d+/.exec(stdout);
-    return match
-      ? { value: match[0] }
-      : { error: `unrecognized output ${JSON.stringify(stdout.trim())}` };
+    return match ? { value: match[0] } : { error: "it printed no recognizable version" };
   } catch (error) {
-    return { error: (error as Error).message };
+    return { error: processFailure(error, 15) };
   }
 }
 
@@ -380,7 +489,7 @@ export function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`no response within ${ms / 1000} s`)), ms);
+      timer = setTimeout(() => reject(new TimeoutError(`no response within ${ms / 1000} s`)), ms);
     }),
   ]).finally(() => clearTimeout(timer));
 }
