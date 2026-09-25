@@ -1,134 +1,164 @@
 # Codex to Claude bridge
 
-A local Codex-to-Claude delegation bridge: a personal Codex plugin with a delegation skill and a stdio MCP entry point, backed by a background service that runs Claude Code through the Claude Agent SDK with your existing Claude Code login. This release checks readiness and runs read-only delegated tasks on a shared checkout (optionally with nested read-only agents) and writing tasks in isolated Git worktrees (optionally split among nested writers in worktrees of their own) that may publish a task pull request, with bounded waits, cursor-based progress reads, answers to Claude's questions and permission requests, follow-ups to the same Claude session, cancellation, and cleanup of task worktrees and branches.
+Delegate work from Codex to Claude Code without leaving Codex. The bridge is a personal Codex plugin: Codex hands Claude a bounded task, Claude works on it in the background with your existing Claude Code login, and Codex reads the result, answers Claude's questions, and reviews what it did.
 
-## Setup
+What it can do:
 
-Use Node.js **24.21.0**, Bun **1.4.2** as the package manager, and Git **2.32+**. Node runs the application, development scripts, and both test runners. Bun only manages dependencies. [ADR 0003](docs/adr/0003-node-runtime-and-bun-package-management.md) supersedes the Bun runtime and `bun:sqlite` choices in [issue #1](https://github.com/vova-white/codex-claude-bridge/issues/1).
+- **Read-only tasks.** Reviews, investigations, and research on your current checkout, optionally with nested Claude agents.
+- **Writing tasks.** Changes in an isolated Git worktree on a separate branch, so your checkout stays untouched. Claude can split the work among parallel nested writers and, if you allow it, push the branch and open a pull request.
+- **Long-running work.** Tasks run in a background service and survive Codex restarts. Codex can wait for a task, read its progress, send follow-ups to the same Claude session, and cancel it.
+- **Questions and approvals.** When Claude asks a question or needs approval to use a tool, Codex answers.
+- **Cleanup.** Remove a task's worktrees and branches when you are done, with safeguards against losing unmerged commits.
 
-Install the pinned runtimes using your version manager or the official [Node distribution](https://nodejs.org/dist/v24.21.0/) and [Bun installer](https://bun.sh/docs/installation). An existing global Vite+ installation respects `.node-version` and `packageManager`; it is optional. The project installs Vite+ locally.
+> **Platform support.** The bridge is developed and tested on Ubuntu under WSL 2. macOS and native Windows are not tested and may not work.
+
+## Requirements
+
+- [Codex CLI](https://github.com/openai/codex)
+- [Claude Code](https://docs.claude.com/en/docs/claude-code), signed in with a Claude subscription. API keys and third-party providers are not supported.
+- Node.js **24.21.0**, on the `PATH` that Codex uses
+- Bun **1.4.2**, only to install dependencies and build
+- Git **2.32** or newer
+- Optional: the GitHub CLI (`gh`), signed in, if you want Claude to open pull requests
+
+## Installation
+
+1. Install Node.js and Bun with your version manager (the repository pins them in `.node-version` and `package.json`) or with the official [Node.js 24.21.0](https://nodejs.org/dist/v24.21.0/) and [Bun](https://bun.sh/docs/installation) installers.
+
+2. Sign in to Claude Code: run `claude`, then `/login`.
+
+3. Clone the repository and build the plugin:
+
+   ```sh
+   git clone https://github.com/vova-white/codex-claude-bridge.git
+   cd codex-claude-bridge
+   bun install --frozen-lockfile
+   bun run build:plugin
+   ```
+
+4. Register the checkout as a local plugin marketplace and install the plugin:
+
+   ```sh
+   codex plugin marketplace add "$PWD"
+   codex plugin add claude-bridge@codex-claude-bridge
+   ```
+
+5. Start Codex and ask it to check Claude readiness. It reports whether Claude Code is found and signed in and which models it offers.
+
+### Updating
+
+Codex runs its own cached copy of the plugin, so rebuilding the checkout alone changes nothing. Rebuild and reinstall:
+
+```sh
+git pull
+bun install --frozen-lockfile
+bun run build:plugin
+codex plugin remove claude-bridge@codex-claude-bridge
+codex plugin add claude-bridge@codex-claude-bridge
+```
+
+Then [stop the service](#stopping-the-service) if it is running, so the next request starts the new version.
+
+## Usage
+
+Ask Codex in plain words, for example:
+
+- "Ask Claude to review the error handling in `src/service`."
+- "Have Claude rewrite the README as a writing task and open a pull request."
+
+The plugin's `claude-delegation` skill teaches Codex how to brief Claude, wait for the result, and review it. When you have merged a writing task's branch or no longer need it, ask Codex to clean up the task.
+
+## Configuration
+
+The bridge keeps its state in `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (by default `~/.local/state/codex-claude-bridge`). Task worktrees live under `worktrees/`, and the service writes its diagnostics to `service.log`.
+
+To change the defaults, create `config.json` there. The service reads it whenever it needs it, so there is no need to restart.
+
+| Key                       | Meaning                                                                                                                                                              |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claudeExecutable`        | Absolute path to Claude Code when `claude` is not on the service `PATH`                                                                                              |
+| `claudeConfigDir`         | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`                                                                                          |
+| `mcpServers`              | MCP servers Claude may use, in Claude Code's format. `"autoApprove": true` lets Claude call a server's tools without asking Codex. `codex_claude_bridge` is reserved |
+| `maxConcurrentExecutions` | How many Claude runs may work at once across all tasks (default 2); the rest wait in line                                                                            |
+
+```json
+{
+  "maxConcurrentExecutions": 3,
+  "mcpServers": {
+    "context7": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"], "autoApprove": true }
+  }
+}
+```
+
+Codex's own tools and connectors are not available to Claude; it gets only its task's tools and the MCP servers you configure here.
+
+## How it works
+
+Codex launches the plugin's MCP server, a thin process without state. On first use it starts a background bridge service, which owns all tasks, stores them in SQLite in the state directory, and runs Claude Code through the Claude Agent SDK. One service serves every Codex session and keeps running after Codex exits, so tasks continue in the background. If the service stops, the next one marks unfinished runs as interrupted; nothing reruns on its own, but a follow-up resumes the Claude session.
+
+### Stopping the service
+
+Send `SIGTERM` to the PID recorded in `service.json` in the state directory:
+
+```sh
+kill "$(node -p 'require(process.argv[1]).pid' ~/.local/state/codex-claude-bridge/service.json)"
+```
+
+The next request to the bridge starts a new service.
+
+### Troubleshooting
+
+Bridge diagnostics (readiness problems, task errors, and `service.log`) never copy error text from Claude Code, MCP servers, `git`, or `gh`, so that credentials cannot leak through them. To see the full error, run `claude` in the project: `/mcp` shows MCP server problems, and `/resume` opens the session a failed task reports.
+
+## Development
 
 ```sh
 bun install --frozen-lockfile
 bun run dev
 ```
 
-Commit `package.json` and `bun.lock` together. Direct dependency versions are exact; use `--frozen-lockfile` for fresh clones and CI. Vite+ **1.0.0-rc.0** is a release candidate and bundles Vitest 5.0.1, Oxlint, Oxfmt, and tsdown. Type checking uses the stable **TypeScript 7.0.2 native Go compiler**, whose released command is `tsc` (previously `tsgo`). Neither Node's TypeScript execution nor the bundler checks types.
+Node runs the application, scripts, and tests; Bun only manages dependencies, so `bun test` is not used. Installing dependencies also installs the Git pre-commit hook; if you installed with `--ignore-scripts`, run `bun run hooks:install`. Tooling comes from Vite+ (Vitest, Oxlint, Oxfmt, tsdown); types are checked by the native TypeScript 7 `tsc`.
 
-`trustedDependencies: []` disables Bun's default dependency-script allowlist. The selected dependencies install without trusted dependency scripts or browser downloads. The repository's own `prepare` script still runs and installs the Vite+ hook dispatcher via `vp config --no-agent`. If installation used `--ignore-scripts`, run `bun run hooks:install` explicitly. Review any new dependency that requires an installation script before adding its name to `trustedDependencies`; do not broadly trust all packages.
+Dependency versions are exact: commit `package.json` and `bun.lock` together. `trustedDependencies` is empty on purpose, so review any dependency that needs an installation script before adding it there.
 
-## Install the Codex plugin
+Terminology is in [`CONTEXT.md`](CONTEXT.md), and design decisions are in [`docs/adr/`](docs/adr/).
 
-Requirements: Node.js 24.21.0 on the `PATH` that Codex uses, Claude Code signed in with your Claude subscription (`claude`, then `/login`), and Git 2.32+. Build the plugin bundle from a checkout, then register the checkout as a local plugin marketplace:
+### Commands
 
-```sh
-bun install --frozen-lockfile
-bun run build:plugin
-codex plugin marketplace add /path/to/codex-claude-bridge
-codex plugin add claude-bridge@codex-claude-bridge
-```
+Run them with `bun run <name>`.
 
-Codex copies the plugin, including the bundle in `plugins/claude-bridge/dist/`, into its plugin cache. After rebuilding, run `codex plugin remove claude-bridge@codex-claude-bridge` and add it again. The plugin provides the `claude-delegation` skill and the `claude_bridge` MCP server; ask Codex to check Claude readiness to verify the installation.
+| Script                           | Purpose                                                       |
+| -------------------------------- | ------------------------------------------------------------- |
+| `dev`                            | Run the CLI from source in watch mode                         |
+| `build` / `start`                | Bundle the CLI into `dist/cli.mjs` / run the bundle           |
+| `build:plugin`                   | Bundle the CLI into the plugin directory for Codex            |
+| `typecheck`                      | Strict type checking of the whole project                     |
+| `lint`                           | Oxlint; warnings fail                                         |
+| `format` / `format:check`        | Apply or verify formatting, including Markdown                |
+| `test`                           | All unit and integration tests                                |
+| `test:unit` / `test:integration` | One test category                                             |
+| `test:e2e`                       | Build a temporary bundle and run the Playwright process tests |
+| `smoke`                          | Opt-in check against the installed Claude Code                |
+| `check`                          | The full CI gate: formatting, lint, types, build, all tests   |
+| `hooks:install` / `hooks:check`  | Install the Git hook / verify it in a disposable repository   |
 
-## Architecture and state
+### Tests
 
-Codex launches `node dist/cli.mjs mcp` from the plugin. That MCP entry point keeps no state: it connects to the bridge service over a Unix socket in the state directory, starting `cli.mjs service` as a detached process when none is running. Every connection must present the random token the service writes to `service.token`. The state directory is private to the user (mode 0700), and the service holds an exclusive lock on its SQLite database ([ADR 0004](docs/adr/0004-node-sqlite-and-exclusive-state-ownership.md)), so concurrent MCP clients share one service per state directory. The service keeps running when Codex exits.
+- `tests/unit/`: argument parsing, Claude Code version compatibility, and diagnostic redaction.
+- `tests/integration/`: the public MCP boundary. Each test runs the real MCP server and service in its own temporary state directory, with `tests/fixtures/fake-claude.ts` in place of Claude Code and `tests/fixtures/fake-gh.ts` in place of `gh`.
+- `tests/e2e/`: Playwright runs the built plugin outside the checkout, the way Codex installs it. No browsers are needed.
 
-The state directory is `$CODEX_CLAUDE_BRIDGE_HOME`, or `$XDG_STATE_HOME/codex-claude-bridge` (default `~/.local/state/codex-claude-bridge`). It contains `state.db`, `service.sock`, `service.token`, `service.json` (PID and version), `service.log` (bridge-composed diagnostics, rotated at 1 MB), and the optional `config.json`:
+Automated tests need no Claude credentials, model calls, or GitHub access. `bun run smoke` is the exception and never runs in CI: it drives the bridge against your installed Claude Code and login in a temporary directory and spends a little subscription usage. `--readiness-only` stops before sending a prompt, `--bundle` uses `dist/cli.mjs`, and `--claude <path>` names the Claude Code executable.
 
-| Key                       | Meaning                                                                                                                                                                            |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `claudeExecutable`        | Absolute path to Claude Code when `claude` is not on the service `PATH`                                                                                                            |
-| `claudeConfigDir`         | Separate Claude Code configuration directory, passed as `CLAUDE_CONFIG_DIR`                                                                                                        |
-| `mcpServers`              | MCP servers Claude may use, in Claude Code's format. `"autoApprove": true` on an entry lets Claude call its tools without asking Codex. The name `codex_claude_bridge` is reserved |
-| `maxConcurrentExecutions` | Most executions running at once across all tasks (positive integer, default 2)                                                                                                     |
+### Commit hook
 
-The service runs Claude Code with its own environment and the user's Claude Code settings. Readiness reports the credential source Claude Code uses and never accepts an API key or a third-party provider as the subscription. Configured MCP servers reach Claude Code through a private file (mode 0600), not the command line. Codex's own tools and connectors are not available to Claude.
+The pre-commit hook checks the staged snapshot and never modifies your files:
 
-Readiness results, the `error` of failed task executions, and `service.log` contain only diagnostics the bridge composes from known fields: problem codes and failure reasons, configured MCP server names, the statuses Claude Code reports for them, failure categories the bridge determines itself (timeout, executable not runnable, the exit code or signal of the Claude Code process it spawned, the assistant error code and result subtype Claude Code reports), the subscription reset time, known account values, model identifiers, and actions. Error text from Claude Code, the Agent SDK, or MCP servers, including stderr, result text, and MCP connection errors, is never copied there, so credentials it may quote cannot leak in any encoding. To see a full error, run `claude` in a terminal: inspect `/mcp` for an integration, or run it in the project and `/resume` the session a failed task reports. Pattern-based redaction remains only as a backstop for these messages; it carries no guarantee. Claude's own content (assistant text, tool inputs, requests, nested summaries, commit subjects, file names, and results) reaches the parent unchanged, bounded only by size limits: the bridge runs for one user, and Claude and Codex can already read the same configuration and files.
+1. Formatting and lint of staged files.
+2. The full type check, unless only Markdown changed.
+3. Unit tests related to the changed files.
 
-A writing task (`mode: write`) gets its own worktree under `worktrees/<task>` in the state directory, on a GitFlow task branch created from a committed baseline before any execution runs. A dirty parent checkout is refused unless the caller names the baseline explicitly. The worktree, branch, and changes are kept after completion, failure, and cancellation; ending a task never deletes them. Only `cleanup_task` removes them, one task at a time, together with those of the task's nested writers: each worktree with `git worktree remove` and, unless the caller keeps them, the branches. It refuses, removing nothing, while an execution is queued or running, and when a worktree has uncommitted or untracked changes or commits at a worktree's HEAD or on a branch being deleted are contained in no branch, tag, remote-tracking ref, or parent checkout's HEAD that the cleanup keeps, unless the caller explicitly decides to discard them. Branches one cleanup deletes never count as holding each other's commits, so a writer branch merged into the task branch is integrated while the task branch exists, and a cleanup deleting both needs the task branch integrated. Cleanups of one repository, across all its checkouts, run one at a time, so a commit two task branches share keeps its last branch; a follow-up sent during a cleanup waits for it. It never touches the parent checkout, other worktrees, remotes, or the task's records, results, and session reference. The workspace state (`removed` or `branch_kept`) records what remains, and follow-ups to a cleaned-up task are refused rather than run in a recreated worktree.
-
-A writing task started with `publish: "pull_request"` authorizes Claude to push its task branch and create or update a pull request using the Git and GitHub CLI (`gh`) credentials available to the service, without a parent review first; merging stays with the parent and the user. Only the task branch is published: nested writers' branches stay local, and their work reaches the pull request once the executor has assembled it into the task branch. The bridge establishes what was published itself rather than from Claude's report: after each execution that is not cancelled, and before each follow-up, it reads the branch where Git pushes it (the push remote and push URL, with `git ls-remote`) and the branch's pull request (`gh pr list --head --state all`, also after the branch was deleted), parses them into known fields, and records them as the task's publication. A value a check cannot read keeps its last known value, so a follow-up after an unreported or interrupted push is told about the existing pull request and updates it rather than creating another. Error text from `git` and `gh` is never copied into results or logs; the result names the problem and an action instead.
-
-Delegated tasks are stored in `state.db` with their executions, provider session references, and results. Each task belongs to a project (the Git root realpath) and a logical caller: `$CODEX_CLAUDE_BRIDGE_CALLER`, default `codex`, which the plugin forwards from Codex's environment. A request key identifies a start request within that scope, so retries return the existing task. A task runs in the service, not the MCP connection, and continues when Codex disconnects. Before sending the brief, the service checks that the Claude Code session uses a verified subscription login and offers the requested model. When a result message from Claude Code ends an execution or a nested writer, completed or failed, the service stores that message's `usage` with it: Claude Code's cost estimate, wall and API durations, turns, token counts, and per-model figures with the context window, kept as numbers and model identifiers only. An execution that ran several turns in one process records its last result's figures. The cost estimate and the per-model token and cost counters are cumulative: within a process, and across a resumed session, where they include earlier executions. The aggregate token counts cover only the main loop's last turn, and turns and durations cover the follow-up alone. `task_status` and `wait_task` show `usage` with the execution's state and in each `nestedWriters` entry; `task_result` and `read_output` do not. Cancelled and interrupted runs have none.
-
-When a new service starts, it recovers the work its predecessor left unfinished ([ADR 0005](docs/adr/0005-recovery-by-process-identity-and-boot.md)). The service records each Claude Code process it spawns, for executions and nested writers, by PID and, on Linux, by the boot and start time from `/proc`. A recorded process that still runs with the same start time can no longer be observed or controlled, so the new service stops it (`SIGTERM`, then `SIGKILL`); its execution becomes `interrupted` with `detail.recovery.process`: `stopped`, `ended` (it was already gone), `none` (Claude Code had not been launched), or `unknown` (the platform reports no start times, or the process survived `SIGKILL`). In-process nested agents of an ended or stopped process are reported `stopped` with termination `process_exit`, and nested writers `interrupted` with their own `recovery`. Queued executions stay queued and start when a slot is free, unless the machine restarted since the previous service started: the database may then have lost its latest commits (ADR 0004), so they are interrupted too. Pending requests expire. For an interrupted writing task, the service then records in the background the worktree's commits and changes, which `task_result` of that execution pages as for a failed one (`detail.workspace` shows their counts), and, when publishing, what the remote holds (`detail.publication`), or `detail.recovery.worktree: "unreadable"` when Git cannot read the worktree, or `"missing"` when Git has no worktree at its path; it only reads the remote. A worktree recorded as not yet created is reconciled too once Git shows it exists, since a machine restart can lose that record while the worktree survives. `cleanup_task` treats interrupted executions as ended. Nothing is rerun on the service's initiative. A follow-up to an interrupted task resumes the Claude session, reports `resumes`, and tells Claude that its previous execution was interrupted.
-
-A task's executions run one at a time: a follow-up is a new execution that resumes the task's Claude session (`--resume`) after the active execution ends, and fails as `session_unavailable` rather than starting a new conversation when Claude Code cannot resume it. Cancellation stops the running Claude Code process, which the service spawns itself so it can confirm the process exited (escalating to `SIGKILL` after a grace period), and cancels queued follow-ups.
-
-Claude runs the tools its task profile grants without asking. It waits for Codex only when it asks a question (`AskUserQuestion`) or calls a tool of a server configured in `mcpServers` without `autoApprove`: the service records a pending request with its task, execution, and Claude session, reports the execution as `needs_input`, and answers Claude Code's permission callback once `respond_to_request` arrives. A request is answerable only while the Claude Code process that asked is running in the current service; when that execution ends, or the service restarts, the request expires and a follow-up has to carry the answer.
-
-Across tasks, the service runs at most `maxConcurrentExecutions` executions at once, one per execution slot (see `CONTEXT.md`). Further executions stay `queued` with `reason: waiting_for_slot`, their position, and the limit, and start in the order they began waiting whenever a running execution ends, whatever its outcome; a task's next execution joins the line only once its previous one has ended. `list_tasks` reports the limit and the running and waiting counts. A failed or waiting execution is never replaced automatically. The service reads the limit whenever it schedules: when work is queued, cancelled, or ends, and when `list_tasks`, `task_status`, or `wait_task` is called; an edit never stops running executions. A slot is released when its execution ends; if Claude Code did not exit even after `SIGKILL` (`processExited: false`), the bridge no longer controls that process and does not count it. The limit counts executions, not the agents working for them. Nested agents run inside the execution's Claude Code process and are subject only to Claude Code's own limits and to the brief's guidance. Nested writers are separate Claude Code processes, but they run as part of their executor's execution, which holds its slot while it waits for them; a writer that needed a slot of its own could wait forever behind the executor that waits for it. Nothing caps nested writers per execution either (see below), so the bridge claims no global agent or process cap.
-
-In read-only tasks, Claude may start nested agents through Claude Code's Agent tool. The read-only profile disables the edit tools with session deny rules, which Claude Code (verified in 2.1.282) applies to every nested agent's tools and permission checks, whatever its definition lists. The adapter records the nested agents Claude Code reports (`task_started`, `task_progress`, `task_notification`) per execution. A successful result that arrives while some of them still run leaves the execution `running` with `reason: waiting_for_children`: Claude Code runs another turn when a nested agent finishes, and the execution completes with the first result after all have ended. If Claude Code exits first, the execution fails. Nothing bounds a nested agent that never ends except cancellation, which asks Claude Code to stop each running nested agent (`stop_task`), waits briefly for it to report them stopped, and then ends the process. In-process agents end with the process; work they started outside it is not controlled, and the cancel response discloses nested agents whose stop was not reported.
-
-A writing task disallows the Agent tool, because Claude Code's in-process agents share the executor's working directory. Instead, the executor gets two tools from an in-process SDK MCP server named `codex_claude_bridge`: `start_nested_writer` and `wait_nested_writers`. The configuration refuses a server with that name, so these tools always run without asking Codex. Starting refuses an executor worktree with uncommitted changes, records the writer in `nested_writers` with a new worktree under `worktrees/<writer>` and a GitFlow branch at the executor's HEAD commit, and then spawns a separate Claude Code process in that worktree with the writing profile. The bridge chooses that working directory, which is what holds the writer to its workspace; the prompt only describes it. It returns at once: Claude Code runs MCP tool calls concurrently only for read-only tools, so a blocking start would serialize writers, while waiting is read-only. The executor merges or cherry-picks the writers' branches and reports conflicts. A result that arrives while writers still run leaves the execution waiting for children, as with nested agents; because Claude Code does not start a turn when a bridge-owned writer ends, the service then sends the executor a message to collect and assemble their work. Cancellation stops the writers' processes along with the executor's and confirms their exit; writers still running when the executor's execution ends otherwise are stopped as `parent_ended`, and after a service restart they are reported `interrupted`. Their worktrees, branches, and results are kept; `cleanup_task` removes the worktrees and branches with the task's own and records what remains in the writer's workspace state. A nested writer follows the same request policy as its executor: its questions and calls to tools of servers without `autoApprove` become requests of the executor's execution, marked with the writer's ID, and expire when the writer ends. Nested writers cannot start nested writers; the service does not otherwise limit their number, they take no execution slot, and each one uses the same Claude subscription as a separate session, subject to its usage limits. The guidance to use them only when parallel work justifies that cost is prompt text, not enforcement.
-
-Each execution's progress (status changes, Claude's messages, tool calls, nested agents and writers, and the final summary) is stored as numbered events for `read_output`. Diagnostics retention is bounded separately from results: an event keeps at most 16,000 characters, and an execution keeps its newest 2,000 events. A `wait_task` call lasts at most 300 s, below the plugin's 600 s MCP tool timeout; `start_task` and `send_followup` take an optional `waitSeconds` with the same bound, which accepts the work durably and then waits on the accepted execution as `wait_task` does, returning its fields.
-
-To stop the service, send `SIGTERM` to the PID in `service.json`. The next service then recovers running tasks as interrupted.
-
-## Commands
-
-Use `bun run <name>` to invoke these package scripts. They run Node or the local Vite+ CLI; `bun test` is a different runner and is not used here.
-
-| Script                           | Purpose                                                                 |
-| -------------------------------- | ----------------------------------------------------------------------- |
-| `dev`                            | Run the TypeScript CLI with Node watch mode                             |
-| `start`                          | Run `dist/cli.mjs` after a build                                        |
-| `typecheck`                      | Strict native TypeScript checking of source, scripts, tests, and config |
-| `lint`                           | Oxlint; warnings fail the command                                       |
-| `format`                         | Apply Oxfmt formatting, including Markdown                              |
-| `format:check`                   | Verify formatting without fixes                                         |
-| `build`                          | Bundle the CLI and its dependencies into `dist/cli.mjs`                 |
-| `build:plugin`                   | Bundle the CLI into the plugin directory for installation in Codex      |
-| `build:check`                    | Build into a temporary directory, check syntax, and execute the bundle  |
-| `test`                           | All Vitest unit and integration tests                                   |
-| `test:unit` / `test:integration` | One Vitest test category                                                |
-| `test:e2e`                       | Build a fresh temporary bundle and run Playwright process tests         |
-| `smoke`                          | Opt-in check against the installed Claude Code (see Test boundaries)    |
-| `check`                          | Formatting, lint, types, build verification, Vitest, then Playwright    |
-| `hooks:install`                  | Install or refresh the Git hook dispatcher                              |
-| `hooks:check`                    | Verify real Git commits in a disposable repository                      |
-
-The CLI accepts `--help`, `--version`, `mcp` (the stdio MCP entry point), and `service` (the background service, normally started by `mcp`). Unsupported invocations return exit code 2 with a diagnostic on stderr. For example: `bun run start --version` after `bun run build`.
-
-## Test boundaries
-
-- `tests/unit/**/*.test.ts`: argument parsing, Claude Code version compatibility, and diagnostic redaction.
-- `tests/integration/**/*.test.ts`: the public MCP boundary. `tests/support/bridge.ts` gives each test a temporary state directory and launches the real MCP entry point and background service as subprocesses, with real SQLite. `tests/fixtures/fake-claude.ts` replaces the Claude Code executable: it speaks the Agent SDK's stream-json control protocol and follows a per-test scenario, so the real SDK and adapter run without credentials or model calls. Publication tests use a local bare repository as `origin` and put `tests/fixtures/fake-gh.ts`, which keeps pull requests in a JSON file, first on the service `PATH` as `gh`. `acceptance.test.ts` runs one parent-agent session across these features, as the delegation skill instructs it.
-- `tests/e2e/**/*.e2e.ts`: Playwright Test launches the built CLI outside the source checkout, and runs the plugin as Codex installs it: copied without `node_modules`, launched from its `.mcp.json`.
-
-Vitest and Playwright have separate discovery patterns. Full suites fail when no tests are found, focused tests are forbidden, and retries are disabled for E2E. There are no browser fixtures, so `playwright install` and OS browser libraries are unnecessary. If actual browser behavior is added later, document the required browser and install it explicitly in local setup and CI.
-
-All automated tests work without Claude credentials, model calls, or GitHub mutations. Tests stop the service processes they start; a test's state directory is never the installed bridge's.
-
-`bun run smoke` is not part of any suite or CI. It checks the bridge against the installed Claude Code and your existing login, in a temporary state directory and Git repository: it starts the MCP entry point as Codex does, checks readiness, delegates a small read-only assignment with the cheapest model readiness offers, disconnects and finds the task again with a new client, reads the result, sends a follow-up, and prints a pass or fail line per step without credentials or Claude's output. It uses subscription usage for two short turns. Then it stops the service it started and removes its temporary directories. `--readiness-only` stops after readiness and sends no prompt; `--bundle` launches `dist/cli.mjs` from `bun run build` instead of `src/cli.ts`; `--claude <path>` names the Claude Code executable when `claude` is not on the `PATH`.
-
-## Commit checks
-
-Vite+ manages `.vite-hooks/pre-commit`; no Husky or separate lint-staged package is needed. The hook exports the Git index to a temporary directory and checks that snapshot, sharing the installed `node_modules`. It does not stash, format, stage, or rewrite working files. Partially staged changes are checked as they will appear in the commit. Build and E2E outputs are temporary and cleaned up.
-
-The ordered pre-commit policy is:
-
-1. Verify formatting of staged supported files and lint staged JS/TS files, without fixes.
-2. For changes beyond Markdown, check the entire TypeScript project.
-3. Run changed unit test files and unit tests related to changed source files through static imports.
-
-The hook does not build or run integration/E2E suites, including when dependency metadata or shared configuration changes. Markdown-only changes require only formatting. Deleted files are excluded from file-based commands; remaining code is still type checked. Related test selection may legitimately be empty; full suites never accept an empty test set. Static imports do not capture subprocess, filesystem, or all dynamic dependencies.
-
-During development, run focused tests for the behavior and consumers affected by the change. For service/process boundaries, select the relevant integration or E2E scenarios explicitly. A changed test file is not the only possible affected test. Full-project type checking remains available locally. Run repository-wide checks locally only on explicit request or when needed to diagnose tooling or shared-contract changes.
-
-Run `bun install --frozen-lockfile` after changing dependency metadata before committing: the snapshot uses the installed dependencies. `bun run check` retains the full formatting, lint, typecheck, build, Vitest, and Playwright gate for CI and explicit troubleshooting. GitHub Actions runs it and hook verification on pushes and pull requests. Require the `quality` job in the hosting repository's branch protection/ruleset before relying on CI to block merges; the workflow alone does not enforce this setting.
-
-## Hook troubleshooting
-
-Run `bun run hooks:install` after a fresh clone if hooks are missing, and inspect `./node_modules/.bin/vp hooks status`. Vite+ stores generated dispatcher files under `.vite-hooks/_` and sets the repository's `core.hooksPath`. Existing project-owned hooks must be integrated before replacing a custom hooks path.
-
-An explicit local `vp hooks disable` preference survives reinstall; re-enable it with `./node_modules/.bin/vp hooks enable`. `VP_GIT_HOOKS=0` and `HUSKY=0` disable hooks; remove them when checks are expected to run. Git GUI clients need the pinned Node runtime on `PATH` too. A missing runtime or dependency is an error, not a skipped check.
-
-On check failure, use `bun run format` for formatting fixes or run the reported quality command, then stage the intended corrections and retry. `bun run hooks:check` creates only temporary test commits and verifies formatting, lint, type, and affected unit-test failures, confirms that builds and integration/E2E are deferred to CI, and checks preservation of staged and unstaged content. It never commits to the current branch.
+Builds, integration, and E2E tests run in CI (`bun run check`). If a check fails, fix it (`bun run format` handles formatting), stage the fix, and commit again. If hooks do not run, check `./node_modules/.bin/vp hooks status` and make sure `VP_GIT_HOOKS=0` or `HUSKY=0` is not set.
 
 ## License
 
