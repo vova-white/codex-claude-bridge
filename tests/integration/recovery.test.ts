@@ -57,6 +57,15 @@ async function status(client: BridgeClient, project: string, taskId: string) {
   return (await client.call("task_status", { project, taskId })).data;
 }
 
+/**
+ * Waits until the service has recorded the task's Claude session. The scripted
+ * Claude Code signals from its own process, before the service has necessarily
+ * read the session it reported, so a crash right after a signal could lose it.
+ */
+async function sessionRecorded(client: BridgeClient, project: string, taskId: string) {
+  await waitFor(async () => (await status(client, project, taskId)).sessionId);
+}
+
 async function finish(client: BridgeClient, project: string, taskId: string, executionId: string) {
   const waited = await client.call("wait_task", {
     project,
@@ -112,6 +121,7 @@ describe("recovery after a service crash", () => {
     const client = await fixture.connect();
     const { taskId, executionId } = await start(client, { project });
     await waitFor(() => fixture.signalled("working") || undefined);
+    await sessionRecorded(client, project, taskId);
     const [launch] = fixture.launches();
 
     await fixture.killService();
@@ -198,6 +208,7 @@ describe("recovery after a service crash", () => {
     const client = await fixture.connect();
     const { taskId, executionId } = await start(client, { project });
     await waitFor(() => fixture.signalled("running") || undefined);
+    await sessionRecorded(client, project, taskId);
     const queued = await client.call("send_followup", {
       project,
       taskId,
