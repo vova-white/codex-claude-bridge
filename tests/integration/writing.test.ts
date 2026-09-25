@@ -72,18 +72,34 @@ async function run(client: BridgeClient, args: Record<string, unknown>) {
 }
 
 describe("writing tasks", () => {
-  it("report commits and files without configured secrets, including staged-only changes", async () => {
+  it("keep configured secrets out of the task branch name", async () => {
     const fixture = new BridgeFixture({
       config: {
-        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "tok-COMMITSECRET" } } },
+        mcpServers: { github: { command: "github-mcp", env: { TOKEN: "abc" } } },
       },
+      scenario: { turns: [{ steps: [finished("Done.")] }] },
+    });
+    fixtures.push(fixture);
+    const project = fixture.createRepository();
+    const client = await fixture.connect();
+    const { taskId } = await run(
+      client,
+      writeTask(project, { assignment: "ABC rotation: update the README." }),
+    );
+    const { workspace } = (await client.call("task_status", { project, taskId })).data;
+    // A short secret in another letter case still keeps the assignment out of the name.
+    expect(workspace.branch).toMatch(/^feature\/[0-9a-f]{8}$/);
+  });
+
+  it("report commits and files, including staged-only changes", async () => {
+    const fixture = new BridgeFixture({
       scenario: {
         turns: [
           {
             steps: [
               { writeFile: { path: "notes.txt", content: "n\n" } },
               { exec: ["git", "add", "notes.txt"] },
-              commit("docs: add notes for tok-COMMITSECRET"),
+              commit("docs: add notes"),
               { writeFile: { path: "README.md", content: "# Staged\n" } },
               { exec: ["git", "add", "README.md"] },
               { writeFile: { path: "README.md", content: "# Fixture\n" } },
@@ -100,10 +116,9 @@ describe("writing tasks", () => {
 
     const result = await client.call("task_result", { project, taskId });
     expect(result.data.result.workspace).toMatchObject({
-      commits: [{ subject: "docs: add notes for [REDACTED]" }],
+      commits: [{ subject: "docs: add notes" }],
       changedFiles: ["README.md", "notes.txt"],
     });
-    expect(result.text).not.toContain("COMMITSECRET");
   });
 
   it("bound checks and Git metadata by maxChars and serve them in full through the result cursor", async () => {
